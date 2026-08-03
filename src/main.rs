@@ -9,8 +9,13 @@
 //!   bitty --allow-run cargo,python3           # programs scripts may execute
 //!   bitty --allow-net api.example.com         # hosts they may reach
 //!   bitty --allow-env HOME,PATH --allow-sys   # environment and system facts
-//!   bitty --journal DIR                        # record processes so they survive a restart
-//!   bitty --resume [\"message\"]                 # bring them back, optionally with a nudge
+//!   bitty --resume NAME                        # bring back a session by name
+//!   bitty --resume [\"message\"]                 # the most recent one, optionally with a nudge
+//!   bitty --journal DIR                        # journal somewhere specific instead
+//!
+//! Every interactive run is a persisted session under .bitty/sessions/<name>,
+//! created automatically and named at startup. `--once` is exempt: a one-shot
+//! run has nothing to come back to.
 //!
 //! Console, while running:
 //!   plain text        → mail to the root process (interrupts it mid-task)
@@ -33,6 +38,57 @@ use std::sync::Arc;
 
 /// Where processes are recorded unless told otherwise.
 const DEFAULT_JOURNAL: &str = ".bitty/journal";
+/// Each run gets its own directory under here, so sessions accumulate side by
+/// side and can be resumed by name rather than by remembering a path.
+const SESSION_ROOT: &str = ".bitty/sessions";
+
+/// A name a person can retype from memory an hour later. Two words carry the
+/// recall and the epoch tail carries the uniqueness — a bare timestamp is
+/// unique too, but nobody remembers which one was theirs.
+fn new_session_name() -> String {
+    const ADJECTIVES: [&str; 16] = [
+        "amber", "brisk", "calm", "dusk", "eager", "fresh", "glad", "hollow", "ivory", "jolly",
+        "keen", "lucid", "mellow", "noble", "opal", "plain",
+    ];
+    const NOUNS: [&str; 16] = [
+        "otter", "harbor", "cedar", "falcon", "meadow", "quartz", "raven", "summit", "thicket",
+        "vault", "willow", "anchor", "beacon", "cove", "dune", "ember",
+    ];
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let base = format!(
+        "{}-{}-{:x}",
+        ADJECTIVES[(secs / 60) as usize % ADJECTIVES.len()],
+        NOUNS[secs as usize % NOUNS.len()],
+        secs % 0xffff
+    );
+    // Two runs in the same second would otherwise share a directory and
+    // interleave their journals.
+    let mut name = base.clone();
+    let mut n = 2;
+    while std::path::Path::new(SESSION_ROOT).join(&name).exists() {
+        name = format!("{base}-{n}");
+        n += 1;
+    }
+    name
+}
+
+/// The most recently written session, for a bare `--resume`.
+fn latest_session() -> Option<String> {
+    let mut best: Option<(std::time::SystemTime, String)> = None;
+    for entry in std::fs::read_dir(SESSION_ROOT).ok()?.flatten() {
+        let Ok(modified) = entry.metadata().and_then(|m| m.modified()) else {
+            continue;
+        };
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if best.as_ref().is_none_or(|(t, _)| modified > *t) {
+            best = Some((modified, name));
+        }
+    }
+    best.map(|(_, name)| name)
+}
 use std::time::Duration;
 use system::{Mail, NodeSpec, System};
 use tokio::sync::mpsc;
@@ -52,6 +108,7 @@ async fn main() -> anyhow::Result<()> {
     let mut allow_env: Vec<String> = Vec::new();
     let mut allow_sys: Vec<String> = Vec::new();
     let mut journal_dir: Option<String> = None;
+    let mut session: Option<String> = None;
     let mut resume = false;
     let mut rest: Vec<String> = Vec::new();
     while let Some(arg) = args.next() {
@@ -70,9 +127,21 @@ async fn main() -> anyhow::Result<()> {
                     std::process::exit(2);
                 }
             },
-            "--resume" => {
+            // `--resume` alone picks up the most recent session. A name may
+            // follow either as --resume=NAME or as the next word — the next
+            // word is only taken when it actually names a session, so
+            // `--resume "keep going"` still reads as a prompt.
+            _ if arg == "--resume" || arg.starts_with("--resume=") => {
                 resume = true;
-                journal_dir.get_or_insert_with(|| DEFAULT_JOURNAL.to_string());
+                let named = arg.strip_prefix("--resume=").map(String::from).or_else(|| {
+                    let candidate = args.peek()?;
+                    std::path::Path::new(SESSION_ROOT)
+                        .join(candidate)
+                        .is_dir()
+                        .then(|| args.next())
+                        .flatten()
+                });
+                session = named.or_else(latest_session);
             }
             "--allow-run" => match args.next() {
                 Some(v) => allow_run.extend(v.split(',').map(String::from)),
@@ -135,6 +204,27 @@ async fn main() -> anyhow::Result<()> {
 
     let api = api::Client::from_env()?;
     ui::system(&format!("bitty · model {} · /ps /graph /stop /quit · '@proc-N msg' targets a process, plain text goes to root", api.model));
+
+    // Persistence is the default, not something to remember to switch on: an
+    // interactive run that dies having built a world of scripts should be
+    // resumable. `--once` is exempt — a one-shot batch run has nothing to come
+    // back to, and would only litter the session directory.
+    if journal_dir.is_none() && !once {
+        if resume && session.is_none() {
+            ui::system("no session to resume — starting a new one");
+        }
+        let name = session.clone().unwrap_or_else(new_session_name);
+        journal_dir = Some(format!("{SESSION_ROOT}/{name}"));
+        ui::system(&format!(
+            "session {name} — resume it later with: bitty --resume {name}"
+        ));
+        session = Some(name);
+    }
+    // A resume with nothing to restore would otherwise sit silently on an empty
+    // journal; say so rather than looking like a successful restore.
+    if resume && session.is_none() && journal_dir.is_none() {
+        ui::system("nothing to resume");
+    }
 
     let journal: Arc<dyn durable::Journal> = match &journal_dir {
         Some(dir) => match durable::FileJournal::new(dir) {
