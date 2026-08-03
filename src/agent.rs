@@ -1302,6 +1302,20 @@ reply_to id, someone is blocked waiting on you: answer with send_message and in_
 topology node. Script processes have the same mailbox, links, permissions and namespace, but they \
 run deterministic code and cost no API tokens. Prefer one for any node whose job is mechanical — \
 routing, aggregating, counting, validating, reformatting — and keep agents for judgment.
+- When a task needs a primitive you do not have, build it or delegate it — never approximate it. \
+You hold very few tools directly: messaging, spawning, and the ability to run TypeScript. \
+Everything mechanical — reading and writing files, running programs, fetching URLs, searching, \
+parsing, arithmetic, formatting — is done by writing a script, inline with run_script for a \
+one-off or as a script process when the job will recur. Reaching for a script the moment you \
+notice a missing primitive is the correct instinct, and it is almost always faster than the \
+alternative. Simulating a primitive in prose is not: walking a directory from memory, interpreting \
+code in your head, or guessing a file's contents produces answers that look right and are not, and \
+building an elaborate substitute for a primitive you were never given is worse still.
+- Delegation gets you hands, not rights. A process you spawn is attenuated to your own \
+permissions, so if you cannot read a path, nothing you create can read it either — spawning is \
+never a way around a permission you lack. Delegate to get parallelism, isolation, a cheaper model, \
+or a mechanical job done in code. When the missing piece is a permission rather than a primitive, \
+stop and say which one is missing instead of working around it.
 - Match the model and effort you give a process to the work it will do. A mechanical, \
 well-specified task does not need your model or your effort level, and spawning it smaller is by \
 far the biggest saving available to you — much larger than writing shorter messages.
@@ -1378,7 +1392,12 @@ fn process_identity(me: &Meta) -> String {
     };
     let role = if me.parent == "user" {
         "You are the root process: the human user talks to you directly, and your plain-text \
-         replies stream to their console. Messages arriving from \"user\" are the human typing."
+         replies stream to their console. Messages arriving from \"user\" are the human typing. \
+         You are also the only process that can reach the person who can change what this system \
+         is permitted to do, so when a task is blocked on a permission you do not hold, name the \
+         permission and let them decide — they can restart with different flags, and no amount of \
+         delegating will get it for you. When a task is instead blocked on a primitive, that is \
+         yours to solve: write the script or spawn the worker."
             .to_string()
     } else if me.grants.send.permits(&me.parent) {
         format!(
