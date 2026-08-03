@@ -51,6 +51,12 @@ pub async fn run(
             me.parent, transcript
         )));
     }
+    // An empty briefing means "start and wait" — the process comes up idle
+    // rather than burning a turn on nothing.
+    if instructions.trim().is_empty() && first_turn.is_empty() {
+        drive(sys, me, mailbox, Vec::new()).await;
+        return;
+    }
     first_turn.push(text_block(&envelope(&Mail::system(&me.parent, instructions))));
     let opening = json!({"role": "user", "content": first_turn});
     sys.journal.record(&me.id, &Event::Input { content: json!(first_turn) });
@@ -85,6 +91,11 @@ async fn drive(
     let mut warned_unmanaged = false;
 
     loop {
+        // Nothing to answer yet: wait for the first message instead of
+        // sending an empty conversation to the API.
+        if history.is_empty() && !wait_for_mail(&sys, &me, &mut mailbox, &mut history, &mut deferred).await {
+            return;
+        }
         me.set_status(Status::Running);
         sys.note_running();
         let turn = Turn {
@@ -1251,6 +1262,15 @@ defined communication graph.
 - A spawned process starts with an empty context by default. Pass context: \"inherit\" when it \
 genuinely needs your history as background; prefer a well-written briefing over inheriting, \
 since inherited context costs tokens on every one of its turns.
+- Give a worker tools, not instructions, whenever the thing it needs is another process. Passing \
+passing `tools` on spawn turns an instruction like \"send proc-4 a path and it will reply with the \
+contents\" into a read_file tool with a checked argument schema, and the worker never learns a \
+graph exists — it just has a tool. That is worth doing even for a single edge: a contract survives being handed to \
+a cheaper model, a convention does not.
+- Start an edge as an agent because prose is the fastest way to specify judgment, then demote it \
+to a script once the judgment turns out to be mechanical. The caller does not change, because it \
+only ever knew the tool. Routing, scoring, retrying, formatting and aggregating are all better as \
+code than as someone's discretion.
 - Grant the least privilege that does the job. A process you spawn inherits your capabilities \
 unless you narrow them, and inheriting is rarely what the work needs: a reviewer wants read \
 access and no write, a summarizer wants neither, a test runner wants one program and not a \

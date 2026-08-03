@@ -114,7 +114,9 @@ async fn main() -> anyhow::Result<()> {
         }
     }
     let prompt = rest.join(" ");
-    if prompt.trim().is_empty() && !resume {
+    // With no prompt, come up idle and wait for the console. Only --once needs
+    // something to do, since it exits as soon as everything settles.
+    if prompt.trim().is_empty() && !resume && once {
         eprintln!(
             "usage: bitty [--once] [--role \"prompt\"] [-A | --allow-read DIR --allow-write DIR] \
              \"initial task\""
@@ -205,6 +207,9 @@ async fn main() -> anyhow::Result<()> {
         )
         .map_err(anyhow::Error::msg)?
     };
+    if prompt.trim().is_empty() && !resume {
+        ui::system("waiting for input — type a message, or /ps /graph /stop /quit");
+    }
     if resume && !prompt.trim().is_empty() {
         let _ = sys.send(&root, user_mail(&prompt));
     }

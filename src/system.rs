@@ -335,6 +335,9 @@ pub struct System {
     pub api: api::Client,
     /// Latch so a system-wide quiesce is announced once, not once per process.
     quiesce_announced: AtomicBool,
+    /// Held for the whole of a spawn so ids can be handed back if validation
+    /// fails. Without it two concurrent spawns could reserve overlapping ids.
+    spawning: Mutex<()>,
     /// In-flight synchronous calls, keyed by correlation id.
     pending: Mutex<HashMap<String, PendingCall>>,
     calls: AtomicU64,
@@ -350,6 +353,7 @@ impl System {
             counter: AtomicU64::new(0),
             api,
             quiesce_announced: AtomicBool::new(false),
+            spawning: Mutex::new(()),
             pending: Mutex::new(HashMap::new()),
             calls: AtomicU64::new(0),
             journal: Arc::new(NoJournal),
@@ -641,13 +645,17 @@ impl System {
 
 
 
-        // Phase 1 — allocate ids so nodes can reference each other by name.
+        // Phase 1 — reserve ids so nodes can reference each other by name.
+        // Reserved, not consumed: later phases can still reject the spawn, and
+        // a refused spawn must not leave a hole in the sequence. The lock makes
+        // the reserve-validate-commit sequence atomic against other spawns.
+        let _reserving = self.spawning.lock().unwrap();
+        let base = self.counter.load(Ordering::Relaxed);
         let mut ids = Vec::with_capacity(nodes.len());
         let mut ordinals = Vec::with_capacity(nodes.len());
-        for _ in &nodes {
-            let n = self.counter.fetch_add(1, Ordering::Relaxed) + 1;
-            ids.push(format!("proc-{n}"));
-            ordinals.push(n);
+        for offset in 1..=nodes.len() as u64 {
+            ids.push(format!("proc-{}", base + offset));
+            ordinals.push(base + offset);
         }
         let by_name: Vec<(Option<&str>, &str)> = nodes
             .iter()
@@ -892,7 +900,9 @@ impl System {
             resolved.push((grants, labels, aliases));
         }
 
-        // Phase 3 — register and launch.
+        // Phase 3 — nothing can refuse the spawn from here, so the ids are
+        // finally consumed.
+        self.counter.store(base + nodes.len() as u64, Ordering::Relaxed);
         let mut launched = Vec::with_capacity(nodes.len());
         for (((node, id), n), (grants, labels, aliases)) in
             nodes.into_iter().zip(ids).zip(ordinals).zip(resolved)

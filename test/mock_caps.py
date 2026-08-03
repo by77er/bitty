@@ -171,7 +171,8 @@ class H(BaseHTTPRequestHandler):
             STATE["checks"].add("no_escalation")
             ev = turn([("text", "Working within my grants.\n")], "end_turn")
         else:
-            return self.fail(f"unexpected process: {system[:200]!r}")
+            idx=system.find("You are process")
+            return self.fail(f"unexpected process: {system[idx:idx+90]!r} n={n} tools={[t['name'] for t in b['tools']][:3]}")
 
         p = sse(ev)
         self.send_response(200)
