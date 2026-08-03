@@ -35,7 +35,10 @@ class H(BaseHTTPRequestHandler):
             if "run_script" not in names:
                 return self.fail(f"root holds spawn and should be offered run_script: {names}")
             return self.respond(turn([("tool_use","t1","run_script",
-                {"script": "let n = 0; for await (const _ of Deno.readDir(%s)) n++; return `count=${n}`;" % json.dumps(REPO+"/src")})],"tool_use"))
+                # Annotated on purpose: inline source has to be transpiled, not
+                # just typechecked, or every annotation reaches V8 as a syntax
+                # error at runtime.
+                {"script": "let n: number = 0; const dir: string = %s; for await (const _ of Deno.readDir(dir)) n++; return `count=${n}`;" % json.dumps(REPO+"/src")})],"tool_use"))
         if n==1:
             r=res(messages[-1])[0]
             if r["is_error"] or "count=1" not in r["content"]:

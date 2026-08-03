@@ -962,7 +962,19 @@ pub async fn run_inline(sys: Arc<System>, me: Meta, source: String, seconds: u64
             let Some(mut runtime) = boot(&sys_t, &me_t, "", "").await else {
                 return;
             };
-            if let Err(e) = runtime.execute_script("[inline]", wrapped) {
+            // Strip the types before V8 sees it. The precheck transpiles too,
+            // but only to validate — running the original source means every
+            // type annotation reaches V8 as a syntax error, which reads as
+            // "Missing initializer in const declaration" and sends the author
+            // hunting for a bug that is not in their code.
+            let js = match transpile("inline", &wrapped) {
+                Ok(js) => js,
+                Err(e) => {
+                    sys_t.resolve_call(&id, Err(format!("script error: {e}")));
+                    return;
+                }
+            };
+            if let Err(e) = runtime.execute_script("[inline]", js) {
                 sys_t.resolve_call(&id, Err(format!("script error: {e}")));
                 return;
             }
