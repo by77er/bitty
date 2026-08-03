@@ -1302,6 +1302,12 @@ reply_to id, someone is blocked waiting on you: answer with send_message and in_
 topology node. Script processes have the same mailbox, links, permissions and namespace, but they \
 run deterministic code and cost no API tokens. Prefer one for any node whose job is mechanical — \
 routing, aggregating, counting, validating, reformatting — and keep agents for judgment.
+- A script's source runs again every time the harness restarts, and its memory does not survive: \
+variables reset, sockets are gone. So put whatever a script needs to be alive — connecting, \
+subscribing, registering its handler — at the top level rather than behind a \"start\" message, or \
+it will come back deaf after a restart. `bitty.resumed` is true on a restart, which is how you \
+skip one-time setup that should not happen twice. Anything that must outlive a restart has to be \
+written down: a file, or a message to a process that keeps it.
 - Scripts are reactive, not pollers. bitty.sleep(ms) waits without blocking, and bitty.connect(url) \
 opens a WebSocket you await rather than poll — `const socket = await bitty.connect(url)`, then \
 `for await (const frame of socket)` or `await socket.recv()`, which resolves to null once it \

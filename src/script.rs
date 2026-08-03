@@ -1078,6 +1078,7 @@ pub async fn run(
     control: UnboundedReceiver<Control>,
     instructions: String,
     source: String,
+    resumed: bool,
 ) {
     // V8 is thread-bound; give this process its own thread and runtime, then
     // block on the actor loop there.
@@ -1092,7 +1093,7 @@ pub async fn run(
                     return;
                 }
             };
-            rt.block_on(actor_loop(sys, me, mailbox, control, instructions, source));
+            rt.block_on(actor_loop(sys, me, mailbox, control, instructions, source, resumed));
         });
     if let Err(e) = handle {
         ui::warn(&tag, &format!("could not spawn script thread: {e}"));
@@ -1106,11 +1107,12 @@ async fn actor_loop(
     mut control: UnboundedReceiver<Control>,
     instructions: String,
     source: String,
+    resumed: bool,
 ) {
     // Held as an Option so the old isolate can be dropped *before* the
     // replacement is built. Two isolates alive at once on the same thread
     // leaves V8 without a current handle scope and aborts the process.
-    let mut runtime = match boot(&sys, &me, &instructions, &source).await {
+    let mut runtime = match boot(&sys, &me, &instructions, &source, resumed).await {
         Some(runtime) => Some(runtime),
         None => return,
     };
@@ -1172,7 +1174,7 @@ async fn actor_loop(
             Wake::Ctl(Some(Control::Replace(source))) => {
                 ui::trace(&me.tag, "⟳ replacing script code");
                 drop(runtime.take());
-                match boot(&sys, &me, &instructions, &source).await {
+                match boot(&sys, &me, &instructions, &source, true).await {
                     Some(fresh) => runtime = Some(fresh),
                     None => return,
                 }
@@ -1215,6 +1217,9 @@ async fn actor_loop(
                 }
             }
         }
+        // A script has no turns, so this is its turn boundary: the point at
+        // which what it has consumed is worth making durable.
+        sys.journal.flush(&me.id);
         settled = false;
     }
 }
@@ -1246,7 +1251,7 @@ pub async fn run_inline(sys: Arc<System>, me: Meta, source: String, seconds: u64
             return;
         };
         rt.block_on(async move {
-            let Some(mut runtime) = boot(&sys_t, &me_t, "", "").await else {
+            let Some(mut runtime) = boot(&sys_t, &me_t, "", "", false).await else {
                 return;
             };
             // Strip the types before V8 sees it. The precheck transpiles too,
@@ -1285,7 +1290,7 @@ pub async fn run_inline(sys: Arc<System>, me: Meta, source: String, seconds: u64
 
 /// Build a fresh isolate for `source`. Returns None if the code cannot start,
 /// having already reported why.
-async fn boot(sys: &Arc<System>, me: &Meta, instructions: &str, source: &str) -> Option<JsRuntime> {
+async fn boot(sys: &Arc<System>, me: &Meta, instructions: &str, source: &str, resumed: bool) -> Option<JsRuntime> {
     const OPS: &[OpDecl] = &[
         op_bitty_send(),
         op_bitty_stop(),
@@ -1350,6 +1355,11 @@ async fn boot(sys: &Arc<System>, me: &Meta, instructions: &str, source: &str) ->
         "name": me.name,
         "parent": me.parent,
         "instructions": instructions,
+        // True when this is the harness coming back up rather than a first
+        // start. The source re-runs either way — that is how a script gets its
+        // sockets and handlers back — so this is how it tells "connect again"
+        // apart from "do the one-time setup".
+        "resumed": resumed,
     });
     let init = format!("globalThis.__bitty_init({info});");
     let _ = runtime.execute_script("[bitty:init]", init);
@@ -1388,6 +1398,7 @@ interface BittySocket {
 }
 interface BittyApi {
   id: string; name: string | null; parent: string; instructions: string;
+  resumed: boolean;
   onMail(handler: (mail: BittyMail, api: BittyApi) => unknown): void;
   send(to: string | string[], message: string, priority?: "high" | "low"): string;
   stop(targets: string | string[], cascade?: boolean): string;

@@ -448,6 +448,7 @@ impl System {
                 control_rx,
                 record.instructions,
                 source,
+                true,
             )),
         };
         if let Some(entry) = self.procs.lock().unwrap().iter().find(|p| p.id == id) {
@@ -994,6 +995,7 @@ impl System {
                     control_rx,
                     node.instructions,
                     source,
+                    false,
                 )),
             };
             if let Some(entry) = self.procs.lock().unwrap().iter().find(|p| p.id == id) {

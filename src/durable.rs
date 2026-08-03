@@ -145,6 +145,14 @@ impl Journal for FileJournal {
             }
         };
         let _ = writeln!(writer, "{line}");
+        // Batching is for the high-frequency events. Spawned and Stopped are
+        // neither frequent nor optional: Spawned is the only record that makes
+        // a process restorable at all, and a script process has no turns, so
+        // nothing else would ever flush it — its spawn would sit in this buffer
+        // until the harness exited and the process would simply not come back.
+        if matches!(event, Event::Spawned(_) | Event::Stopped { .. }) {
+            let _ = writer.flush();
+        }
     }
 
     fn flush(&self, process: &str) {

@@ -79,6 +79,42 @@ run "myopic worker (tools, no graph)"           8756 mock_myopic.py    --once "d
 run "deno.serve in a script process"        8757 mock_serve.py     --once --allow-net 127.0.0.1:8899 "stand up a server"
 run "reactive scripts (sleep + socket)"       8758 mock_reactive.py  --once --allow-net 127.0.0.1:8901 "be reactive"
 
+# Two runs against one journal, so this cannot use the single-run helper above.
+restart_arm() {
+  local name="script survives a harness restart" port=8759 start=$SECONDS
+  pkill -f "$LEFTOVER" >/dev/null 2>&1; pkill -f mock_restart.py >/dev/null 2>&1
+  local dir markdir; dir=$(mktemp -d); markdir=$(mktemp -d)
+  export BITTY_RESTART_MARK="$markdir/boots" BITTY_RESTART_PORT=$port
+  local out=""
+  for phase in 1 2; do
+    ( cd "$SCRATCH" && BITTY_RESTART_PHASE=$phase setsid nohup python3 mock_restart.py >/dev/null 2>&1 & )
+    for _ in $(seq 40); do
+      (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null && exec 3<&- && break || sleep 0.1
+    done
+    if [ "$phase" = 1 ]; then
+      out="$out$(ANTHROPIC_API_KEY=test ANTHROPIC_BASE_URL="http://127.0.0.1:$port" timeout 90 \
+        ./target/debug/bitty --once --journal "$dir" --allow-read "$markdir" --allow-write "$markdir" "go" 2>&1)"
+    else
+      out="$out$(ANTHROPIC_API_KEY=test ANTHROPIC_BASE_URL="http://127.0.0.1:$port" timeout 90 \
+        ./target/debug/bitty --once --journal "$dir" --resume "check" 2>&1)"
+    fi
+    pkill -f mock_restart.py >/dev/null 2>&1
+    pkill -f "$LEFTOVER" >/dev/null 2>&1
+    for _ in $(seq 40); do
+      (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null && exec 3<&- && sleep 0.1 || break
+    done
+  done
+  rm -rf "$dir" "$markdir"
+  if echo "$out" | grep -q "ASSERTION"; then
+    printf 'FAIL  %s\n' "$name"; echo "$out" | grep -o "ASSERTION.*" | head -2 | sed 's/^/      /'
+    fail=$((fail+1))
+  else
+    printf 'pass  %s (%ss)\n' "$name" "$((SECONDS - start))"; pass=$((pass+1))
+  fi
+}
+restart_arm
+
+
 echo "---"
 echo "$pass passed, $fail failed"
 exit $((fail > 0))
