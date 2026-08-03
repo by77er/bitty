@@ -874,18 +874,23 @@ impl System {
 
             let grants = Grants { send, stop, spawn, run, net, env, sys, read, write };
 
-            // An alias may only point at something this process could already
-            // message. Otherwise it would be a way to launder authority: a
-            // tool that reaches a process the holder is not permitted to talk
-            // to directly.
+            // An alias *is* a grant: authority to reach exactly one process
+            // with exactly one shape of argument, and nothing else. So it is
+            // bounded by the spawner's own reach rather than by the child's —
+            // a process with no messaging at all can still hold tools, which
+            // is the whole point of handing out a tool instead of a graph.
+            //
+            // What it may not do is launder authority upward. A spawner may
+            // point an alias at anything it could message itself, or at a
+            // process it is creating in this very spawn, and nothing else.
             let mut aliases = Vec::new();
             for alias in &node.aliases {
                 let target = resolve(&alias.target)?;
-                if !grants.send.permits(&target) {
+                if !ceiling.send.permits(&target) && !ids.contains(&target) {
                     return Err(format!(
-                        "Cannot give '{}' the tool '{}': it points at {target}, which that \
-                         process is not permitted to message. An alias cannot grant reach that \
-                         the permissions do not.",
+                        "Cannot give '{}' the tool '{}': it points at {target}, which you are \
+                         not permitted to message. An alias cannot grant reach that you do not \
+                         have yourself.",
                         node.name.as_deref().unwrap_or("the new process"),
                         alias.name,
                     ));

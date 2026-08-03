@@ -9,7 +9,7 @@
 //! (just the briefing) or seeded with a rendered snapshot of the spawner's
 //! conversation.
 
-use crate::grants::Capability;
+use crate::grants::{Capability, Grant};
 use crate::api::Turn;
 use crate::actions;
 use crate::durable::Event;
@@ -295,16 +295,31 @@ async fn execute_tool(
                 },
             };
             let shown = child.name.clone().map(|n| format!(" ({n})")).unwrap_or_default();
+            // Naming the contracts back is what makes the pattern stick: the
+            // parent re-reads this line on every later turn, so what it sees is
+            // the shape it repeats.
+            let contracts: Vec<String> = child.aliases.iter().map(|a| a.name.clone()).collect();
+            let mute = child.wants.send.as_ref().is_some_and(|to| to.is_empty());
             let id = match sys.spawn(&me.id, child) {
                 Ok(id) => id,
                 Err(e) => return (e, true),
             };
+            let reach = if mute {
+                // Worth stating plainly. A parent that thinks it is owed a
+                // reply will otherwise wait for one that cannot arrive.
+                " It has no messaging of its own, so it can only answer the tools you gave it — \
+                 call one to reach it."
+                    .to_string()
+            } else {
+                format!(" It can reach you at your id, {}.", me.id)
+            };
+            let tools = if contracts.is_empty() {
+                String::new()
+            } else {
+                format!(" It sees {} as tools.", contracts.join(", "))
+            };
             (
-                format!(
-                    "Spawned {id}{shown}. It is now working on your instructions and can reach you \
-                     at your id, {}.",
-                    me.id
-                ),
+                format!("Spawned {id}{shown}. It is now working on your instructions.{tools}{reach}"),
                 false,
             )
         }
@@ -960,6 +975,20 @@ fn tool_definitions(me: &Meta) -> Value {
     // per shape, not per process.
     const ALWAYS: [&str; 2] = ["send_message", "list_processes"];
     let permitted = |name: &str| match name {
+        "send_message" => me.grants.send.is_permissive(),
+        // A roster is only useful to a process that can act on a name other
+        // than its own — every process may stop itself, so that alone is not a
+        // reason to hand one out. A process that can name no one else has
+        // nothing to do with a list of ids except learn that a graph exists,
+        // which is exactly what a process holding only tools should not learn.
+        "list_processes" => {
+            me.grants.send.is_permissive()
+                || match &me.grants.stop {
+                    Grant::All => true,
+                    Grant::Nobody => false,
+                    Grant::Ids(ids) => ids.iter().any(|id| *id != me.id),
+                }
+        }
         // Running code inline is the same authority as creating a process to
         // run it, so it rides on the same capability.
         "spawn_process" | "spawn_topology" | "run_script" => me.grants.spawn.is_permissive(),
@@ -983,17 +1012,30 @@ fn tool_definitions(me: &Meta) -> Value {
             optional.push(tool.clone());
         }
     }
-    if let Some(last) = always.last_mut() {
-        last["cache_control"] = json!({"type": "ephemeral"});
-    }
+    // A process holding none of the always-present tools is myopic by
+    // construction: it sees its own aliases and nothing else, so there is no
+    // shared prefix left to mark.
+    let boundary = always.len().checked_sub(1);
     always.extend(optional);
+    if let Some(i) = boundary {
+        always[i]["cache_control"] = json!({"type": "ephemeral"});
+    }
     for alias in &me.aliases {
+        // Naming the process that answers is orientation for a holder that can
+        // already see it, and a graph leak for one that cannot. A myopic
+        // process should learn that it has a tool, not that it has a colleague.
+        let answered_by = me
+            .grants
+            .send
+            .permits(&alias.target)
+            .then(|| format!("Answered by {}. ", alias.target))
+            .unwrap_or_default();
         always.push(json!({
             "name": alias.name,
             "description": format!(
-                "{} (Answered by {}. Arguments are validated against this schema before \
+                "{} ({answered_by}Arguments are validated against this schema before \
                  delivery, and the reply comes back inside this turn.)",
-                alias.description, alias.target
+                alias.description
             ),
             "input_schema": alias.input_schema,
         }));
@@ -1033,7 +1075,7 @@ fn base_tools() -> Value {
                     "can_send_to": {
                         "type": "array",
                         "items": {"type": "string"},
-                        "description": "Restrict who it may message: ids of running processes, 'parent' (you), 'user' (the human console). Omit to give it the same reach you have. Pass [] to isolate it entirely."
+                        "description": "Restrict who it may message: ids of running processes, 'parent' (you), 'user' (the human console). Omit to give it the same reach you have. Pass [] to isolate it entirely — combined with `tools`, and with can_stop: [] and can_spawn: false, that is the strongest form of this whole idea: the process keeps every tool you gave it and loses send_message, list_processes and the spawn tools outright, so it cannot see, name, or route around anything. Prefer it whenever the worker's job is a function of its arguments. Such a worker cannot report back, so call it if you need its answer."
                     },
                     "script": {
                         "type": "string",
@@ -1230,6 +1272,14 @@ calls mid-task. Treat them like interruptions from a collaborator: read them whe
 and factor them into what you do next.
 - When you end a turn without calling a tool, you go idle until the next mailbox message wakes \
 you. Going idle is normal — end your turn when you have nothing left to do.
+- Message text is free-form. Be concise and information-dense.";
+
+/// The half of the preamble that only means anything to a process that can
+/// reach or create other processes. A process holding nothing but tools is not
+/// shown it: telling it how a graph works, while giving it no tool that touches
+/// one, is the exact confusion the tool list was filtered to avoid. Two shapes
+/// means two cache entries, not one per process.
+const GRAPH_PREAMBLE: &str = "\
 - Processes you spawn are linked to you by default, like spawn_link in an actor framework. If a \
 linked process dies unexpectedly or stalls, the harness mails you an <exit_signal> from \
 \"system\". That is how you find out a worker is gone instead of waiting for a reply that will \
@@ -1263,10 +1313,20 @@ defined communication graph.
 genuinely needs your history as background; prefer a well-written briefing over inheriting, \
 since inherited context costs tokens on every one of its turns.
 - Give a worker tools, not instructions, whenever the thing it needs is another process. Passing \
-passing `tools` on spawn turns an instruction like \"send proc-4 a path and it will reply with the \
+`tools` on spawn turns an instruction like \"send proc-4 a path and it will reply with the \
 contents\" into a read_file tool with a checked argument schema, and the worker never learns a \
-graph exists — it just has a tool. That is worth doing even for a single edge: a contract survives being handed to \
-a cheaper model, a convention does not.
+graph exists — it just has a tool. That is worth doing even for a single edge: a contract survives \
+being handed to a cheaper model, a convention does not.
+- Finish that move by passing can_send_to: [], can_stop: [] and can_spawn: false alongside the \
+tools. Then it is not a preference but the shape of the world: send_message, list_processes and \
+the spawn tools are not in that worker's tool list at all, and it is not told a graph exists — so \
+there is no id to guess at, no roster to enumerate, and no way to route around the contract you \
+wrote. It keeps every tool you gave it, because a tool carries its own authority rather than \
+borrowing the holder's. Prefer this whenever a worker's job is a function of its arguments; it is \
+the version that stays true after the worker is handed to a cheaper model or its context is \
+compacted. Note that such a worker cannot report back — it acts through its tools and then ends \
+its turn — so if you need an answer from it, either call it and let it reply, or leave it \
+can_send_to: [\"parent\"].
 - Start an edge as an agent because prose is the fastest way to specify judgment, then demote it \
 to a script once the judgment turns out to be mechanical. The caller does not change, because it \
 only ever knew the tool. Routing, scoring, retrying, formatting and aggregating are all better as \
@@ -1287,14 +1347,25 @@ a stopped id cannot be woken or mailed. If you might get follow-up messages, sta
 /// The system prompt as content blocks, ordered general → specific so the
 /// shared prefix can be cached across every process in the system.
 fn system_blocks(me: &Meta) -> Value {
-    json!([
-        {
-            "type": "text",
-            "text": SHARED_PREAMBLE,
-            "cache_control": {"type": "ephemeral"},
-        },
-        {"type": "text", "text": process_identity(me)},
-    ])
+    // Whether this process can touch anything beyond itself. A process that
+    // cannot is told nothing about the graph it lives in.
+    let connected = me.grants.send.is_permissive()
+        || me.grants.spawn.is_permissive()
+        || match &me.grants.stop {
+            Grant::All => true,
+            Grant::Nobody => false,
+            Grant::Ids(ids) => ids.iter().any(|id| *id != me.id),
+        };
+    let mut blocks = vec![json!({"type": "text", "text": SHARED_PREAMBLE})];
+    if connected {
+        blocks.push(json!({"type": "text", "text": GRAPH_PREAMBLE}));
+    }
+    // The breakpoint sits on the last shared block, so every process of the
+    // same shape shares the whole prefix and nothing per-process precedes it.
+    let last = blocks.len() - 1;
+    blocks[last]["cache_control"] = json!({"type": "ephemeral"});
+    blocks.push(json!({"type": "text", "text": process_identity(me)}));
+    Value::Array(blocks)
 }
 
 /// Everything that varies per process, kept strictly after the cache
@@ -1309,12 +1380,28 @@ fn process_identity(me: &Meta) -> String {
         "You are the root process: the human user talks to you directly, and your plain-text \
          replies stream to their console. Messages arriving from \"user\" are the human typing."
             .to_string()
-    } else {
+    } else if me.grants.send.permits(&me.parent) {
         format!(
             "You were spawned by {}. When you finish a task it gave you, report the result back \
              with send_message — ending your turn without reporting means your work is lost.",
             me.parent
         )
+    } else if me.grants.send.is_permissive() {
+        // Spawned by one process, permitted to answer a different one. Saying
+        // so is better than naming a parent it cannot reach.
+        format!(
+            "You were spawned by {}, which you are not permitted to message. When you finish, \
+             report the result with send_message to whoever your permissions do allow — ending \
+             your turn without reporting means your work is lost.",
+            me.parent
+        )
+    } else {
+        // Nothing to report back with, so asking for a report would only get
+        // this process to spend a turn discovering it cannot. Its work is done
+        // through its tools; ending the turn is the correct ending.
+        "You have no way to message anyone. Do your work through the tools you have and then \
+         end your turn — that is the whole of your job, and nothing is expected of you afterward."
+            .to_string()
     };
 
     let wiring = if me.grants.is_unrestricted() {

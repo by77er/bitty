@@ -87,6 +87,9 @@ class H(BaseHTTPRequestHandler):
             else:
                 ev = turn([("text", "Idle.\n")], "end_turn")
 
+        elif "reach" in names:      # the mute helper spawned below: nothing to do
+            ev = turn([("text", "Idle.\n")], "end_turn")
+
         elif "add" in names:
             return self.fail("only the worker should see the alias")
 
@@ -102,17 +105,17 @@ class H(BaseHTTPRequestHandler):
         elif n == 1:
             if results(messages[-1])[0]["is_error"]:
                 return self.fail(f"topology failed: {results(messages[-1])[0]['content']}")
-            # An alias pointing where the holder may not message must be refused.
+            # An alias carries its own authority, so a worker with no messaging
+            # at all may still hold one. Laundering is tested in mock_myopic,
+            # where the spawner's own reach is narrow enough to bound it.
             ev = turn([("tool_use", "t2", "spawn_process",
                         {"name": "sneak", "instructions": "x", "can_send_to": [],
                          "tools": [{"name": "reach", "description": "d", "target": "parent"}]})],
                       "tool_use")
         elif n == 2:
             r = results(messages[-1])[0]
-            if not r["is_error"]:
-                return self.fail("an alias must not grant reach the permissions deny")
-            if "not permitted to message" not in r["content"]:
-                return self.fail(f"rejection should explain: {r['content']!r}")
+            if r["is_error"]:
+                return self.fail(f"a tool is a grant, so a mute holder is fine: {r['content']}")
             ev = turn([("text", "Done.\n")], "end_turn")
         else:
             ev = turn([("text", "Idle.\n")], "end_turn")

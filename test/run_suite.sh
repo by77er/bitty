@@ -75,6 +75,7 @@ export BITTY_TEST_REPO="$REPO2"
 run "inline typescript (run_script)"            8751 mock_inline.py    --once --allow-read "$REPO2" "compute inline"
 run "tools follow capabilities"                8750 mock_tools.py     --once "spawn a leaf"
 run "agent-to-agent call reply"                8749 mock_reply.py     --once "scout the env"
+run "myopic worker (tools, no graph)"           8756 mock_myopic.py    --once "delegate with tools"
 
 echo "---"
 echo "$pass passed, $fail failed"
