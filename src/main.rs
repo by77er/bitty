@@ -75,6 +75,35 @@ fn new_session_name() -> String {
     name
 }
 
+/// Load `KEY=value` lines into this process's environment, so a token kept in
+/// a file reaches the harness without being exported by hand. Returns the names
+/// it set — never the values, which have no business on a console.
+///
+/// Existing variables win: something already exported is a deliberate act, and
+/// a stale file should not silently override it.
+fn load_env_file(path: &str) -> Result<Vec<String>, String> {
+    let text = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
+    let mut loaded = Vec::new();
+    for line in text.lines() {
+        let line = line.trim().strip_prefix("export ").unwrap_or(line.trim());
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((name, value)) = line.split_once('=') else {
+            continue;
+        };
+        let name = name.trim();
+        let value = value.trim().trim_matches(['"', '\'']);
+        if name.is_empty() || std::env::var_os(name).is_some() {
+            continue;
+        }
+        // SAFETY: single-threaded startup, before any process is spawned.
+        unsafe { std::env::set_var(name, value) };
+        loaded.push(name.to_string());
+    }
+    Ok(loaded)
+}
+
 /// The most recently written session, for a bare `--resume`.
 fn latest_session() -> Option<String> {
     let mut best: Option<(std::time::SystemTime, String)> = None;
@@ -108,6 +137,7 @@ async fn main() -> anyhow::Result<()> {
     let mut allow_env: Vec<String> = Vec::new();
     let mut allow_sys: Vec<String> = Vec::new();
     let mut journal_dir: Option<String> = None;
+    let mut env_file: Option<String> = None;
     let mut session: Option<String> = None;
     let mut resume = false;
     let mut rest: Vec<String> = Vec::new();
@@ -120,6 +150,13 @@ async fn main() -> anyhow::Result<()> {
                 allow_write.push("/".into());
                 allow_all = true;
             }
+            "--env-file" => match args.next() {
+                Some(path) => env_file = Some(path),
+                None => {
+                    eprintln!("--env-file needs a path");
+                    std::process::exit(2);
+                }
+            },
             "--journal" => match args.next() {
                 Some(dir) => journal_dir = Some(dir),
                 None => {
@@ -200,6 +237,26 @@ async fn main() -> anyhow::Result<()> {
              nothing is bounded. Prefer naming what the task needs: --allow-read DIR \
              --allow-write DIR --allow-run PROGRAM --allow-net HOST --allow-env NAME.",
         );
+    }
+
+    // Before the client is built, so a key kept in the file works too. A token
+    // sitting in .env that was never exported is invisible to the harness, and
+    // a process hunting for a variable that is not there is both a waste and an
+    // alarming-looking thing for it to be doing.
+    let named_file = env_file.is_some();
+    match load_env_file(env_file.as_deref().unwrap_or(".env")) {
+        Ok(names) if !names.is_empty() => {
+            ui::system(&format!("loaded {} from .env — grant with --allow-env {}",
+                names.join(", "), names.join(",")));
+        }
+        Ok(_) => {}
+        // Only complain when a file was actually asked for; a missing .env is
+        // the normal case, not a problem.
+        Err(e) if named_file => {
+            eprintln!("cannot read env file: {e}");
+            std::process::exit(2);
+        }
+        Err(_) => {}
     }
 
     let api = api::Client::from_env()?;

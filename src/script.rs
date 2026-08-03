@@ -465,6 +465,25 @@ fn op_bitty_env(
     Ok(std::env::var(&name).unwrap_or_default())
 }
 
+/// Every variable this process may read, as a JSON object. Without it, a
+/// process that cannot find a variable has no way to tell "not set" from
+/// "misremembered the name", and its only recourse is to shell out to `env`
+/// and grep — which is both a worse answer and an alarming-looking one.
+/// The grant does the filtering, so this can never show more than `env` for a
+/// single name already would.
+#[op2]
+#[string]
+fn op_bitty_env_list(state: &mut OpState) -> Result<String, deno_error::JsErrorBox> {
+    let host = state.borrow::<Host>();
+    let mut out = serde_json::Map::new();
+    for (name, value) in std::env::vars() {
+        if host.me.may(crate::grants::Capability::Env, &name) {
+            out.insert(name, json!(value));
+        }
+    }
+    Ok(Value::Object(out).to_string())
+}
+
 #[op2]
 #[string]
 fn op_bitty_sys(
@@ -544,6 +563,9 @@ globalThis.bitty = (() => {
         String(url), String(opts.method ?? "GET"), String(opts.body ?? "")));
     },
     env(name) { return ops.op_bitty_env(String(name)); },
+    // Names, not values: enough to find out what you actually have without
+    // pulling a pile of secrets into a transcript.
+    envNames() { return Object.keys(JSON.parse(ops.op_bitty_env_list())).sort(); },
     sys(key) { return ops.op_bitty_sys(String(key)); },
     exec(program, args = [], cwd = ".") {
       return JSON.parse(ops.op_bitty_exec(String(program), args.map(String), String(cwd)));
@@ -579,7 +601,54 @@ globalThis.bitty = (() => {
   D.env = {
     get: (n) => { const v = api.env(n); return v === "" ? undefined : v; },
     has: (n) => api.env(n) !== "",
+    // Filtered by the grant, so this shows nothing a per-name read would not
+    // already give. A process that cannot find a variable should be able to
+    // look, rather than shelling out to `env` and grepping for likely names.
+    toObject: () => JSON.parse(ops.op_bitty_env_list()),
   };
+
+  // Declared by the TypeScript lib, implemented by an extension we do not
+  // embed. Same trap as URL: without these, code that decodes a subprocess's
+  // output typechecks cleanly and throws at runtime. UTF-8 only.
+  class TextDecoder {
+    constructor(label = "utf-8") { this.encoding = String(label).toLowerCase(); }
+    decode(input) {
+      if (input == null) return "";
+      const bytes = input instanceof ArrayBuffer ? new Uint8Array(input) : input;
+      let out = "";
+      for (let i = 0; i < bytes.length; ) {
+        const b = bytes[i];
+        if (b < 0x80) { out += String.fromCharCode(b); i += 1; }
+        else if (b >= 0xc0 && b < 0xe0) {
+          out += String.fromCharCode(((b & 0x1f) << 6) | (bytes[i + 1] & 0x3f)); i += 2;
+        } else if (b >= 0xe0 && b < 0xf0) {
+          out += String.fromCharCode(((b & 0x0f) << 12) | ((bytes[i + 1] & 0x3f) << 6) | (bytes[i + 2] & 0x3f));
+          i += 3;
+        } else {
+          const cp = ((b & 0x07) << 18) | ((bytes[i + 1] & 0x3f) << 12) | ((bytes[i + 2] & 0x3f) << 6) | (bytes[i + 3] & 0x3f);
+          out += String.fromCodePoint(cp); i += 4;
+        }
+      }
+      return out;
+    }
+  }
+  class TextEncoder {
+    constructor() { this.encoding = "utf-8"; }
+    encode(input = "") {
+      const s = String(input);
+      const out = [];
+      for (const ch of s) {
+        const cp = ch.codePointAt(0);
+        if (cp < 0x80) out.push(cp);
+        else if (cp < 0x800) out.push(0xc0 | (cp >> 6), 0x80 | (cp & 0x3f));
+        else if (cp < 0x10000) out.push(0xe0 | (cp >> 12), 0x80 | ((cp >> 6) & 0x3f), 0x80 | (cp & 0x3f));
+        else out.push(0xf0 | (cp >> 18), 0x80 | ((cp >> 12) & 0x3f), 0x80 | ((cp >> 6) & 0x3f), 0x80 | (cp & 0x3f));
+      }
+      return new Uint8Array(out);
+    }
+  }
+  globalThis.TextDecoder = TextDecoder;
+  globalThis.TextEncoder = TextEncoder;
   // Deno.Command, minus the byte-array plumbing: stdout and stderr come back
   // as strings, which is what a script actually wants here.
   D.Command = class {
@@ -934,6 +1003,7 @@ async fn boot(sys: &Arc<System>, me: &Meta, instructions: &str, source: &str) ->
         op_bitty_fetch(),
         op_bitty_serve(),
         op_bitty_env(),
+        op_bitty_env_list(),
         op_bitty_sys(),
     ];
 
@@ -1022,6 +1092,7 @@ interface BittyApi {
   exec(program: string, args?: string[], cwd?: string): BittyExec;
   fetch(url: string, opts?: { method?: string; body?: string }): { status: number; body: string };
   env(name: string): string;
+  envNames(): string[];
   sys(key: string): string;
 }
 declare const bitty: BittyApi;
