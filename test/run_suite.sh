@@ -7,15 +7,24 @@ cd /home/bit/Code/Bitty || exit 1
 set +m
 SCRATCH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Bracketed so the pattern cannot match the shell that is running this suite.
-LEFTOVER='[t]arget/debug/bitty'
+# Pids of harnesses this suite started, so cleanup never reaches beyond them.
+STARTED=()
+reap_started() {
+  local pid
+  for pid in "${STARTED[@]}"; do
+    kill "$pid" 2>/dev/null
+    wait "$pid" 2>/dev/null
+  done
+  STARTED=()
+}
 pass=0; fail=0
 
 run() {
   local name=$1 port=$2 script=$3; shift 3
-  # A harness left over from an earlier arm keeps retrying and competing for
-  # CPU, which is enough to push a later arm past its timeout. Each arm starts
-  # from a clean slate.
-  pkill -f "$LEFTOVER" >/dev/null 2>&1
+  # Only ever reap harnesses this suite started, tracked by pid. Matching on
+  # the binary path would also kill a bitty someone is running for real, which
+  # is not the suite's business.
+  reap_started
   pkill -f "$script" >/dev/null 2>&1
   # Wait for the previous server to release the port, or the new one binds
   # nothing, dies silently, and the harness fails for an unrelated reason.
@@ -30,13 +39,15 @@ run() {
   local out
   # Generous: spawning a script runs `deno check`, which costs real seconds.
   local start=$SECONDS
-  out=$(ANTHROPIC_API_KEY=test ANTHROPIC_BASE_URL="http://127.0.0.1:$port" \
-        timeout 180 ./target/debug/bitty "$@" 2>&1)
+  local log; log=$(mktemp)
+  ANTHROPIC_API_KEY=test ANTHROPIC_BASE_URL="http://127.0.0.1:$port" \
+        timeout 180 ./target/debug/bitty "$@" > "$log" 2>&1 &
+  local bpid=$!
+  STARTED+=("$bpid")
+  wait "$bpid" 2>/dev/null
+  out=$(cat "$log"); rm -f "$log"
   local elapsed=$((SECONDS - start))
-  # A harness left over from an earlier arm keeps retrying and competing for
-  # CPU, which is enough to push a later arm past its timeout. Each arm starts
-  # from a clean slate.
-  pkill -f "$LEFTOVER" >/dev/null 2>&1
+  reap_started
   pkill -f "$script" >/dev/null 2>&1
   if echo "$out" | grep -q "ASSERTION"; then
     printf 'FAIL  %s\n' "$name"; echo "$out" | grep -o "ASSERTION.*" | head -2 | sed 's/^/      /'
@@ -82,8 +93,10 @@ run "reactive scripts (sleep + socket)"       8758 mock_reactive.py  --once --al
 # Two runs against one journal, so this cannot use the single-run helper above.
 restart_arm() {
   local name="script survives a harness restart" port=8759 start=$SECONDS
-  pkill -f "$LEFTOVER" >/dev/null 2>&1; pkill -f mock_restart.py >/dev/null 2>&1
+  reap_started; pkill -f mock_restart.py >/dev/null 2>&1
   local dir markdir; dir=$(mktemp -d); markdir=$(mktemp -d)
+  # Compact aggressively so a two-phase run actually exercises a checkpoint.
+  export BITTY_COMPACT_FLOOR=1
   export BITTY_RESTART_MARK="$markdir/boots" BITTY_RESTART_PORT=$port
   local out=""
   for phase in 1 2; do
@@ -99,12 +112,13 @@ restart_arm() {
         ./target/debug/bitty --once --journal "$dir" --resume "check" 2>&1)"
     fi
     pkill -f mock_restart.py >/dev/null 2>&1
-    pkill -f "$LEFTOVER" >/dev/null 2>&1
+    reap_started
     for _ in $(seq 40); do
       (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null && exec 3<&- && sleep 0.1 || break
     done
   done
   rm -rf "$dir" "$markdir"
+  unset BITTY_COMPACT_FLOOR
   if echo "$out" | grep -q "ASSERTION"; then
     printf 'FAIL  %s\n' "$name"; echo "$out" | grep -o "ASSERTION.*" | head -2 | sed 's/^/      /'
     fail=$((fail+1))

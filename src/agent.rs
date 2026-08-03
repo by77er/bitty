@@ -192,6 +192,11 @@ async fn drive(
                 // are not run a second time.
                 sys.journal.record(&me.id, &Event::Input { content: json!(blocks) });
                 sys.journal.flush(&me.id);
+                // A turn has just ended, so the log is consistent and nothing is
+                // mid-write. Checked here rather than on a timer for that reason.
+                if sys.journal.should_compact(&me.id) {
+                    sys.journal.compact(&me.id);
+                }
                 history.push(json!({"role": "user", "content": blocks}));
             }
             // Server-side pause; re-send as-is to let the turn resume.

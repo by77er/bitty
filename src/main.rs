@@ -334,6 +334,9 @@ async fn main() -> anyhow::Result<()> {
                 instructions: prompt.clone(),
                 name: Some("root".into()),
                 persona: role,
+                // Root sets the tree's default: anything it spawns inherits
+                // this effort unless the spawn names its own.
+                effort: Some(api::DEFAULT_EFFORT.to_string()),
                 // Always explicit, never inherited: the console's ceiling is
                 // the whole filesystem, so falling through to "inherit" would
                 // silently hand root everything. Empty means no access.

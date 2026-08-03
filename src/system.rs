@@ -1138,6 +1138,10 @@ impl System {
                         },
                     },
                 );
+                // A tombstone needs its identity and the fact that it stopped;
+                // its conversation and mailbox are dead weight from here on.
+                // Compacting now bounds the cost of a graph that churns.
+                self.journal.compact(&p.id);
                 if initiator != Some(p.id.as_str()) {
                     let reason = match initiator {
                         _ if !targets.iter().any(|t| t == &p.id) => {

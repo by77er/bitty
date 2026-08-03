@@ -740,7 +740,13 @@ globalThis.bitty = (() => {
   const ops = Deno.core.ops;
   let handler = null;
   const api = {
-    onMail(fn) { handler = fn; },
+    onMail(fn) {
+      handler = fn;
+      // Startup may await before registering. Anything that arrived in the
+      // meantime is delivered now rather than answered with silence.
+      const waiting = pending.splice(0, pending.length);
+      for (const mail of waiting) globalThis.__bitty_deliver(mail);
+    },
     send(to, message, priority = "high") {
       return ops.op_bitty_send(Array.isArray(to) ? to : [to], String(message), priority);
     },
@@ -1025,6 +1031,7 @@ globalThis.bitty = (() => {
     });
   };
 
+  const pending = [];
   globalThis.__bitty_deliver = async (mail) => {
     // An HTTP request arrives as mail so that it queues, serializes and replies
     // like everything else — but it is dispatched to the serve handler, not to
@@ -1049,8 +1056,8 @@ globalThis.bitty = (() => {
       return;
     }
     if (!handler) {
-      api.log("script received mail but never called bitty.onMail(...)");
-      if (mail.replyTo) ops.op_bitty_reply(mail.replyTo, "");
+      // Not an error yet: the handler may still be a few awaits away.
+      pending.push(mail);
       return;
     }
     // Whatever the handler returns is the answer to a synchronous call. This
@@ -1220,6 +1227,11 @@ async fn actor_loop(
         // A script has no turns, so this is its turn boundary: the point at
         // which what it has consumed is worth making durable.
         sys.journal.flush(&me.id);
+        // A turn has just ended, so the log is consistent and nothing is
+        // mid-write. Checked here rather than on a timer for that reason.
+        if sys.journal.should_compact(&me.id) {
+            sys.journal.compact(&me.id);
+        }
         settled = false;
     }
 }
@@ -1270,14 +1282,7 @@ pub async fn run_inline(sys: Arc<System>, me: Meta, source: String, seconds: u64
                 sys_t.resolve_call(&id, Err(format!("script error: {e}")));
                 return;
             }
-            // Bounded: a script whose startup opens a socket never settles,
-            // and waiting for it here would mean it never reached its mailbox.
-            // Whatever is still pending is driven by the actor loop.
-            let _ = tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                runtime.run_event_loop(PollEventLoopOptions::default()),
-            )
-            .await;
+            let _ = runtime.run_event_loop(PollEventLoopOptions::default()).await;
         });
     });
     if started.is_err() {
@@ -1392,8 +1397,16 @@ async fn boot(sys: &Arc<System>, me: &Meta, instructions: &str, source: &str, re
         finish(sys, me, "script raised at load");
         return None;
     }
-    // Top-level awaits and pending promises from load.
-    let _ = runtime.run_event_loop(PollEventLoopOptions::default()).await;
+    // Give startup a moment to settle, but no more: a script whose top level
+    // runs forever — connect, then read frames until the process is stopped —
+    // would otherwise never return from boot, and a process that never leaves
+    // boot never reaches its mailbox. It looks alive, connects, and answers
+    // nothing. Whatever is still pending is driven by the actor loop's race.
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        runtime.run_event_loop(PollEventLoopOptions::default()),
+    )
+    .await;
     Some(runtime)
 }
 

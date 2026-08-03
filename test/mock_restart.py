@@ -84,6 +84,10 @@ class H(BaseHTTPRequestHandler):
                 r = results(messages[-1])[0]
                 if r["is_error"]:
                     return self.fail(f"spawning the script failed: {r['content']}")
+                # Traffic, so the log has something to compact.
+                ev = turn([("tool_use", "t9", "send_message",
+                            {"to": ["proc-2"], "message": "x" * 400})], "tool_use")
+            elif n == 2:
                 ev = turn([("text", "phase one done\n")], "end_turn")
             else:
                 ev = turn([("text", "idle\n")], "end_turn")

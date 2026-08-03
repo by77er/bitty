@@ -18,7 +18,9 @@ const API_VERSION: &str = "2023-06-01";
 /// What the root process comes up as. Everything it spawns inherits its model
 /// unless the spawn names one, so this is the ceiling of the whole tree rather
 /// than only the first process — put a cheaper model on the workers.
-const DEFAULT_MODEL: &str = "claude-fable-5";
+const DEFAULT_MODEL: &str = "claude-opus-5";
+/// Root's reasoning effort. Spawned processes inherit it the same way.
+pub const DEFAULT_EFFORT: &str = "high";
 const MAX_TOKENS: u64 = 64_000;
 const MAX_ATTEMPTS: u32 = 4;
 
