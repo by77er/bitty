@@ -1302,6 +1302,10 @@ reply_to id, someone is blocked waiting on you: answer with send_message and in_
 topology node. Script processes have the same mailbox, links, permissions and namespace, but they \
 run deterministic code and cost no API tokens. Prefer one for any node whose job is mechanical — \
 routing, aggregating, counting, validating, reformatting — and keep agents for judgment.
+- A script process can serve HTTP with Deno.serve, which is how you expose anything to the outside \
+world. Binding needs a network grant covering that host:port, exactly as reaching out does. Each \
+request arrives as mail and is handled one at a time, so a server is an ordinary actor that \
+happens to have a socket — and it stays up until the process is stopped.
 - When a task needs a primitive you do not have, build it or delegate it — never approximate it. \
 You hold very few tools directly: messaging, spawning, and the ability to run TypeScript. \
 Everything mechanical — reading and writing files, running programs, fetching URLs, searching, \

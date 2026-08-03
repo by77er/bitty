@@ -188,6 +188,208 @@ fn op_bitty_exec(
     .to_string())
 }
 
+/// Bind a port and serve it. The accept loop runs on the *main* runtime, not
+/// in this isolate: a script process is mail-driven, and its event loop is only
+/// pumped while a message is being handled, so a JS-side accept loop would
+/// either block the mailbox or never be polled.
+///
+/// Instead a request becomes what everything else in this system is — a piece
+/// of mail with a reply_to. It queues behind other messages, the handler runs
+/// one at a time the way an actor should, and the reply plumbing is the same
+/// plumbing `call_process` already uses.
+#[op2(fast)]
+fn op_bitty_serve(
+    state: &mut OpState,
+    #[string] hostname: String,
+    #[smi] port: u32,
+) -> Result<(), deno_error::JsErrorBox> {
+    let host = state.borrow::<Host>();
+    let with_port = format!("{hostname}:{port}");
+    if !host.me.may(crate::grants::Capability::Net, &hostname)
+        && !host.me.may(crate::grants::Capability::Net, &with_port)
+    {
+        return Err(fs_error(format!(
+            "not permitted to serve on '{with_port}'; your network grant covers {}",
+            host.me.permitted(crate::grants::Capability::Net)
+        )));
+    }
+
+    let (sys, me) = (host.sys.clone(), host.me.clone());
+    let listener = std::net::TcpListener::bind(&with_port)
+        .map_err(|e| fs_error(format!("cannot bind {with_port}: {e}")))?;
+    listener
+        .set_nonblocking(true)
+        .map_err(|e| fs_error(format!("{with_port}: {e}")))?;
+
+    let tag = me.tag.clone();
+    host.sys.rt().spawn(async move {
+        let Ok(listener) = tokio::net::TcpListener::from_std(listener) else {
+            ui::warn(&tag, "could not take over the listening socket");
+            return;
+        };
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                continue;
+            };
+            // One task per connection so a slow handler cannot wedge the
+            // accept loop; the handlers themselves still serialize, because
+            // they run in the script's single isolate.
+            let (sys, me) = (sys.clone(), me.clone());
+            tokio::spawn(async move {
+                if let Err(e) = serve_connection(stream, &sys, &me).await {
+                    ui::trace(&me.tag, &format!("  http: {e}"));
+                }
+            });
+        }
+    });
+    Ok(())
+}
+
+/// Read one HTTP/1.1 request, hand it to the script as mail, write what comes
+/// back. Deliberately minimal: one request per connection, closed afterward, so
+/// there is no keep-alive state machine to get wrong.
+async fn serve_connection(
+    mut stream: tokio::net::TcpStream,
+    sys: &Arc<System>,
+    me: &Meta,
+) -> Result<(), String> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 4096];
+    // Headers first: read until the blank line that ends them.
+    let head_end = loop {
+        if let Some(at) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            break at + 4;
+        }
+        let n = stream.read(&mut chunk).await.map_err(|e| e.to_string())?;
+        if n == 0 {
+            return Err("connection closed before the request finished".into());
+        }
+        buf.extend_from_slice(&chunk[..n]);
+        if buf.len() > 1_000_000 {
+            return Err("request headers too large".into());
+        }
+    };
+
+    let head = String::from_utf8_lossy(&buf[..head_end]).to_string();
+    let mut lines = head.lines();
+    let request_line = lines.next().unwrap_or_default().to_string();
+    let mut parts = request_line.split_whitespace();
+    let method = parts.next().unwrap_or("GET").to_string();
+    let path = parts.next().unwrap_or("/").to_string();
+
+    let mut headers = serde_json::Map::new();
+    let mut content_length = 0usize;
+    let mut authority = String::from("localhost");
+    for line in lines {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        let (name, value) = (name.trim().to_lowercase(), value.trim().to_string());
+        if name == "content-length" {
+            content_length = value.parse().unwrap_or(0);
+        }
+        if name == "host" {
+            authority = value.clone();
+        }
+        headers.insert(name, json!(value));
+    }
+
+    // Then the body, however much the headers said to expect.
+    let mut body = buf[head_end..].to_vec();
+    while body.len() < content_length {
+        let n = stream.read(&mut chunk).await.map_err(|e| e.to_string())?;
+        if n == 0 {
+            break;
+        }
+        body.extend_from_slice(&chunk[..n]);
+    }
+
+    let (call, rx) = sys.register_call(&me.id, &me.id);
+    let payload = json!({
+        "__http": true,
+        "method": method,
+        "url": format!("http://{authority}{path}"),
+        "headers": headers,
+        "body": String::from_utf8_lossy(&body).to_string(),
+    });
+    if let Err(e) = sys.send(
+        &me.id,
+        Mail {
+            from: "http".into(),
+            from_name: Some("http".into()),
+            body: payload.to_string(),
+            priority: Priority::High,
+            reply_to: Some(call.clone()),
+            seq: 0,
+        },
+    ) {
+        sys.resolve_call(&call, Err(e.clone()));
+        return Err(e);
+    }
+
+    // A handler that never answers must not hold the socket forever.
+    let answered = tokio::time::timeout(std::time::Duration::from_secs(60), rx).await;
+    let (status, extra, text) = match answered {
+        Ok(Ok(Ok(value))) => match serde_json::from_str::<Value>(&value) {
+            Ok(v) if v.get("__status").is_some() => (
+                v["__status"].as_u64().unwrap_or(200) as u16,
+                v["__headers"].clone(),
+                v["__body"].as_str().unwrap_or("").to_string(),
+            ),
+            // A handler that returned a plain value rather than a Response.
+            _ => (200, Value::Null, value),
+        },
+        Ok(Ok(Err(e))) => (500, Value::Null, e),
+        _ => {
+            sys.resolve_call(&call, Err("no response".into()));
+            (504, Value::Null, "the handler did not respond".to_string())
+        }
+    };
+
+    let mut head = format!(
+        "HTTP/1.1 {status} {}\r\ncontent-length: {}\r\nconnection: close\r\n",
+        reason(status),
+        text.len()
+    );
+    let mut had_type = false;
+    if let Some(map) = extra.as_object() {
+        for (name, value) in map {
+            let lower = name.to_lowercase();
+            if lower == "content-length" || lower == "connection" {
+                continue;
+            }
+            had_type |= lower == "content-type";
+            head.push_str(&format!("{lower}: {}\r\n", value.as_str().unwrap_or("")));
+        }
+    }
+    if !had_type {
+        head.push_str("content-type: text/plain; charset=utf-8\r\n");
+    }
+    head.push_str("\r\n");
+    stream.write_all(head.as_bytes()).await.map_err(|e| e.to_string())?;
+    stream.write_all(text.as_bytes()).await.map_err(|e| e.to_string())?;
+    stream.flush().await.map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn reason(status: u16) -> &'static str {
+    match status {
+        200 => "OK",
+        201 => "Created",
+        204 => "No Content",
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
+        404 => "Not Found",
+        405 => "Method Not Allowed",
+        500 => "Internal Server Error",
+        504 => "Gateway Timeout",
+        _ => "OK",
+    }
+}
+
 /// Fetch over HTTP. The host is checked against the grant, and the request is
 /// run on the *main* runtime rather than this script's, so blocking here
 /// stalls only this isolate — which is correct anyway, since an actor handles
@@ -399,7 +601,138 @@ globalThis.bitty = (() => {
     });
   };
 
+  // Enough of Headers/Request/Response for a handler to be written the way it
+  // would be anywhere else. deno_core ships none of the fetch API, so these are
+  // ours; they are not the full spec, and they are not pretending to be.
+  class Headers {
+    constructor(init) {
+      this._m = new Map();
+      if (init) for (const [k, v] of (init[Symbol.iterator] ? init : Object.entries(init))) this.set(k, v);
+    }
+    get(k) { const v = this._m.get(String(k).toLowerCase()); return v === undefined ? null : v; }
+    set(k, v) { this._m.set(String(k).toLowerCase(), String(v)); }
+    has(k) { return this._m.has(String(k).toLowerCase()); }
+    delete(k) { this._m.delete(String(k).toLowerCase()); }
+    entries() { return this._m.entries(); }
+    forEach(fn) { for (const [k, v] of this._m) fn(v, k, this); }
+    [Symbol.iterator]() { return this._m.entries(); }
+    toJSON() { return Object.fromEntries(this._m); }
+  }
+  class Request {
+    constructor(url, init = {}) {
+      this.url = url;
+      this.method = (init.method || "GET").toUpperCase();
+      this.headers = init.headers instanceof Headers ? init.headers : new Headers(init.headers);
+      this._body = init.body == null ? "" : String(init.body);
+    }
+    async text() { return this._body; }
+    async json() { return JSON.parse(this._body || "null"); }
+  }
+  class Response {
+    constructor(body, init = {}) {
+      this._body = body == null ? "" : String(body);
+      this.status = init.status || 200;
+      this.headers = init.headers instanceof Headers ? init.headers : new Headers(init.headers);
+      this.ok = this.status >= 200 && this.status < 300;
+    }
+    static json(value, init = {}) {
+      const r = new Response(JSON.stringify(value), init);
+      if (!r.headers.has("content-type")) r.headers.set("content-type", "application/json");
+      return r;
+    }
+    async text() { return this._body; }
+    async json() { return JSON.parse(this._body || "null"); }
+  }
+  // URL is declared by the TypeScript lib but implemented by an extension we
+  // do not embed, so without this a handler that parses its own path compiles
+  // cleanly and then throws at runtime. Enough of it to route a request.
+  class URLSearchParams {
+    constructor(init = "") {
+      this._p = [];
+      const s = String(init).replace(/^\?/, "");
+      if (s) for (const pair of s.split("&")) {
+        if (!pair) continue;
+        const i = pair.indexOf("=");
+        const k = i < 0 ? pair : pair.slice(0, i);
+        const v = i < 0 ? "" : pair.slice(i + 1);
+        this._p.push([decodeURIComponent(k.replace(/\+/g, " ")), decodeURIComponent(v.replace(/\+/g, " "))]);
+      }
+    }
+    get(k) { const f = this._p.find(([n]) => n === k); return f ? f[1] : null; }
+    getAll(k) { return this._p.filter(([n]) => n === k).map(([, v]) => v); }
+    has(k) { return this._p.some(([n]) => n === k); }
+    entries() { return this._p[Symbol.iterator](); }
+    [Symbol.iterator]() { return this._p[Symbol.iterator](); }
+    toString() { return this._p.map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`).join("&"); }
+  }
+  class URL {
+    constructor(input, base) {
+      let href = String(input);
+      if (base && !/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(href)) {
+        const b = new URL(base);
+        href = href.startsWith("/") ? `${b.protocol}//${b.host}${href}` : `${b.protocol}//${b.host}${b.pathname.replace(/[^/]*$/, "")}${href}`;
+      }
+      const m = /^([a-zA-Z][a-zA-Z0-9+.-]*:)\/\/([^/?#]*)([^?#]*)(\?[^#]*)?(#.*)?$/.exec(href);
+      if (!m) throw new TypeError(`Invalid URL: ${href}`);
+      this.protocol = m[1];
+      this.host = m[2];
+      const at = this.host.lastIndexOf("@");
+      const hostport = at < 0 ? this.host : this.host.slice(at + 1);
+      const colon = hostport.lastIndexOf(":");
+      this.hostname = colon < 0 ? hostport : hostport.slice(0, colon);
+      this.port = colon < 0 ? "" : hostport.slice(colon + 1);
+      this.pathname = m[3] || "/";
+      this.search = m[4] || "";
+      this.hash = m[5] || "";
+      this.searchParams = new URLSearchParams(this.search);
+      this.origin = `${this.protocol}//${this.host}`;
+      this.href = href;
+    }
+    toString() { return this.href; }
+  }
+  globalThis.URL = URL;
+  globalThis.URLSearchParams = URLSearchParams;
+  globalThis.Headers = Headers;
+  globalThis.Request = Request;
+  globalThis.Response = Response;
+
+  let httpHandler = null;
+  Deno.serve = (a, b) => {
+    const opts = typeof a === "function" ? {} : (a || {});
+    const fn = typeof a === "function" ? a : (b || opts.handler);
+    if (typeof fn !== "function") throw new TypeError("Deno.serve needs a handler function");
+    if (httpHandler) throw new Error("this process is already serving; one server per process");
+    const hostname = opts.hostname || "127.0.0.1";
+    const port = opts.port === undefined ? 8000 : opts.port;
+    ops.op_bitty_serve(hostname, port);
+    httpHandler = fn;
+    const addr = { transport: "tcp", hostname, port };
+    if (opts.onListen) opts.onListen(addr);
+    else api.log(`listening on http://${hostname}:${port}/`);
+    // The server lives as long as the process does; stopping the process is
+    // how it shuts down, so `finished` never settles on its own.
+    return { addr, finished: new Promise(() => {}) };
+  };
+
   globalThis.__bitty_deliver = async (mail) => {
+    // An HTTP request arrives as mail so that it queues, serializes and replies
+    // like everything else — but it is dispatched to the serve handler, not to
+    // onMail, so a script can be both a server and a peer.
+    if (mail.from === "http" && httpHandler) {
+      const req = JSON.parse(mail.body);
+      let out;
+      try {
+        const request = new Request(req.url, { method: req.method, headers: req.headers, body: req.body });
+        const response = await httpHandler(request, { remoteAddr: null });
+        const r = response instanceof Response ? response : new Response(String(response ?? ""));
+        out = { __status: r.status, __headers: r.headers.toJSON(), __body: await r.text() };
+      } catch (e) {
+        api.log(`http handler raised: ${e && e.message ? e.message : e}`);
+        out = { __status: 500, __headers: {}, __body: "handler error" };
+      }
+      if (mail.replyTo) ops.op_bitty_reply(mail.replyTo, JSON.stringify(out));
+      return;
+    }
     if (!handler) {
       api.log("script received mail but never called bitty.onMail(...)");
       if (mail.replyTo) ops.op_bitty_reply(mail.replyTo, "");
@@ -599,6 +932,7 @@ async fn boot(sys: &Arc<System>, me: &Meta, instructions: &str, source: &str) ->
         op_bitty_fs_remove(),
         op_bitty_exec(),
         op_bitty_fetch(),
+        op_bitty_serve(),
         op_bitty_env(),
         op_bitty_sys(),
     ];
@@ -691,6 +1025,35 @@ interface BittyApi {
   sys(key: string): string;
 }
 declare const bitty: BittyApi;
+
+declare class Headers {
+  constructor(init?: Record<string, string> | Iterable<[string, string]>);
+  get(name: string): string | null;
+  set(name: string, value: string): void;
+  has(name: string): boolean;
+  delete(name: string): void;
+  entries(): IterableIterator<[string, string]>;
+  forEach(fn: (value: string, name: string, parent: Headers) => void): void;
+  toJSON(): Record<string, string>;
+  [Symbol.iterator](): IterableIterator<[string, string]>;
+}
+declare class Request {
+  constructor(url: string, init?: { method?: string; headers?: Record<string, string> | Headers; body?: string });
+  readonly url: string;
+  readonly method: string;
+  readonly headers: Headers;
+  text(): Promise<string>;
+  json(): Promise<any>;
+}
+declare class Response {
+  constructor(body?: string | null, init?: { status?: number; headers?: Record<string, string> | Headers });
+  static json(value: unknown, init?: { status?: number; headers?: Record<string, string> | Headers }): Response;
+  readonly status: number;
+  readonly ok: boolean;
+  readonly headers: Headers;
+  text(): Promise<string>;
+  json(): Promise<any>;
+}
 "#;
 
 /// Validate a script before anything is spawned, so a mistake is reported to
@@ -710,7 +1073,10 @@ pub fn precheck(name: &str, source: &str) -> Result<(), String> {
 /// real.
 pub fn precheck_as(name: &str, source: &str, inline: bool) -> Result<(), String> {
     let checked = if inline {
-        format!("async function __inline(): Promise<unknown> {{\n{source}\n}}\nvoid __inline;")
+        // The return type is inferred rather than declared: annotating it
+        // Promise<unknown> makes TypeScript demand a return statement, which
+        // rejects every inline script that only has side effects.
+        format!("async function __inline() {{\n{source}\n}}\nvoid __inline;")
     } else {
         source.to_string()
     };
