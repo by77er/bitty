@@ -1270,7 +1270,14 @@ pub async fn run_inline(sys: Arc<System>, me: Meta, source: String, seconds: u64
                 sys_t.resolve_call(&id, Err(format!("script error: {e}")));
                 return;
             }
-            let _ = runtime.run_event_loop(PollEventLoopOptions::default()).await;
+            // Bounded: a script whose startup opens a socket never settles,
+            // and waiting for it here would mean it never reached its mailbox.
+            // Whatever is still pending is driven by the actor loop.
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                runtime.run_event_loop(PollEventLoopOptions::default()),
+            )
+            .await;
         });
     });
     if started.is_err() {
@@ -1336,6 +1343,18 @@ async fn boot(sys: &Arc<System>, me: &Meta, instructions: &str, source: &str, re
 
     // TypeScript is stripped to JavaScript before it ever reaches V8; deno_core
     // runs JS, not TS.
+    // A script is executed as a classic script, where `await` outside a
+    // function is a syntax error — but it is *typechecked* as a module, where
+    // top-level await is perfectly legal. So source that compiles cleanly could
+    // fail to parse, reported as "missing ) after argument list", which points
+    // nowhere near the actual line. Wrapping in an async IIFE makes the two
+    // agree: top-level await works, and the declarations stay visible to the
+    // handler because it closes over this same scope.
+    let wrapped = format!(
+        "(async () => {{\n{source}\n}})().catch((e) => {{ \
+         bitty.log(\"script failed during startup: \" + (e && e.message ? e.message : e)); }});"
+    );
+    let source = wrapped.as_str();
     let js = match transpile(&me.id, source) {
         Ok(js) => js,
         Err(e) => {
@@ -1344,6 +1363,10 @@ async fn boot(sys: &Arc<System>, me: &Meta, instructions: &str, source: &str, re
             return None;
         }
     };
+    // Diagnostic escape hatch: dump exactly what V8 is asked to parse.
+    if let Ok(path) = std::env::var("BITTY_DUMP_JS") {
+        let _ = std::fs::write(path, &js);
+    }
 
     if let Err(e) = runtime.execute_script("[bitty:prelude]", PRELUDE) {
         ui::warn(&me.tag, &format!("prelude failed: {e}"));

@@ -15,6 +15,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 # Sleeps far longer than the test takes. If awaiting blocked the mailbox, the
 # call below would time out instead of being answered.
 SLEEPER = """
+// Top-level await: legal in the module `deno check` validates, so it has to be
+// legal in what actually executes.
+await bitty.sleep(1);
 let woken = 0;
 bitty.onMail(async (mail): Promise<string> => {
   if (mail.body === "nap") { await bitty.sleep(8000); woken++; return "slept"; }
