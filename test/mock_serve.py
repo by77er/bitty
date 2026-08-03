@@ -13,7 +13,7 @@ SERVER = """
 Deno.serve({ port: 8899, hostname: "127.0.0.1" }, async (req: Request): Promise<Response> => {
   const url = new URL(req.url);
   if (url.pathname === "/echo") {
-    return Response.json({ echoed: await req.text(), method: req.method });
+    return Response.json({ echoed: await req.text(), method: req.method, probe: req.headers.get("x-probe") });
   }
   return new Response("hello from " + bitty.id, { headers: { "x-served-by": "bitty" } });
 });
@@ -27,7 +27,7 @@ let last = "";
 while (Date.now() < deadline) {
   try {
     const r = bitty.fetch("http://127.0.0.1:8899/");
-    const e = bitty.fetch("http://127.0.0.1:8899/echo", { method: "POST", body: "ping" });
+    const e = bitty.fetch("http://127.0.0.1:8899/echo", { method: "POST", body: "ping", headers: { "x-probe": "sent" } });
     return r.status + " " + r.body + " | " + e.body;
   } catch (err) { last = String(err); }
 }
@@ -102,6 +102,10 @@ class H(BaseHTTPRequestHandler):
                 return self.fail(f"the handler's response should come back: {got!r}")
             if '"echoed":"ping"' not in got.replace(" ", ""):
                 return self.fail(f"a POST body should reach the handler: {got!r}")
+            # Without headers there is no way to authenticate against any real
+            # API, and the failure looks like a rejected credential.
+            if '"probe":"sent"' not in got.replace(" ", ""):
+                return self.fail(f"request headers must actually be sent: {got!r}")
             # A port outside the net grant must be refused at bind time.
             ev = turn([("tool_use", "t3", "run_script", {"script": DENIED})], "tool_use")
         elif n == 3:

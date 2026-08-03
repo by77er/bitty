@@ -577,6 +577,7 @@ fn op_bitty_fetch(
     #[string] url: String,
     #[string] method: String,
     #[string] body: String,
+    #[string] headers: String,
 ) -> Result<String, deno_error::JsErrorBox> {
     let host = state.borrow::<Host>();
     let parsed = reqwest::Url::parse(&url).map_err(|e| fs_error(format!("{url}: {e}")))?;
@@ -597,20 +598,40 @@ fn op_bitty_fetch(
         )));
     }
 
+    // Headers are the difference between "can make a request" and "can use an
+    // API": without them there is no way to authenticate, and the failure looks
+    // like a rejected credential rather than a missing one.
+    let supplied: serde_json::Map<String, Value> = serde_json::from_str(&headers)
+        .unwrap_or_default();
+
     let client = reqwest::Client::new();
     let (tx, rx) = std::sync::mpsc::channel();
     host.sys.rt().spawn(async move {
-        let request = match method.to_uppercase().as_str() {
+        let mut request = match method.to_uppercase().as_str() {
             "POST" => client.post(parsed).body(body),
             "PUT" => client.put(parsed).body(body),
-            "DELETE" => client.delete(parsed),
+            "PATCH" => client.patch(parsed).body(body),
+            "DELETE" => client.delete(parsed).body(body),
             _ => client.get(parsed),
         };
+        for (name, value) in &supplied {
+            if let Some(value) = value.as_str() {
+                request = request.header(name.as_str(), value);
+            }
+        }
         let outcome = match request.send().await {
             Ok(response) => {
                 let status = response.status().as_u16();
+                // Returned because a caller that cannot see rate-limit headers
+                // has to guess at pacing, and will guess wrong.
+                let mut received = serde_json::Map::new();
+                for (name, value) in response.headers() {
+                    if let Ok(value) = value.to_str() {
+                        received.insert(name.as_str().to_string(), json!(value));
+                    }
+                }
                 match response.text().await {
-                    Ok(text) => Ok((status, text)),
+                    Ok(text) => Ok((status, text, received)),
                     Err(e) => Err(e.to_string()),
                 }
             }
@@ -619,7 +640,12 @@ fn op_bitty_fetch(
         let _ = tx.send(outcome);
     });
     match rx.recv() {
-        Ok(Ok((status, text))) => Ok(json!({"status": status, "body": text}).to_string()),
+        Ok(Ok((status, text, received))) => Ok(json!({
+            "status": status,
+            "body": text,
+            "headers": Value::Object(received),
+        })
+        .to_string()),
         Ok(Err(e)) => Err(fs_error(e)),
         Err(_) => Err(fs_error("the request was dropped".into())),
     }
@@ -735,8 +761,11 @@ globalThis.bitty = (() => {
     // command line. Returns {code, stdout, stderr}.
     // HTTP against hosts this process was granted. Returns {status, body}.
     fetch(url, opts = {}) {
+      const headers = opts.headers ? JSON.stringify(opts.headers) : "{}";
+      const body = opts.body === undefined || opts.body === null
+        ? "" : (typeof opts.body === "string" ? opts.body : JSON.stringify(opts.body));
       return JSON.parse(ops.op_bitty_fetch(
-        String(url), String(opts.method ?? "GET"), String(opts.body ?? "")));
+        String(url), String(opts.method ?? "GET"), body, headers));
     },
     env(name) { return ops.op_bitty_env(String(name)); },
     // Names, not values: enough to find out what you actually have without
@@ -976,10 +1005,21 @@ globalThis.bitty = (() => {
   };
 
   globalThis.fetch = (url, init = {}) => {
-    const r = api.fetch(url, { method: init.method, body: init.body });
+    // Headers may arrive as a plain object or as anything iterable of pairs.
+    let headers = init.headers;
+    if (headers && typeof headers[Symbol.iterator] === "function") {
+      headers = Object.fromEntries(headers);
+    }
+    const r = api.fetch(url, { method: init.method, body: init.body, headers });
     return Promise.resolve({
       status: r.status,
       ok: r.status >= 200 && r.status < 300,
+      headers: {
+        get: (name) => r.headers[String(name).toLowerCase()] ?? null,
+        has: (name) => String(name).toLowerCase() in r.headers,
+        entries: () => Object.entries(r.headers)[Symbol.iterator](),
+        [Symbol.iterator]: () => Object.entries(r.headers)[Symbol.iterator](),
+      },
       text: () => Promise.resolve(r.body),
       json: () => Promise.resolve(JSON.parse(r.body)),
     });
@@ -1361,7 +1401,7 @@ interface BittyApi {
     remove(path: string): string;
   };
   exec(program: string, args?: string[], cwd?: string): BittyExec;
-  fetch(url: string, opts?: { method?: string; body?: string }): { status: number; body: string };
+  fetch(url: string, opts?: { method?: string; body?: string | object; headers?: Record<string, string> }): { status: number; body: string; headers: Record<string, string> };
   env(name: string): string;
   envNames(): string[];
   sleep(ms: number): Promise<void>;
