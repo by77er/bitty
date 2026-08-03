@@ -77,6 +77,7 @@ run "tools follow capabilities"                8750 mock_tools.py     --once "sp
 run "agent-to-agent call reply"                8749 mock_reply.py     --once "scout the env"
 run "myopic worker (tools, no graph)"           8756 mock_myopic.py    --once "delegate with tools"
 run "deno.serve in a script process"        8757 mock_serve.py     --once --allow-net 127.0.0.1:8899 "stand up a server"
+run "reactive scripts (sleep + socket)"       8758 mock_reactive.py  --once --allow-net 127.0.0.1:8901 "be reactive"
 
 echo "---"
 echo "$pass passed, $fail failed"

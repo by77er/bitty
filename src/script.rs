@@ -16,6 +16,8 @@ use crate::system::{Control, Mail, Meta, Priority, Status, System};
 use crate::ui;
 use deno_core::{Extension, JsRuntime, OpDecl, OpState, PollEventLoopOptions, RuntimeOptions, op2};
 use serde_json::{Value, json};
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::sync::Arc;
 use tokio::sync::mpsc::UnboundedReceiver;
 
@@ -390,6 +392,180 @@ fn reason(status: u16) -> &'static str {
     }
 }
 
+/// Wait, without holding the thread. This is an *async* op, so it yields to
+/// the event loop, and the loop that drives a script process races the event
+/// loop against the mailbox — which means a sleeping script is still reachable
+/// and a message still lands the moment it arrives.
+#[op2(async(deferred), nofast)]
+async fn op_bitty_sleep(millis: f64) {
+    let millis = millis.max(0.0).min(86_400_000.0) as u64;
+    tokio::time::sleep(std::time::Duration::from_millis(millis)).await;
+}
+
+/// Open sockets, keyed per process. A script refers to one by number and never
+/// holds a handle, so a socket cannot outlive the isolate that opened it.
+#[derive(Default)]
+struct Sockets {
+    next: u32,
+    open: std::collections::HashMap<u32, SocketHandle>,
+}
+
+struct SocketHandle {
+    outgoing: tokio::sync::mpsc::UnboundedSender<String>,
+    incoming: Arc<tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<Result<String, String>>>>,
+}
+
+/// Connect a WebSocket. This is the primitive that makes a script reactive
+/// rather than a poller: the socket is driven on the main runtime, and the
+/// script awaits the next frame instead of asking repeatedly whether anything
+/// has changed.
+#[op2(async(deferred), nofast)]
+#[smi]
+async fn op_bitty_ws_connect(
+    state: Rc<RefCell<OpState>>,
+    #[string] url: String,
+) -> Result<u32, deno_error::JsErrorBox> {
+    let (sys, me) = {
+        let state = state.borrow();
+        let host = state.borrow::<Host>();
+        (host.sys.clone(), host.me.clone())
+    };
+
+    let parsed = reqwest::Url::parse(&url).map_err(|e| fs_error(format!("{url}: {e}")))?;
+    let Some(hostname) = parsed.host_str().map(String::from) else {
+        return Err(fs_error(format!("{url} names no host")));
+    };
+    let with_port = parsed
+        .port()
+        .map(|p| format!("{hostname}:{p}"))
+        .unwrap_or_else(|| hostname.clone());
+    if !me.may(crate::grants::Capability::Net, &hostname)
+        && !me.may(crate::grants::Capability::Net, &with_port)
+    {
+        return Err(fs_error(format!(
+            "not permitted to reach '{hostname}'; you may reach {}",
+            me.permitted(crate::grants::Capability::Net)
+        )));
+    }
+
+    let (stream, _) = tokio_tungstenite::connect_async(&url)
+        .await
+        .map_err(|e| fs_error(format!("{url}: {e}")))?;
+
+    let (to_socket, mut outbox) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let (inbox_tx, inbox_rx) = tokio::sync::mpsc::unbounded_channel::<Result<String, String>>();
+
+    // The socket is pumped on the main runtime, not in the isolate: V8 is not
+    // Send, and this way a script that is busy handling a message is not also
+    // responsible for keeping a connection alive.
+    sys.rt().spawn(async move {
+        use futures_util::{SinkExt, StreamExt};
+        let (mut write, mut read) = stream.split();
+        loop {
+            tokio::select! {
+                outgoing = outbox.recv() => match outgoing {
+                    Some(text) => {
+                        if write.send(tokio_tungstenite::tungstenite::Message::Text(text.into())).await.is_err() {
+                            let _ = inbox_tx.send(Err("the socket closed while sending".into()));
+                            return;
+                        }
+                    }
+                    None => {
+                        let _ = write.close().await;
+                        return;
+                    }
+                },
+                incoming = read.next() => match incoming {
+                    Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text))) => {
+                        if inbox_tx.send(Ok(text.to_string())).is_err() { return; }
+                    }
+                    Some(Ok(tokio_tungstenite::tungstenite::Message::Close(_))) | None => {
+                        let _ = inbox_tx.send(Err("the socket closed".into()));
+                        return;
+                    }
+                    Some(Err(e)) => {
+                        let _ = inbox_tx.send(Err(e.to_string()));
+                        return;
+                    }
+                    // Ping/pong and binary frames are handled or ignored by the
+                    // library; a text protocol is all this exposes.
+                    Some(Ok(_)) => {}
+                },
+            }
+        }
+    });
+
+    let mut state = state.borrow_mut();
+    let sockets = state.try_borrow_mut::<Sockets>().is_none();
+    if sockets {
+        state.put(Sockets::default());
+    }
+    let sockets = state.borrow_mut::<Sockets>();
+    sockets.next += 1;
+    let id = sockets.next;
+    sockets.open.insert(
+        id,
+        SocketHandle {
+            outgoing: to_socket,
+            incoming: Arc::new(tokio::sync::Mutex::new(inbox_rx)),
+        },
+    );
+    Ok(id)
+}
+
+#[op2(fast)]
+fn op_bitty_ws_send(
+    state: &mut OpState,
+    #[smi] id: u32,
+    #[string] text: String,
+) -> Result<(), deno_error::JsErrorBox> {
+    let sockets = state
+        .try_borrow::<Sockets>()
+        .ok_or_else(|| fs_error("no socket is open".into()))?;
+    let socket = sockets
+        .open
+        .get(&id)
+        .ok_or_else(|| fs_error(format!("socket {id} is not open")))?;
+    socket
+        .outgoing
+        .send(text)
+        .map_err(|_| fs_error(format!("socket {id} has closed")))
+}
+
+/// Await the next frame. Returns null when the socket has closed, so a script
+/// can loop on it without a separate liveness check.
+#[op2(async(deferred), nofast)]
+#[string]
+async fn op_bitty_ws_recv(
+    state: Rc<RefCell<OpState>>,
+    #[smi] id: u32,
+) -> Result<Option<String>, deno_error::JsErrorBox> {
+    let incoming = {
+        let state = state.borrow();
+        let sockets = state
+            .try_borrow::<Sockets>()
+            .ok_or_else(|| fs_error("no socket is open".into()))?;
+        sockets
+            .open
+            .get(&id)
+            .ok_or_else(|| fs_error(format!("socket {id} is not open")))?
+            .incoming
+            .clone()
+    };
+    let mut incoming = incoming.lock().await;
+    match incoming.recv().await {
+        Some(Ok(text)) => Ok(Some(text)),
+        Some(Err(_)) | None => Ok(None),
+    }
+}
+
+#[op2(fast)]
+fn op_bitty_ws_close(state: &mut OpState, #[smi] id: u32) {
+    if let Some(sockets) = state.try_borrow_mut::<Sockets>() {
+        sockets.open.remove(&id);
+    }
+}
+
 /// Fetch over HTTP. The host is checked against the grant, and the request is
 /// run on the *main* runtime rather than this script's, so blocking here
 /// stalls only this isolate — which is correct anyway, since an actor handles
@@ -566,6 +742,27 @@ globalThis.bitty = (() => {
     // Names, not values: enough to find out what you actually have without
     // pulling a pile of secrets into a transcript.
     envNames() { return Object.keys(JSON.parse(ops.op_bitty_env_list())).sort(); },
+    // Waiting without blocking: the process stays reachable while it sleeps,
+    // because the loop that drives it races the event loop against the mailbox.
+    sleep(ms) { return ops.op_bitty_sleep(Number(ms)); },
+    // A socket you await rather than poll. connect resolves to a handle;
+    // recv resolves to the next frame, or null once the socket closes.
+    async connect(url) {
+      const id = await ops.op_bitty_ws_connect(String(url));
+      return {
+        id,
+        send: (text) => ops.op_bitty_ws_send(id, typeof text === "string" ? text : JSON.stringify(text)),
+        recv: () => ops.op_bitty_ws_recv(id),
+        close: () => ops.op_bitty_ws_close(id),
+        async *[Symbol.asyncIterator]() {
+          for (;;) {
+            const frame = await ops.op_bitty_ws_recv(id);
+            if (frame === null) return;
+            yield frame;
+          }
+        },
+      };
+    },
     sys(key) { return ops.op_bitty_sys(String(key)); },
     exec(program, args = [], cwd = ".") {
       return JSON.parse(ops.op_bitty_exec(String(program), args.map(String), String(cwd)));
@@ -606,6 +803,21 @@ globalThis.bitty = (() => {
     // look, rather than shelling out to `env` and grepping for likely names.
     toObject: () => JSON.parse(ops.op_bitty_env_list()),
   };
+
+
+  // Deno.Command, minus the byte-array plumbing: stdout and stderr come back
+  // as strings, which is what a script actually wants here.
+  D.Command = class {
+    constructor(program, options = {}) {
+      this._program = program;
+      this._args = options.args ?? [];
+      this._cwd = options.cwd ?? ".";
+    }
+    outputSync() { return api.exec(this._program, this._args, this._cwd); }
+    output() { return Promise.resolve(this.outputSync()); }
+  };
+
+
 
   // Declared by the TypeScript lib, implemented by an extension we do not
   // embed. Same trap as URL: without these, code that decodes a subprocess's
@@ -649,26 +861,6 @@ globalThis.bitty = (() => {
   }
   globalThis.TextDecoder = TextDecoder;
   globalThis.TextEncoder = TextEncoder;
-  // Deno.Command, minus the byte-array plumbing: stdout and stderr come back
-  // as strings, which is what a script actually wants here.
-  D.Command = class {
-    constructor(program, options = {}) {
-      this._program = program;
-      this._args = options.args ?? [];
-      this._cwd = options.cwd ?? ".";
-    }
-    outputSync() { return api.exec(this._program, this._args, this._cwd); }
-    output() { return Promise.resolve(this.outputSync()); }
-  };
-  globalThis.fetch = (url, init = {}) => {
-    const r = api.fetch(url, { method: init.method, body: init.body });
-    return Promise.resolve({
-      status: r.status,
-      ok: r.status >= 200 && r.status < 300,
-      text: () => Promise.resolve(r.body),
-      json: () => Promise.resolve(JSON.parse(r.body)),
-    });
-  };
 
   // Enough of Headers/Request/Response for a handler to be written the way it
   // would be anywhere else. deno_core ships none of the fetch API, so these are
@@ -783,6 +975,16 @@ globalThis.bitty = (() => {
     return { addr, finished: new Promise(() => {}) };
   };
 
+  globalThis.fetch = (url, init = {}) => {
+    const r = api.fetch(url, { method: init.method, body: init.body });
+    return Promise.resolve({
+      status: r.status,
+      ok: r.status >= 200 && r.status < 300,
+      text: () => Promise.resolve(r.body),
+      json: () => Promise.resolve(JSON.parse(r.body)),
+    });
+  };
+
   globalThis.__bitty_deliver = async (mail) => {
     // An HTTP request arrives as mail so that it queues, serializes and replies
     // like everything else — but it is dispatched to the serve handler, not to
@@ -791,10 +993,14 @@ globalThis.bitty = (() => {
       const req = JSON.parse(mail.body);
       let out;
       try {
-        const request = new Request(req.url, { method: req.method, headers: req.headers, body: req.body });
+        // The real Request throws if a GET or HEAD is given a body, even an
+        // empty one, so the field is omitted rather than passed as "".
+        const init = { method: req.method, headers: req.headers };
+        if (req.body && req.method !== "GET" && req.method !== "HEAD") init.body = req.body;
+        const request = new Request(req.url, init);
         const response = await httpHandler(request, { remoteAddr: null });
         const r = response instanceof Response ? response : new Response(String(response ?? ""));
-        out = { __status: r.status, __headers: r.headers.toJSON(), __body: await r.text() };
+        out = { __status: r.status, __headers: Object.fromEntries(r.headers.entries()), __body: await r.text() };
       } catch (e) {
         api.log(`http handler raised: ${e && e.message ? e.message : e}`);
         out = { __status: 500, __headers: {}, __body: "handler error" };
@@ -869,32 +1075,74 @@ async fn actor_loop(
         None => return,
     };
 
-    loop {
-        me.set_status(Status::Idle);
-        sys.note_quiesced();
+    // Why the event loop is raced rather than awaited to completion: a script
+    // holding a timer or an open socket has work that is *permanently* pending,
+    // so awaiting it would wedge the mailbox forever. Racing it against the
+    // mailbox means async work keeps making progress while the process is idle,
+    // and a message still gets through the moment it arrives. That is what
+    // makes a script reactive instead of only ever running when mailed.
+    //
+    // `settled` records that the isolate has nothing pending, so the loop can
+    // wait quietly on the mailbox rather than re-polling a finished event loop.
+    let mut settled = false;
+    // Whoever is blocked on the message currently being handled, so an async
+    // failure can be reported to them rather than to no one.
+    let mut pending_reply: Option<String> = None;
 
-        let mail = tokio::select! {
-            // Code replacement is out of band, so it is never mistaken for a
-            // message and cannot be starved behind a full mailbox.
-            ctl = control.recv() => {
-                match ctl {
-                    Some(Control::Replace(source)) => {
-                        ui::trace(&me.tag, "⟳ replacing script code");
-                        drop(runtime.take());
-                        match boot(&sys, &me, &instructions, &source).await {
-                            Some(fresh) => runtime = Some(fresh),
-                            None => return,
-                        }
-                        continue;
-                    }
-                    None => return,
+    enum Wake {
+        Ctl(Option<Control>),
+        Mail(Option<Mail>),
+        Quiet(Result<(), String>),
+    }
+
+    loop {
+        if settled {
+            me.set_status(Status::Idle);
+            sys.note_quiesced();
+        }
+
+        let wake = {
+            let js = runtime.as_mut().expect("runtime is present while the loop runs");
+            tokio::select! {
+                // Code replacement is out of band, so it is never mistaken for a
+                // message and cannot be starved behind a full mailbox.
+                ctl = control.recv() => Wake::Ctl(ctl),
+                // recv is cancel-safe, so losing this race never drops a message.
+                mail = mailbox.recv() => Wake::Mail(mail),
+                result = js.run_event_loop(PollEventLoopOptions::default()), if !settled => {
+                    Wake::Quiet(result.map_err(|e| e.to_string()))
                 }
             }
-            mail = mailbox.recv() => {
-                // The sender is dropped when this process is stopped, which is
-                // how a blocked script learns to exit.
-                match mail { Some(mail) => mail, None => return }
+        };
+
+        let mail = match wake {
+            Wake::Quiet(result) => {
+                // Nothing left pending: stop polling and wait for mail.
+                settled = true;
+                if let Err(e) = result {
+                    ui::warn(&me.tag, &format!("handler failed: {e}"));
+                    if let Some(id) = pending_reply.take() {
+                        if sys.call_is_pending(&id) {
+                            sys.resolve_call(&id, Err(format!("the handler raised: {e}")));
+                        }
+                    }
+                }
+                continue;
             }
+            Wake::Ctl(Some(Control::Replace(source))) => {
+                ui::trace(&me.tag, "⟳ replacing script code");
+                drop(runtime.take());
+                match boot(&sys, &me, &instructions, &source).await {
+                    Some(fresh) => runtime = Some(fresh),
+                    None => return,
+                }
+                settled = false;
+                continue;
+            }
+            // The sender is dropped when this process is stopped, which is how
+            // a blocked script learns to exit.
+            Wake::Ctl(None) | Wake::Mail(None) => return,
+            Wake::Mail(Some(mail)) => mail,
         };
 
         me.set_status(Status::Running);
@@ -911,24 +1159,23 @@ async fn actor_loop(
         sys.note_consumed(&me.id, mail.seq);
 
         let call = format!("globalThis.__bitty_deliver({payload});");
+        pending_reply = mail.reply_to.clone();
         let js = runtime.as_mut().expect("runtime is present while the loop runs");
-        let outcome = match js.execute_script("[bitty:mail]", call) {
-            Ok(_) => js
-                .run_event_loop(PollEventLoopOptions::default())
-                .await
-                .map_err(|e| e.to_string()),
-            Err(e) => Err(e.to_string()),
-        };
-        if let Err(e) = outcome {
+        // Only the synchronous part runs here. Whatever the handler leaves
+        // pending is driven by the race at the top of the loop, which is what
+        // lets a handler await a socket without deafening the process.
+        if let Err(e) = js.execute_script("[bitty:mail]", call) {
+            let e = e.to_string();
             ui::warn(&me.tag, &format!("handler failed: {e}"));
             // A caller blocked on this message must not wait for the timeout
             // when the handler has already blown up.
-            if let Some(id) = &mail.reply_to {
-                if sys.call_is_pending(id) {
-                    sys.resolve_call(id, Err(format!("the handler raised: {e}")));
+            if let Some(id) = pending_reply.take() {
+                if sys.call_is_pending(&id) {
+                    sys.resolve_call(&id, Err(format!("the handler raised: {e}")));
                 }
             }
         }
+        settled = false;
     }
 }
 
@@ -1014,6 +1261,11 @@ async fn boot(sys: &Arc<System>, me: &Meta, instructions: &str, source: &str) ->
         op_bitty_exec(),
         op_bitty_fetch(),
         op_bitty_serve(),
+        op_bitty_sleep(),
+        op_bitty_ws_connect(),
+        op_bitty_ws_send(),
+        op_bitty_ws_recv(),
+        op_bitty_ws_close(),
         op_bitty_env(),
         op_bitty_env_list(),
         op_bitty_sys(),
@@ -1087,6 +1339,13 @@ interface BittyMail { from: string; fromName: string | null; body: string;
   priority: "high" | "low"; replyTo: string | null; }
 interface BittyExec { code: number | null; stdout: string; stderr: string; }
 interface BittyEntry { name: string; path: string; dir: boolean; }
+interface BittySocket {
+  id: number;
+  send(text: string | object): void;
+  recv(): Promise<string | null>;
+  close(): void;
+  [Symbol.asyncIterator](): AsyncIterableIterator<string>;
+}
 interface BittyApi {
   id: string; name: string | null; parent: string; instructions: string;
   onMail(handler: (mail: BittyMail, api: BittyApi) => unknown): void;
@@ -1105,6 +1364,8 @@ interface BittyApi {
   fetch(url: string, opts?: { method?: string; body?: string }): { status: number; body: string };
   env(name: string): string;
   envNames(): string[];
+  sleep(ms: number): Promise<void>;
+  connect(url: string): Promise<BittySocket>;
   sys(key: string): string;
 }
 declare const bitty: BittyApi;

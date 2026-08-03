@@ -1302,6 +1302,12 @@ reply_to id, someone is blocked waiting on you: answer with send_message and in_
 topology node. Script processes have the same mailbox, links, permissions and namespace, but they \
 run deterministic code and cost no API tokens. Prefer one for any node whose job is mechanical — \
 routing, aggregating, counting, validating, reformatting — and keep agents for judgment.
+- Scripts are reactive, not pollers. bitty.sleep(ms) waits without blocking, and bitty.connect(url) \
+opens a WebSocket you await rather than poll — `const socket = await bitty.connect(url)`, then \
+`for await (const frame of socket)` or `await socket.recv()`, which resolves to null once it \
+closes. A process stays reachable by mail the whole time it is awaiting, so long-lived listeners \
+are ordinary actors. Reach for a socket or an event stream before you reach for a polling loop; \
+polling is what you do when the service gives you nothing better.
 - A script process can serve HTTP with Deno.serve, which is how you expose anything to the outside \
 world. Binding needs a network grant covering that host:port, exactly as reaching out does. Each \
 request arrives as mail and is handled one at a time, so a server is an ordinary actor that \
