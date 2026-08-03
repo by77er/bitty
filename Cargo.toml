@@ -1,0 +1,15 @@
+[package]
+name = "bitty"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+serde_json = "1"
+futures-util = "0.3"
+anyhow = "1"
+deno_core = "0.409.0"
+deno_ast = { version = "0.53.3", features = ["transpiling"] }
+deno_error = "=0.7.1"
+serde = { version = "1.0.229", features = ["derive"] }

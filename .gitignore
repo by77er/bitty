@@ -1,0 +1,7 @@
+/target
+
+# Local credentials — never commit.
+.env
+
+# Process journals written by --journal / --resume.
+.bitty/
