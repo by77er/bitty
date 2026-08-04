@@ -111,6 +111,65 @@ fn dirs_home() -> Option<std::path::PathBuf> {
 /// Assistant tool calls and their results are separate top-level items here,
 /// not blocks nested in messages, so one Anthropic message can fan out into
 /// several items.
+/// Roughly how much conversation this provider will accept, in characters.
+/// Deliberately conservative: the cost of trimming a little early is a shorter
+/// prompt, and the cost of trimming too late is a turn that cannot run at all.
+const INPUT_BUDGET: usize = 900_000;
+
+/// Drop the oldest exchanges until the conversation fits.
+///
+/// Anthropic compacts server-side; this endpoint does not, so a process that
+/// has been running for two thousand turns will simply be refused. The opening
+/// message is always kept — it is the briefing, and without it a process wakes
+/// up with no idea what it is for.
+///
+/// Trimming from the middle can orphan a tool result whose call is now gone,
+/// which the API rejects, so any output without a surviving call is dropped
+/// with it.
+fn trim(items: Vec<Value>) -> Vec<Value> {
+    let size = |item: &Value| item.to_string().len();
+    let total: usize = items.iter().map(size).sum();
+    if total <= INPUT_BUDGET {
+        return items;
+    }
+
+    let opening = items.first().cloned();
+    let mut kept: Vec<Value> = Vec::new();
+    let mut used = opening.as_ref().map(size).unwrap_or(0);
+    for item in items.iter().skip(1).rev() {
+        let cost = size(item);
+        if used + cost > INPUT_BUDGET {
+            break;
+        }
+        used += cost;
+        kept.push(item.clone());
+    }
+    kept.reverse();
+
+    let calls: std::collections::HashSet<String> = kept
+        .iter()
+        .filter(|i| i["type"] == "function_call")
+        .filter_map(|i| i["call_id"].as_str().map(String::from))
+        .collect();
+    kept.retain(|item| {
+        item["type"] != "function_call_output"
+            || item["call_id"].as_str().is_some_and(|id| calls.contains(id))
+    });
+
+    let mut out = Vec::new();
+    if let Some(opening) = opening {
+        out.push(opening);
+        out.push(json!({
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text":
+                "[earlier turns in this conversation were dropped to fit the context window]"}],
+        }));
+    }
+    out.extend(kept);
+    out
+}
+
 pub fn to_input(messages: &[Value]) -> Vec<Value> {
     let mut input = Vec::new();
     for message in messages {
@@ -166,7 +225,7 @@ pub fn to_input(messages: &[Value]) -> Vec<Value> {
             }));
         }
     }
-    input
+    trim(input)
 }
 
 /// Anthropic tool definitions to Responses function tools.
@@ -307,13 +366,15 @@ pub fn body(
         "input": to_input(messages),
         "tools": to_tools(tools),
         "stream": true,
-        // Server-side threading: the point of the exercise. Storing lets the
-        // next turn reference this one instead of resending the conversation.
-        "store": true,
+        // This endpoint refuses stored responses — it answers "Store must be
+        // set to false" — so there is no server-side thread to reference and
+        // every turn carries its own conversation. What does reduce cost here
+        // is the automatic prefix cache, which needs the prompt to start
+        // identically each turn; that is why the shared preamble and tools
+        // still render first.
+        "store": false,
     });
-    if let Some(previous) = previous {
-        body["previous_response_id"] = json!(previous);
-    }
+    let _ = previous;
     if let Some(effort) = effort {
         body["reasoning"] = json!({"effort": effort});
     }

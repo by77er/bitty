@@ -128,6 +128,28 @@ pub enum Provider {
     Codex(tokio::sync::Mutex<crate::codex::Auth>),
 }
 
+/// Exponential backoff, capped, with jitter, and deferring to `Retry-After`
+/// when the server sends one.
+///
+/// Jitter matters more here than in most clients: a tree of processes shares
+/// one account, so they hit the same limit at the same moment and would
+/// otherwise wake together and collide again. Spreading the retries is what
+/// turns a thundering herd back into a queue.
+fn backoff(attempt: u32, retry_after: Option<&str>) -> Duration {
+    // The server knows better than we do.
+    if let Some(secs) = retry_after.and_then(|v| v.trim().parse::<u64>().ok()) {
+        return Duration::from_secs(secs.clamp(1, 120));
+    }
+    let seconds = 1u64 << attempt.clamp(1, 6);
+    // Up to a quarter of the interval, from the clock rather than a dependency.
+    let spread = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as u64)
+        .unwrap_or(0)
+        % (seconds * 250).max(1);
+    Duration::from_millis(seconds * 1000 + spread)
+}
+
 pub struct Client {
     http: reqwest::Client,
     provider: Provider,
@@ -212,6 +234,14 @@ impl Client {
         })
     }
 
+    /// Whether this provider will compact for us. Anthropic rewrites the
+    /// context server-side and hands back blocks that round-trip; Codex refuses
+    /// stored responses and has no equivalent, so the harness has to summarise
+    /// the conversation itself before it outgrows the window.
+    pub fn compacts_for_us(&self) -> bool {
+        !matches!(self.provider, Provider::Codex(_)) && self.compaction_enabled()
+    }
+
     pub fn compaction_enabled(&self) -> bool {
         self.compaction.load(Ordering::Relaxed)
     }
@@ -266,7 +296,6 @@ impl Client {
         if let Provider::Codex(auth) = &self.provider {
             return self.codex_message(auth, turn, tag).await;
         }
-        let mut delay = Duration::from_secs(1);
         for attempt in 1..=MAX_ATTEMPTS {
             // Rebuilt per attempt so it reflects a latched-off compaction flag.
             let body = self.build_body(&turn);
@@ -279,9 +308,9 @@ impl Client {
                     continue;
                 }
                 Err(e) if attempt < MAX_ATTEMPTS && is_retryable(&e) => {
+                    let delay = backoff(attempt, None);
                     ui::warn(tag, &format!("API error ({e}); retrying in {delay:?}"));
                     tokio::time::sleep(delay).await;
-                    delay *= 2;
                 }
                 Err(e) => return Err(e),
             }
@@ -302,21 +331,18 @@ impl Client {
         // Resume this process's thread if the server still has it, sending only
         // what it has not seen. A thread that is unknown or stale is rebuilt
         // from the full history, which the journal always has.
-        let resumed = self.threads.lock().unwrap().get(turn.process).cloned();
-        let (previous, already) = match resumed {
-            Some((id, sent)) if sent <= turn.messages.len() => (Some(id), sent),
-            _ => (None, 0),
-        };
-        let fresh = &turn.messages[already..];
+        let previous: Option<String> = None;
         let body = crate::codex::body(
             tier,
             turn.effort,
             turn.system,
-            if previous.is_some() { fresh } else { turn.messages },
+            turn.messages,
             turn.tools,
-            previous.as_deref(),
+            None,
         );
-        for attempt in 1..=3 {
+        const CODEX_ATTEMPTS: u32 = 5;
+        let mut refreshed = false;
+        for attempt in 1..=CODEX_ATTEMPTS {
             let (token, account) = {
                 let auth = auth.lock().await;
                 (auth.access_token.clone(), auth.account_id.clone())
@@ -334,9 +360,19 @@ impl Client {
                 .await
                 .context("request failed")?;
             let status = resp.status();
-            if status == reqwest::StatusCode::UNAUTHORIZED && attempt == 1 {
+            if status == reqwest::StatusCode::UNAUTHORIZED && !refreshed {
+                refreshed = true;
                 ui::trace(tag, "  … Codex token expired; refreshing");
                 auth.lock().await.refresh(&self.http).await?;
+                continue;
+            }
+            if status == reqwest::StatusCode::TOO_MANY_REQUESTS && attempt < CODEX_ATTEMPTS {
+                let wait = backoff(
+                    attempt,
+                    resp.headers().get("retry-after").and_then(|v| v.to_str().ok()),
+                );
+                ui::warn(tag, &format!("rate limited; retrying in {wait:?}"));
+                tokio::time::sleep(wait).await;
                 continue;
             }
             if !status.is_success() {
@@ -361,7 +397,7 @@ impl Client {
             }
             return Ok(done);
         }
-        bail!("could not authenticate against Codex")
+        bail!("gave up after {CODEX_ATTEMPTS} attempts (rate limited or unauthenticated)")
     }
 
     async fn consume_codex_stream(
@@ -658,4 +694,53 @@ fn is_retryable(e: &anyhow::Error) -> bool {
         || text.contains("overloaded_error")
         || text.contains("request failed")
         || text.contains("stream interrupted")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Each attempt must wait longer than the last, or it is not backoff.
+    #[test]
+    fn backoff_grows() {
+        let mut last = Duration::ZERO;
+        for attempt in 1..=5 {
+            let wait = backoff(attempt, None);
+            assert!(wait > last, "attempt {attempt} waited {wait:?}, not longer than {last:?}");
+            last = wait;
+        }
+    }
+
+    /// And must stop growing, so a long outage does not park a process for an
+    /// hour.
+    #[test]
+    fn backoff_is_capped() {
+        assert!(backoff(30, None) <= Duration::from_secs(80));
+    }
+
+    /// The server's own advice wins over our guess, within reason.
+    #[test]
+    fn retry_after_is_honored() {
+        assert_eq!(backoff(1, Some("7")), Duration::from_secs(7));
+        assert_eq!(backoff(5, Some("  3 ")), Duration::from_secs(3));
+        // Absurd values are clamped rather than trusted.
+        assert_eq!(backoff(1, Some("99999")), Duration::from_secs(120));
+        // Anything unparseable falls back to the exponential schedule.
+        assert!(backoff(2, Some("in a bit")) >= Duration::from_secs(4));
+    }
+
+    /// Jitter has to actually spread, or a tree of processes retries in
+    /// lockstep and collides again.
+    #[test]
+    fn backoff_is_jittered() {
+        let base = Duration::from_secs(8);
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..50 {
+            let wait = backoff(3, None);
+            assert!(wait >= base && wait < base + Duration::from_secs(3));
+            seen.insert(wait.as_millis());
+            std::thread::sleep(Duration::from_micros(50));
+        }
+        assert!(seen.len() > 1, "every retry waited exactly {base:?}");
+    }
 }

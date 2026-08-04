@@ -91,6 +91,10 @@ run "deno.serve in a script process"        8757 mock_serve.py     --once --allo
 run "reactive scripts (sleep + socket)"       8758 mock_reactive.py  --once --allow-net 127.0.0.1:8901 "be reactive"
 
 # Two runs against one journal, so this cannot use the single-run helper above.
+BITTY_COMPACT_ABOVE=120000 BITTY_COMPACTION=off \
+  run "local compaction (summarise + restart)" 8760 mock_summarize.py --once "the original briefing"
+unset BITTY_COMPACT_ABOVE BITTY_COMPACTION
+
 restart_arm() {
   local name="script survives a harness restart" port=8759 start=$SECONDS
   reap_started; pkill -f mock_restart.py >/dev/null 2>&1

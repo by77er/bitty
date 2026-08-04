@@ -96,6 +96,13 @@ async fn drive(
         if history.is_empty() && !wait_for_mail(&sys, &me, &mut mailbox, &mut history, &mut deferred).await {
             return;
         }
+        // Summarise before the window is a problem, not after: a turn that is
+        // refused for length has already cost the round trip, and the process
+        // has no way to recover on its own.
+        if !sys.api.compacts_for_us() && conversation_size(&history) > compact_above() {
+            compact_conversation(&sys, &me, &system_prompt, &mut history).await;
+        }
+
         me.set_status(Status::Running);
         sys.note_running();
         // Read per turn, so a model switched from the console takes effect on
@@ -1501,6 +1508,110 @@ fn text_block(text: &str) -> Value {
 
 /// If a server-side fallback happened mid-output, blocks before the last
 /// `fallback` marker must drop thinking/tool_use before being echoed back.
+/// Roughly how large a conversation may get before it is summarised. Set well
+/// below what the provider will actually refuse, because compaction itself
+/// needs to fit.
+const COMPACT_ABOVE_DEFAULT: usize = 500_000;
+
+fn compact_above() -> usize {
+    std::env::var("BITTY_COMPACT_ABOVE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(COMPACT_ABOVE_DEFAULT)
+}
+
+/// What Codex's own compaction asks for, near enough: a handoff to a model
+/// that will pick the work up with none of the preceding turns.
+const COMPACT_PROMPT: &str = "\
+You are performing a context checkpoint compaction. Everything above is your own \
+conversation so far, and it is about to be discarded to fit the context window. \
+Write a handoff summary for the model that will continue this work with no other \
+memory of it. Include: what you are trying to achieve, what you have already done \
+and learned, the state of anything you started, which processes you are working \
+with and what each is for, and what you intended to do next. Be specific — ids, \
+names, file paths, decisions and their reasons. Write it as notes to your future \
+self, not as a report to someone else. Do not call any tools.";
+
+fn conversation_size(history: &[Value]) -> usize {
+    history.iter().map(|turn| turn.to_string().len()).sum()
+}
+
+/// Replace a conversation with a summary of itself.
+///
+/// The opening message is kept because it is the briefing — what the process
+/// was created to do — and a summary of the work is not a substitute for the
+/// instruction that started it. Everything between that and now becomes one
+/// user turn. A failure here is survivable: the conversation is left alone and
+/// the request path trims it as a last resort.
+async fn compact_conversation(
+    sys: &Arc<System>,
+    me: &Meta,
+    system_prompt: &Value,
+    history: &mut Vec<Value>,
+) {
+    let before = conversation_size(history);
+    let mut asking = history.clone();
+    asking.push(json!({
+        "role": "user",
+        "content": [text_block(COMPACT_PROMPT)],
+    }));
+    ui::trace(&me.tag, &format!("  … compacting {}k of conversation", before / 1_000));
+
+    let (model, effort) = (me.model(), me.effort());
+    let no_tools = json!([]);
+    let turn = Turn {
+        process: &me.id,
+        system: system_prompt,
+        messages: &asking,
+        // No tools: this turn is meant to produce prose and nothing else.
+        tools: &no_tools,
+        model: &model,
+        effort: effort.as_deref(),
+    };
+    let summary = match sys.api.message(turn, &me.tag).await {
+        Ok(response) => response
+            .content
+            .iter()
+            .filter(|b| b["type"] == "text")
+            .filter_map(|b| b["text"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        Err(e) => {
+            ui::warn(&me.tag, &format!("could not compact ({e}); continuing uncompacted"));
+            return;
+        }
+    };
+    if summary.trim().is_empty() {
+        ui::warn(&me.tag, "compaction produced nothing; continuing uncompacted");
+        return;
+    }
+
+    let opening = history.first().cloned();
+    let mut compacted = Vec::new();
+    if let Some(opening) = opening {
+        compacted.push(opening);
+    }
+    compacted.push(json!({
+        "role": "user",
+        "content": [text_block(&format!(
+            "<compacted_context>\nEarlier turns of this conversation were replaced by this \
+             summary to fit the context window. Treat it as your own memory of the work.\n\n{}\n\
+             </compacted_context>",
+            summary
+        ))],
+    }));
+    *history = compacted;
+
+    sys.journal.record(&me.id, &Event::Compacted { history: history.clone() });
+    sys.journal.flush(&me.id);
+    ui::system(&format!(
+        "{} compacted: {}k → {}k of conversation",
+        me.label(),
+        before / 1_000,
+        conversation_size(history) / 1_000
+    ));
+}
+
 /// Remove thinking blocks from every assistant turn. Returns how many went.
 fn strip_thinking(history: &mut [Value]) -> usize {
     let mut dropped = 0;

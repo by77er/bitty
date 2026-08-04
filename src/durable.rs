@@ -62,6 +62,11 @@ pub enum Event {
     /// A user turn — tool results, mail, or both.
     Input { content: Value },
     Stopped { reason: String },
+    /// The conversation was replaced by a summary of itself. Recorded so a
+    /// resume gets the compacted form rather than replaying the turns it was
+    /// summarised from — otherwise compaction would be undone by the next
+    /// restart.
+    Compacted { history: Vec<Value> },
     /// A model or effort change made while the process was running. Without
     /// this the switch would live only in memory and quietly revert on the
     /// next restart.
@@ -357,6 +362,7 @@ pub fn restore(
             }
             Event::Stopped { .. } => stopped = true,
             Event::Retuned { model, effort } => retuned = Some((model, effort)),
+            Event::Compacted { history: summarised } => history = summarised,
             // A checkpoint supersedes everything before it: reset, then keep
             // folding whatever was appended afterward.
             Event::Checkpoint {
