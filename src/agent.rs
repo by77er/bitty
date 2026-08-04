@@ -98,12 +98,26 @@ async fn drive(
         }
         me.set_status(Status::Running);
         sys.note_running();
+        // Read per turn, so a model switched from the console takes effect on
+        // the next request rather than the next restart.
+        let (model, effort) = (me.model(), me.effort());
+        // Thinking-block signatures belong to the model that produced them, so
+        // replaying them into a different one is rejected. Dropping the traces
+        // is the cost of changing models mid-conversation.
+        if sys.take_switched(&me.id) {
+            let dropped = strip_thinking(&mut history);
+            ui::system(&format!(
+                "{} now on {model} — dropped {dropped} thinking block(s) signed by the previous \
+                 model, and its prompt cache starts cold",
+                me.label()
+            ));
+        }
         let turn = Turn {
             system: &system_prompt,
             messages: &history,
             tools: &tools,
-            model: &me.model,
-            effort: me.effort.as_deref(),
+            model: &model,
+            effort: effort.as_deref(),
         };
         let resp = match sys.api.message(turn, &me.tag).await {
             Ok(resp) => {
@@ -1486,6 +1500,27 @@ fn text_block(text: &str) -> Value {
 
 /// If a server-side fallback happened mid-output, blocks before the last
 /// `fallback` marker must drop thinking/tool_use before being echoed back.
+/// Remove thinking blocks from every assistant turn. Returns how many went.
+fn strip_thinking(history: &mut [Value]) -> usize {
+    let mut dropped = 0;
+    for message in history.iter_mut() {
+        let Some(blocks) = message["content"].as_array_mut() else {
+            continue;
+        };
+        blocks.retain(|block| {
+            let keep = !matches!(
+                block["type"].as_str().unwrap_or(""),
+                "thinking" | "redacted_thinking"
+            );
+            if !keep {
+                dropped += 1;
+            }
+            keep
+        });
+    }
+    dropped
+}
+
 fn sanitize_for_history(content: Vec<Value>) -> Vec<Value> {
     let Some(boundary) = content.iter().rposition(|b| b["type"] == "fallback") else {
         return content;

@@ -234,9 +234,11 @@ struct Entry {
     linked: bool,
     /// This process's capabilities — also the ceiling for anything it spawns.
     grants: Grants,
-    /// Model and effort, inherited by anything this process spawns.
-    model: String,
-    effort: Option<String>,
+    /// Model and effort, inherited by anything this process spawns. Shared
+    /// with the running process's `Meta` rather than copied, so switching a
+    /// model in flight is seen by the next turn instead of the next restart.
+    model: Arc<Mutex<String>>,
+    effort: Arc<Mutex<Option<String>>>,
     /// "script", or "model/effort" for an agent — what /graph shows.
     runs: String,
     /// Script processes only: the channel for code replacement.
@@ -262,11 +264,21 @@ pub struct Meta {
     pub context_tokens: Arc<AtomicU64>,
     /// Resolved aliases, rendered into this process's tool list.
     pub aliases: Vec<ToolAlias>,
-    pub model: String,
-    pub effort: Option<String>,
+    /// Read per turn, not captured at spawn — see `Entry::model`.
+    pub model: Arc<Mutex<String>>,
+    pub effort: Arc<Mutex<Option<String>>>,
 }
 
 impl Meta {
+    /// The model this process should use for its next turn.
+    pub fn model(&self) -> String {
+        self.model.lock().unwrap().clone()
+    }
+
+    pub fn effort(&self) -> Option<String> {
+        self.effort.lock().unwrap().clone()
+    }
+
     /// Returns true if this was an actual transition, so callers can log
     /// state changes without narrating every turn.
     pub fn set_status(&self, status: Status) -> bool {
@@ -338,6 +350,8 @@ pub struct System {
     /// Held for the whole of a spawn so ids can be handed back if validation
     /// fails. Without it two concurrent spawns could reserve overlapping ids.
     spawning: Mutex<()>,
+    /// Processes whose model changed since their last turn.
+    switched: Mutex<HashSet<String>>,
     /// In-flight synchronous calls, keyed by correlation id.
     pending: Mutex<HashMap<String, PendingCall>>,
     calls: AtomicU64,
@@ -354,6 +368,7 @@ impl System {
             api,
             quiesce_announced: AtomicBool::new(false),
             spawning: Mutex::new(()),
+            switched: Mutex::new(HashSet::new()),
             pending: Mutex::new(HashMap::new()),
             calls: AtomicU64::new(0),
             journal: Arc::new(NoJournal),
@@ -396,6 +411,8 @@ impl System {
             None => record.id.clone(),
         };
 
+        let model_cell = Arc::new(Mutex::new(record.model.clone()));
+        let effort_cell = Arc::new(Mutex::new(record.effort.clone()));
         self.procs.lock().unwrap().push(Entry {
             id: record.id.clone(),
             name: record.name.clone(),
@@ -406,8 +423,8 @@ impl System {
             context_tokens: context_tokens.clone(),
             linked: record.linked,
             grants: record.grants.clone(),
-            model: record.model.clone(),
-            effort: record.effort.clone(),
+            model: model_cell.clone(),
+            effort: effort_cell.clone(),
             runs: record.kind.label(&record.model, &record.effort),
             control: Mutex::new(match record.kind {
                 Kind::Script(_) => Some(control_tx),
@@ -427,8 +444,8 @@ impl System {
             labels: HashMap::new(),
             context_tokens,
             aliases: record.aliases.clone(),
-            model: record.model.clone(),
-            effort: record.effort.clone(),
+            model: model_cell.clone(),
+            effort: effort_cell.clone(),
         };
 
         let id = record.id.clone();
@@ -673,9 +690,9 @@ impl System {
                 .map(|p| p.grants.clone())
                 .unwrap_or_else(Grants::console_authority); // parent == "user"
             let model = me
-                .map(|p| p.model.clone())
+                .map(|p| p.model.lock().unwrap().clone())
                 .unwrap_or_else(|| self.api.model.clone());
-            let effort = me.and_then(|p| p.effort.clone());
+            let effort = me.and_then(|p| p.effort.lock().unwrap().clone());
             let existing: Vec<(String, Option<String>)> = procs
                 .iter()
                 .map(|p| (p.id.clone(), p.name.clone()))
@@ -921,6 +938,13 @@ impl System {
             let (control_tx, control_rx) = mpsc::unbounded_channel::<Control>();
             let status = Arc::new(Mutex::new(Status::Running));
             let context_tokens = Arc::new(AtomicU64::new(0));
+            // One cell, held by the registry and the running process alike.
+            let spawn_model = Arc::new(Mutex::new(
+                node.model.clone().unwrap_or_else(|| inherited_model.clone()),
+            ));
+            let spawn_effort = Arc::new(Mutex::new(
+                node.effort.clone().or_else(|| inherited_effort.clone()),
+            ));
 
             self.procs.lock().unwrap().push(Entry {
                 id: id.clone(),
@@ -932,8 +956,8 @@ impl System {
                 context_tokens: context_tokens.clone(),
                 linked: node.link,
                 grants: grants.clone(),
-                model: node.model.clone().unwrap_or_else(|| inherited_model.clone()),
-                effort: node.effort.clone().or_else(|| inherited_effort.clone()),
+                model: spawn_model.clone(),
+                effort: spawn_effort.clone(),
                 control: Mutex::new(match node.kind {
                     Kind::Script(_) => Some(control_tx),
                     Kind::Agent => None,
@@ -976,8 +1000,8 @@ impl System {
                 labels,
                 context_tokens,
                 aliases,
-                model: node.model.clone().unwrap_or_else(|| inherited_model.clone()),
-                effort: node.effort.clone().or_else(|| inherited_effort.clone()),
+                model: spawn_model.clone(),
+                effort: spawn_effort.clone(),
             };
 
             let handle = match node.kind.clone() {
@@ -1060,6 +1084,65 @@ impl System {
     /// A process stopping *itself* is a graceful exit and stays quiet; every
     /// other death is abnormal and notifies its neighbors, because otherwise
     /// anyone waiting on it waits forever.
+    /// Switch a process's model and effort while it runs. Takes effect on its
+    /// next turn, because the loop reads both per turn rather than caching
+    /// them at spawn.
+    pub fn set_model(
+        &self,
+        id: &str,
+        model: &str,
+        effort: Option<&str>,
+    ) -> Result<String, String> {
+        // Same validation as spawn, so a typo fails here rather than as a 400
+        // on the process's next turn.
+        if !model.starts_with("claude-") {
+            return Err(format!(
+                "'{model}' is not a Claude model — try claude-opus-5, claude-sonnet-5 or \
+                 claude-haiku-4-5."
+            ));
+        }
+        if let Some(effort) = effort {
+            if !EFFORT_LEVELS.contains(&effort) {
+                return Err(format!(
+                    "'{effort}' is not an effort level; use one of {}.",
+                    EFFORT_LEVELS.join(", ")
+                ));
+            }
+        }
+        let procs = self.procs.lock().unwrap();
+        let Some(entry) = procs.iter().find(|p| p.id == id) else {
+            return Err(format!("No such process: {id}."));
+        };
+        if matches!(*entry.status.lock().unwrap(), Status::Stopped) {
+            return Err(format!("{id} has been stopped."));
+        }
+        if entry.control.lock().unwrap().is_some() {
+            return Err(format!("{id} is a script — it runs code, not a model."));
+        }
+        let was = entry.model.lock().unwrap().clone();
+        *entry.model.lock().unwrap() = model.to_string();
+        if let Some(effort) = effort {
+            *entry.effort.lock().unwrap() = Some(effort.to_string());
+        }
+        // A switch invalidates the prompt cache for this process, and the
+        // thinking blocks in its history were signed by the old model. Both
+        // are the caller's to act on, so say so rather than leaving it to be
+        // discovered as a failed turn.
+        self.switched.lock().unwrap().insert(id.to_string());
+        Ok(format!(
+            "{id}: {was} → {model}{}. Takes effect on its next turn; its prompt cache starts \
+             cold, and prior thinking blocks are dropped because their signatures belong to the \
+             old model.",
+            effort.map(|e| format!(" at {e} effort")).unwrap_or_default()
+        ))
+    }
+
+    /// Whether this process just changed model and therefore needs its history
+    /// cleaned before the next request. Consumed once.
+    pub fn take_switched(&self, id: &str) -> bool {
+        self.switched.lock().unwrap().remove(id)
+    }
+
     pub fn stop(
         &self,
         targets: &[String],

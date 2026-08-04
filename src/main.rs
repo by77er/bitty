@@ -22,6 +22,7 @@
 //!   @proc-3 message   → mail to a specific process
 //!   /ps               → list processes
 //!   /graph            → supervision tree + who may message whom
+//!   /model proc-1 M [E] → switch a process's model (and effort) in flight
 //!   /stop proc-3      → stop a process (add --cascade for its descendants)
 //!   /quit             → exit
 
@@ -260,7 +261,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let api = api::Client::from_env()?;
-    ui::system(&format!("bitty · model {} · /ps /graph /stop /quit · '@proc-N msg' targets a process, plain text goes to root", api.model));
+    ui::system(&format!("bitty · model {} · /ps /graph /model /stop /quit · '@proc-N msg' targets a process, plain text goes to root", api.model));
 
     // Persistence is the default, not something to remember to switch on: an
     // interactive run that dies having built a world of scripts should be
@@ -387,6 +388,18 @@ async fn main() -> anyhow::Result<()> {
             "/quit" | "/exit" => break,
             "/ps" => ui::system(&sys.list()),
             "/graph" | "/tree" => ui::system(&sys.graph()),
+            _ if line.starts_with("/model") => {
+                let args: Vec<&str> = line["/model".len()..].split_whitespace().collect();
+                match args.as_slice() {
+                    [id, model, rest @ ..] => {
+                        match sys.set_model(id, model, rest.first().copied()) {
+                            Ok(report) => ui::system(&report),
+                            Err(why) => ui::system(&why),
+                        }
+                    }
+                    _ => ui::system("usage: /model proc-1 claude-opus-5 [high]"),
+                }
+            }
             _ if line.starts_with("/stop") => {
                 let rest = line["/stop".len()..].trim();
                 let cascade = rest.split_whitespace().any(|t| t == "--cascade");
