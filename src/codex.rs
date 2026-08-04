@@ -194,6 +194,8 @@ pub struct Accumulated {
     pub content: Vec<Value>,
     pub stop_reason: String,
     pub input_tokens: u64,
+    /// This response's id, to thread the next turn onto.
+    pub id: Option<String>,
 }
 
 #[derive(Default)]
@@ -201,6 +203,7 @@ pub struct Stream {
     text: String,
     calls: Vec<Value>,
     input_tokens: u64,
+    id: Option<String>,
     failed: Option<String>,
 }
 
@@ -235,6 +238,7 @@ impl Stream {
                 self.input_tokens = event["response"]["usage"]["input_tokens"]
                     .as_u64()
                     .unwrap_or(0);
+                self.id = event["response"]["id"].as_str().map(String::from);
             }
             "response.failed" | "error" => {
                 self.failed = Some(
@@ -264,17 +268,27 @@ impl Stream {
             content,
             stop_reason: stop_reason.to_string(),
             input_tokens: self.input_tokens,
+            id: self.id,
         })
     }
 }
 
 /// The request body for one turn.
+/// One turn's request.
+///
+/// `previous` is the id of the last response on this process's thread. When it
+/// is set the server already holds everything before it, so `messages` is only
+/// what is new — which is the whole point: a process with a large conversation
+/// stops re-transmitting it every turn and sends a couple of tool results
+/// instead. When it is `None` the full history goes, which is what happens on
+/// the first turn and after the server forgets a thread.
 pub fn body(
     tier: crate::api::Tier,
     effort: Option<&str>,
     system: &Value,
     messages: &[Value],
     tools: &Value,
+    previous: Option<&str>,
 ) -> Value {
     // Bitty's system prompt is a list of cacheable blocks; Responses takes one
     // string, so the cache_control breakpoints simply have nowhere to go.
@@ -293,8 +307,13 @@ pub fn body(
         "input": to_input(messages),
         "tools": to_tools(tools),
         "stream": true,
-        "store": false,
+        // Server-side threading: the point of the exercise. Storing lets the
+        // next turn reference this one instead of resending the conversation.
+        "store": true,
     });
+    if let Some(previous) = previous {
+        body["previous_response_id"] = json!(previous);
+    }
     if let Some(effort) = effort {
         body["reasoning"] = json!({"effort": effort});
     }

@@ -113,6 +113,7 @@ async fn drive(
             ));
         }
         let turn = Turn {
+            process: &me.id,
             system: &system_prompt,
             messages: &history,
             tools: &tools,

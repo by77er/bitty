@@ -142,6 +142,10 @@ pub struct Client {
     /// the API tells us a parameter is unsupported. One rejected turn teaches
     /// the client permanently instead of failing every turn after it.
     caps: std::sync::Mutex<HashMap<String, Caps>>,
+    /// Codex only: per-process (last response id, messages already sent).
+    /// Threading is what makes a long conversation cheap — without it every
+    /// turn re-transmits the whole thing.
+    threads: std::sync::Mutex<HashMap<String, (String, usize)>>,
 }
 
 /// One request's worth of per-process configuration. Model and effort vary by
@@ -149,6 +153,9 @@ pub struct Client {
 /// cache prefix, so any variation there would fork the shared prefix at
 /// position zero and cost more than the tokens it saved.
 pub struct Turn<'a> {
+    /// Which process this turn belongs to, so a server-side thread can be kept
+    /// per process rather than per client.
+    pub process: &'a str,
     pub system: &'a Value,
     pub messages: &'a [Value],
     pub tools: &'a Value,
@@ -157,6 +164,8 @@ pub struct Turn<'a> {
 }
 
 pub struct FinalMessage {
+    /// Codex only: the id to thread the next turn onto.
+    pub thread: Option<String>,
     pub content: Vec<Value>,
     pub stop_reason: String,
     /// Total prompt size for this turn: uncached + cache-write + cache-read.
@@ -199,6 +208,7 @@ impl Client {
                 !matches!(std::env::var("BITTY_COMPACTION").as_deref(), Ok("off")),
             ),
             caps: std::sync::Mutex::new(HashMap::new()),
+            threads: std::sync::Mutex::new(HashMap::new()),
         })
     }
 
@@ -289,8 +299,24 @@ impl Client {
         tag: &Tag,
     ) -> Result<FinalMessage> {
         let tier = Tier::parse(turn.model).unwrap_or(Tier::Large);
-        let body = crate::codex::body(tier, turn.effort, turn.system, turn.messages, turn.tools);
-        for attempt in 1..=2 {
+        // Resume this process's thread if the server still has it, sending only
+        // what it has not seen. A thread that is unknown or stale is rebuilt
+        // from the full history, which the journal always has.
+        let resumed = self.threads.lock().unwrap().get(turn.process).cloned();
+        let (previous, already) = match resumed {
+            Some((id, sent)) if sent <= turn.messages.len() => (Some(id), sent),
+            _ => (None, 0),
+        };
+        let fresh = &turn.messages[already..];
+        let body = crate::codex::body(
+            tier,
+            turn.effort,
+            turn.system,
+            if previous.is_some() { fresh } else { turn.messages },
+            turn.tools,
+            previous.as_deref(),
+        );
+        for attempt in 1..=3 {
             let (token, account) = {
                 let auth = auth.lock().await;
                 (auth.access_token.clone(), auth.account_id.clone())
@@ -315,9 +341,25 @@ impl Client {
             }
             if !status.is_success() {
                 let text = resp.text().await.unwrap_or_default();
+                // The server forgot this thread: drop it and let the next
+                // attempt send the conversation in full.
+                if previous.is_some() && (status == reqwest::StatusCode::NOT_FOUND
+                    || text.contains("previous_response_id"))
+                {
+                    ui::trace(tag, "  … thread expired; resending the conversation");
+                    self.threads.lock().unwrap().remove(turn.process);
+                    return Box::pin(self.codex_message(auth, turn, tag)).await;
+                }
                 bail!("HTTP {status}: {text}");
             }
-            return self.consume_codex_stream(resp, tag).await;
+            let done = self.consume_codex_stream(resp, tag).await?;
+            if let Some(id) = &done.thread {
+                self.threads
+                    .lock()
+                    .unwrap()
+                    .insert(turn.process.to_string(), (id.clone(), turn.messages.len()));
+            }
+            return Ok(done);
         }
         bail!("could not authenticate against Codex")
     }
@@ -360,6 +402,7 @@ impl Client {
         }
         let done = acc.finish()?;
         Ok(FinalMessage {
+            thread: done.id,
             content: done.content,
             stop_reason: done.stop_reason,
             input_tokens: done.input_tokens,
@@ -489,6 +532,8 @@ impl Client {
         }
 
         Ok(FinalMessage {
+            // Anthropic has no server-side thread; the conversation is resent.
+            thread: None,
             content,
             stop_reason,
             input_tokens,
