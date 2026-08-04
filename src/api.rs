@@ -15,10 +15,63 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 const API_VERSION: &str = "2023-06-01";
+
+/// How much model a process gets, independent of who is serving it.
+///
+/// The harness talks in tiers and each provider names its own model, so a
+/// topology written against one backend runs unchanged on another and a
+/// journaled session survives a provider switch. Concrete ids are still
+/// accepted — an old journal is full of them — and resolve to the tier they
+/// belonged to.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Tier {
+    Small,
+    Medium,
+    Large,
+}
+
+impl Tier {
+    /// What Anthropic calls each tier.
+    pub fn anthropic(self) -> &'static str {
+        match self {
+            Tier::Small => "claude-haiku-4-5",
+            Tier::Medium => "claude-sonnet-5",
+            Tier::Large => "claude-opus-5",
+        }
+    }
+
+    pub const NAMES: [&'static str; 3] = ["small", "medium", "large"];
+
+    pub fn parse(name: &str) -> Option<Tier> {
+        let name = name.trim();
+        match name {
+            "small" => Some(Tier::Small),
+            "medium" => Some(Tier::Medium),
+            "large" => Some(Tier::Large),
+            // Legacy concrete ids, so journals and prompts written before
+            // tiers existed still resolve.
+            m if m.starts_with("claude-haiku") || m.ends_with("-luna") => Some(Tier::Small),
+            m if m.starts_with("claude-sonnet") || m.ends_with("-terra") => Some(Tier::Medium),
+            m if m.starts_with("claude-opus")
+                || m.starts_with("claude-fable")
+                || m.starts_with("claude-mythos")
+                || m.ends_with("-sol") => Some(Tier::Large),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Tier::Small => "small",
+            Tier::Medium => "medium",
+            Tier::Large => "large",
+        }
+    }
+}
 /// What the root process comes up as. Everything it spawns inherits its model
 /// unless the spawn names one, so this is the ceiling of the whole tree rather
 /// than only the first process — put a cheaper model on the workers.
-const DEFAULT_MODEL: &str = "claude-opus-5";
+const DEFAULT_MODEL: &str = "large";
 /// Root's reasoning effort. Spawned processes inherit it the same way.
 pub const DEFAULT_EFFORT: &str = "high";
 const MAX_TOKENS: u64 = 64_000;
@@ -66,8 +119,18 @@ impl Caps {
     }
 }
 
+/// Which backend a turn is sent to. The rest of the harness is unaware: it
+/// hands over a `Turn` and receives a `FinalMessage` either way.
+pub enum Provider {
+    Anthropic,
+    /// OpenAI's Responses API, authenticated with the Codex CLI's stored
+    /// ChatGPT credentials.
+    Codex(tokio::sync::Mutex<crate::codex::Auth>),
+}
+
 pub struct Client {
     http: reqwest::Client,
+    provider: Provider,
     auth: Auth,
     base_url: String,
     pub model: String,
@@ -114,7 +177,17 @@ impl Client {
                  or: ant auth login && eval \"$(ant auth print-credentials --env)\""
             );
         };
+        // Codex when asked for, or whenever its credentials are present and no
+        // Anthropic key is: the common case is a machine set up for one or the
+        // other, and guessing wrong costs a failed turn rather than money.
+        let wants_codex = matches!(std::env::var("BITTY_PROVIDER").as_deref(), Ok("codex"));
+        let provider = if wants_codex {
+            Provider::Codex(tokio::sync::Mutex::new(crate::codex::Auth::load()?))
+        } else {
+            Provider::Anthropic
+        };
         Ok(Client {
+            provider,
             http: reqwest::Client::builder()
                 .connect_timeout(Duration::from_secs(30))
                 .build()?,
@@ -180,6 +253,9 @@ impl Client {
     /// One model turn: send the conversation, stream the response (printing
     /// text live under `tag`), return the accumulated message.
     pub async fn message(&self, turn: Turn<'_>, tag: &Tag) -> Result<FinalMessage> {
+        if let Provider::Codex(auth) = &self.provider {
+            return self.codex_message(auth, turn, tag).await;
+        }
         let mut delay = Duration::from_secs(1);
         for attempt in 1..=MAX_ATTEMPTS {
             // Rebuilt per attempt so it reflects a latched-off compaction flag.
@@ -203,10 +279,98 @@ impl Client {
         unreachable!()
     }
 
+    /// One turn against the Responses API. A 401 means the stored access token
+    /// has aged out, so refresh once and retry rather than failing a turn for
+    /// something the harness can fix itself.
+    async fn codex_message(
+        &self,
+        auth: &tokio::sync::Mutex<crate::codex::Auth>,
+        turn: Turn<'_>,
+        tag: &Tag,
+    ) -> Result<FinalMessage> {
+        let tier = Tier::parse(turn.model).unwrap_or(Tier::Large);
+        let body = crate::codex::body(tier, turn.effort, turn.system, turn.messages, turn.tools);
+        for attempt in 1..=2 {
+            let (token, account) = {
+                let auth = auth.lock().await;
+                (auth.access_token.clone(), auth.account_id.clone())
+            };
+            let resp = self
+                .http
+                .post(crate::codex::endpoint())
+                .bearer_auth(&token)
+                .header("ChatGPT-Account-Id", &account)
+                .header("OpenAI-Beta", "responses=experimental")
+                .header("originator", "codex_cli_rs")
+                .header("accept", "text/event-stream")
+                .json(&body)
+                .send()
+                .await
+                .context("request failed")?;
+            let status = resp.status();
+            if status == reqwest::StatusCode::UNAUTHORIZED && attempt == 1 {
+                ui::trace(tag, "  … Codex token expired; refreshing");
+                auth.lock().await.refresh(&self.http).await?;
+                continue;
+            }
+            if !status.is_success() {
+                let text = resp.text().await.unwrap_or_default();
+                bail!("HTTP {status}: {text}");
+            }
+            return self.consume_codex_stream(resp, tag).await;
+        }
+        bail!("could not authenticate against Codex")
+    }
+
+    async fn consume_codex_stream(
+        &self,
+        resp: reqwest::Response,
+        tag: &Tag,
+    ) -> Result<FinalMessage> {
+        let mut acc = crate::codex::Stream::default();
+        let mut line_buf = String::new();
+        let mut buf = String::new();
+        let mut stream = resp.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            buf.push_str(&String::from_utf8_lossy(&chunk.context("stream interrupted")?));
+            while let Some(cut) = buf.find('\n') {
+                let line = buf[..cut].trim().to_string();
+                buf.drain(..=cut);
+                let Some(payload) = line.strip_prefix("data:") else {
+                    continue;
+                };
+                let payload = payload.trim();
+                if payload.is_empty() || payload == "[DONE]" {
+                    continue;
+                }
+                let Ok(event) = serde_json::from_str::<Value>(payload) else {
+                    continue;
+                };
+                if let Some(text) = acc.apply(&event) {
+                    line_buf.push_str(&text);
+                    while let Some(cut) = line_buf.find('\n') {
+                        ui::say(tag, &line_buf[..cut]);
+                        line_buf.drain(..=cut);
+                    }
+                }
+            }
+        }
+        if !line_buf.is_empty() {
+            ui::say(tag, &line_buf);
+        }
+        let done = acc.finish()?;
+        Ok(FinalMessage {
+            content: done.content,
+            stop_reason: done.stop_reason,
+            input_tokens: done.input_tokens,
+        })
+    }
+
     fn build_body(&self, turn: &Turn<'_>) -> Value {
         let caps = self.caps(turn.model);
+        let tier = Tier::parse(turn.model).unwrap_or(Tier::Large);
         let mut body = json!({
-            "model": turn.model,
+            "model": tier.anthropic(),
             "max_tokens": MAX_TOKENS,
             "stream": true,
             // Second breakpoint, auto-placed on the last cacheable block, so

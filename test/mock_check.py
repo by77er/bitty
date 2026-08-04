@@ -49,8 +49,8 @@ class H(BaseHTTPRequestHandler):
             ev=turn([("tool_use","t2","spawn_process",{"name":"bad-model","instructions":"x","model":"gpt-4o"})],"tool_use")
         elif n==2:
             r=res(messages[-1])[0]
-            if not r["is_error"] or "not a model this harness can use" not in r["content"]:
-                return self.fail(f"a non-Claude model should be refused: {r}")
+            if not r["is_error"] or "not a model tier" not in r["content"]:
+                return self.fail(f"a vendor model id should be refused: {r}")
             ev=turn([("tool_use","t3","spawn_process",{"name":"good","instructions":"x","script":GOOD})],"tool_use")
         elif n==3:
             r=res(messages[-1])[0]

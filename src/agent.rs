@@ -1126,7 +1126,7 @@ fn base_tools() -> Value {
                     },
                     "model": {
                         "type": "string",
-                        "description": "Model for this process — a Claude model id such as claude-opus-5, claude-sonnet-5 or claude-haiku-4-5. Use a smaller one for mechanical work. Defaults to yours, so a cheap worker's own helpers stay cheap. Choosing the right size here saves far more than trimming tokens does."
+                        "description": "How much model this process gets: \"small\", \"medium\" or \"large\". Sizes, not vendor names — the harness resolves each to whichever provider is configured. Use small for mechanical work. Defaults to yours, so a cheap worker's own helpers stay cheap. Choosing the right size here saves far more than trimming tokens does.", "enum": ["small", "medium", "large"]
                     },
                     "effort": {
                         "type": "string",

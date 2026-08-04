@@ -31,6 +31,7 @@ mod durable;
 mod grants;
 mod actions;
 mod api;
+mod codex;
 mod system;
 mod script;
 mod ui;

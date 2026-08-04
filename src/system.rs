@@ -643,11 +643,11 @@ impl System {
         }
         for node in &nodes {
             if let Some(model) = &node.model {
-                if !model.starts_with("claude-") {
+                if crate::api::Tier::parse(model).is_none() {
                     return Err(format!(
-                        "'{model}' is not a model this harness can use. Processes run on Claude \
-                         models — try claude-opus-5, claude-sonnet-5 or claude-haiku-4-5, or omit \
-                         the field to inherit yours."
+                        "'{model}' is not a model tier. Processes are sized, not named — use \
+                         {}, or omit the field to inherit yours.",
+                        crate::api::Tier::NAMES.join(", ")
                     ));
                 }
             }
@@ -1095,12 +1095,13 @@ impl System {
     ) -> Result<String, String> {
         // Same validation as spawn, so a typo fails here rather than as a 400
         // on the process's next turn.
-        if !model.starts_with("claude-") {
+        let Some(tier) = crate::api::Tier::parse(model) else {
             return Err(format!(
-                "'{model}' is not a Claude model — try claude-opus-5, claude-sonnet-5 or \
-                 claude-haiku-4-5."
+                "'{model}' is not a model tier — use one of {}.",
+                crate::api::Tier::NAMES.join(", ")
             ));
-        }
+        };
+        let model = tier.as_str();
         if let Some(effort) = effort {
             if !EFFORT_LEVELS.contains(&effort) {
                 return Err(format!(
