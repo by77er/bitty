@@ -73,6 +73,11 @@ class H(BaseHTTPRequestHandler):
                     return self.fail("the summary should replace the turns it summarised")
                 if "the original briefing" not in text:
                     return self.fail("the opening briefing must survive compaction")
+                # The turns just before compaction have to survive too: a
+                # summary alone is lossy about what was just finished, which is
+                # how a process ends up redoing completed work.
+                if "MOST-RECENT-TURN" not in text:
+                    return self.fail("recent turns must survive compaction verbatim")
                 # And the process must still be able to work.
                 return self.respond(turn([("tool_use", "t9", "list_processes", {})], "tool_use"))
             return self.respond(turn([("text", "compacted and still working\n")], "end_turn"))
@@ -81,7 +86,8 @@ class H(BaseHTTPRequestHandler):
         if n < 3:
             return self.respond(turn([("text", BALLAST + "\n")], "end_turn")) if n else \
                    self.respond(turn([("tool_use", f"t{n}", "list_processes", {})], "tool_use"))
-        return self.respond(turn([("text", BALLAST + "\n")], "end_turn"))
+        marker = " MOST-RECENT-TURN" if n >= 3 else ""
+        return self.respond(turn([("text", BALLAST + marker + "\n")], "end_turn"))
 
     def respond(self, ev):
         p = sse(ev)

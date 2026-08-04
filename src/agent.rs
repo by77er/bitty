@@ -1535,11 +1535,47 @@ const COMPACT_PROMPT: &str = "\
 You are performing a context checkpoint compaction. Everything above is your own \
 conversation so far, and it is about to be discarded to fit the context window. \
 Write a handoff summary for the model that will continue this work with no other \
-memory of it. Include: what you are trying to achieve, what you have already done \
-and learned, the state of anything you started, which processes you are working \
-with and what each is for, and what you intended to do next. Be specific — ids, \
-names, file paths, decisions and their reasons. Write it as notes to your future \
-self, not as a report to someone else. Do not call any tools.";
+memory of it. Separate these clearly:\n\
+- FINISHED: work that is complete. Say plainly that it is done and must not be \
+redone. If you already reported or announced something — to the user, to a \
+channel, to another process — record that it was already sent, so your successor \
+does not send it again.\n\
+- IN PROGRESS: what is underway and exactly where it stopped.\n\
+- NEXT: what you intended to do, and nothing you have already done.\n\
+- CONTEXT: the processes you work with and what each is for, plus ids, names, \
+paths, decisions and their reasons.\n\
+Be specific. Write it as notes to your future self, not as a report to someone \
+else. Do not call any tools.";
+
+/// How much of the tail to carry through compaction verbatim.
+const RECENT_BUDGET: usize = 60_000;
+
+/// The last exchanges, cut at a safe boundary.
+///
+/// A user turn carrying tool results cannot lead: the assistant turn holding
+/// the matching tool calls would be gone, and an orphaned result is rejected.
+/// So the window is trimmed forward until it starts somewhere valid.
+fn recent_turns(history: &[Value], budget: usize) -> Vec<Value> {
+    let mut kept: Vec<Value> = Vec::new();
+    let mut used = 0;
+    for turn in history.iter().skip(1).rev() {
+        let cost = turn.to_string().len();
+        if used + cost > budget {
+            break;
+        }
+        used += cost;
+        kept.push(turn.clone());
+    }
+    kept.reverse();
+    while kept.first().is_some_and(|turn| {
+        turn["content"]
+            .as_array()
+            .is_some_and(|blocks| blocks.iter().any(|b| b["type"] == "tool_result"))
+    }) {
+        kept.remove(0);
+    }
+    kept
+}
 
 fn conversation_size(history: &[Value]) -> usize {
     history.iter().map(|turn| turn.to_string().len()).sum()
@@ -1595,6 +1631,13 @@ async fn compact_conversation(
         return;
     }
 
+    // Keep the most recent exchanges verbatim as well as the summary. A
+    // summary is lossy about what just happened, and what just happened is
+    // precisely what stops a process redoing work it already finished — the
+    // first version of this dropped the tail and root re-announced a task it
+    // had completed a thousand turns earlier.
+    let tail = recent_turns(history, RECENT_BUDGET);
+
     let opening = history.first().cloned();
     let mut compacted = Vec::new();
     if let Some(opening) = opening {
@@ -1603,12 +1646,15 @@ async fn compact_conversation(
     compacted.push(json!({
         "role": "user",
         "content": [text_block(&format!(
-            "<compacted_context>\nEarlier turns of this conversation were replaced by this \
-             summary to fit the context window. Treat it as your own memory of the work.\n\n{}\n\
-             </compacted_context>",
+            "<compacted_context>\nThis conversation was compacted: the earlier turns were \
+             replaced by the summary below to fit the context window. Treat the summary as your \
+             own memory — anything it records as finished is finished, and must not be done or \
+             announced again. The turns after this block are the most recent and are verbatim, so \
+             where they and the summary disagree, they are right.\n\n{}\n</compacted_context>",
             summary
         ))],
     }));
+    compacted.extend(tail);
     *history = compacted;
 
     sys.journal.record(&me.id, &Event::Compacted { history: history.clone() });
