@@ -1109,8 +1109,8 @@ impl System {
                 ));
             }
         }
-        let procs = self.procs.lock().unwrap();
-        let Some(entry) = procs.iter().find(|p| p.id == id) else {
+        let mut procs = self.procs.lock().unwrap();
+        let Some(entry) = procs.iter_mut().find(|p| p.id == id) else {
             return Err(format!("No such process: {id}."));
         };
         if matches!(*entry.status.lock().unwrap(), Status::Stopped) {
@@ -1124,6 +1124,23 @@ impl System {
         if let Some(effort) = effort {
             *entry.effort.lock().unwrap() = Some(effort.to_string());
         }
+        // What /ps and /graph show is a rendered string, so it has to be
+        // re-rendered or it would keep reporting the model this process no
+        // longer uses.
+        let now_effort = entry.effort.lock().unwrap().clone();
+        entry.runs = match &now_effort {
+            Some(effort) => format!("{model}/{effort}"),
+            None => model.to_string(),
+        };
+        drop(procs);
+        self.journal.record(
+            id,
+            &Event::Retuned {
+                model: model.to_string(),
+                effort: effort.map(String::from),
+            },
+        );
+        self.journal.flush(id);
         // A switch invalidates the prompt cache for this process, and the
         // thinking blocks in its history were signed by the old model. Both
         // are the caller's to act on, so say so rather than leaving it to be

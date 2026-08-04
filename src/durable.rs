@@ -62,6 +62,10 @@ pub enum Event {
     /// A user turn — tool results, mail, or both.
     Input { content: Value },
     Stopped { reason: String },
+    /// A model or effort change made while the process was running. Without
+    /// this the switch would live only in memory and quietly revert on the
+    /// next restart.
+    Retuned { model: String, effort: Option<String> },
     /// A fold of everything before it, standing in for those events entirely.
     ///
     /// This is exactly what `restore` computes, written back out — which is
@@ -339,6 +343,7 @@ pub fn restore(
     let mut stopped = false;
     let mut enqueued: Vec<MailRecord> = Vec::new();
     let mut consumed_through = 0u64;
+    let mut retuned: Option<(String, Option<String>)> = None;
     for event in events {
         match event {
             Event::Spawned(spawned) => record = Some(spawned),
@@ -351,6 +356,7 @@ pub fn restore(
                 history.push(serde_json::json!({"role": "user", "content": content}))
             }
             Event::Stopped { .. } => stopped = true,
+            Event::Retuned { model, effort } => retuned = Some((model, effort)),
             // A checkpoint supersedes everything before it: reset, then keep
             // folding whatever was appended afterward.
             Event::Checkpoint {
@@ -382,7 +388,16 @@ pub fn restore(
         .into_iter()
         .filter(|mail| mail.seq > consumed_through)
         .collect();
-    record.map(|record| (record, history, stopped, pending))
+    record.map(|mut record| {
+        // Applied last, so it wins over whatever the spawn recorded.
+        if let Some((model, effort)) = retuned {
+            record.model = model;
+            if effort.is_some() {
+                record.effort = effort;
+            }
+        }
+        (record, history, stopped, pending)
+    })
 }
 
 #[cfg(test)]
