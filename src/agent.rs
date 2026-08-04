@@ -91,9 +91,18 @@ async fn drive(
     let mut warned_unmanaged = false;
 
     loop {
-        // Nothing to answer yet: wait for the first message instead of
-        // sending an empty conversation to the API.
-        if history.is_empty() && !wait_for_mail(&sys, &me, &mut mailbox, &mut history, &mut deferred).await {
+        // Nothing to answer: either the conversation has not started, or it
+        // ended with a completed assistant turn — which is what a restored
+        // process looks like when it was idle at shutdown. Re-prompting then
+        // spends a turn to be told there is nothing to do, and on a restart
+        // that is one wasted turn per process, plus a compaction for every
+        // oversized one. `restore` already drops a trailing assistant turn
+        // whose tool calls went unanswered, so an assistant turn here really
+        // did finish.
+        let finished = history.last().is_some_and(|turn| turn["role"] == "assistant");
+        if (history.is_empty() || finished)
+            && !wait_for_mail(&sys, &me, &mut mailbox, &mut history, &mut deferred).await
+        {
             return;
         }
         // Summarise before the window is a problem, not after: a turn that is
