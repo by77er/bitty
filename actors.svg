@@ -1,0 +1,64 @@
+<svg viewBox="0 0 760 300" width="760" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Two actor processes. proc-1 spawns proc-2; each sends messages into the other's mailbox.">
+  <style>
+    .box   { fill: #f6f8fa; stroke: #59636e; stroke-width: 1.5; }
+    .mail  { fill: #ddf4ff; stroke: #0969da; stroke-width: 1.5; }
+    .title { fill: #1f2328; font: 600 15px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    .body  { fill: #59636e; font: 13px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    .maillabel { fill: #0969da; font: 600 13px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    .label { fill: #0969da; font: 600 13px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    .spawnlabel { fill: #59636e; font: 600 13px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    .send  { stroke: #0969da; stroke-width: 1.8; fill: none; }
+    .spawn { stroke: #59636e; stroke-width: 1.8; fill: none; stroke-dasharray: 5 4; }
+    .divider { stroke: #59636e; stroke-width: 1; opacity: 0.4; }
+    .mk-send  { fill: #0969da; }
+    .mk-spawn { fill: #59636e; }
+    @media (prefers-color-scheme: dark) {
+      .box   { fill: #151b23; stroke: #9198a1; }
+      .mail  { fill: #10233c; stroke: #4493f8; }
+      .title { fill: #e6edf3; }
+      .body, .spawnlabel { fill: #9198a1; }
+      .maillabel, .label { fill: #4493f8; }
+      .send  { stroke: #4493f8; }
+      .spawn { stroke: #9198a1; }
+      .divider { stroke: #9198a1; }
+      .mk-send  { fill: #4493f8; }
+      .mk-spawn { fill: #9198a1; }
+    }
+  </style>
+
+  <defs>
+    <marker id="arr-send" markerWidth="10" markerHeight="10" refX="8" refY="4" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M0,0 L9,4 L0,8 Z" class="mk-send"/>
+    </marker>
+    <marker id="arr-spawn" markerWidth="10" markerHeight="10" refX="8" refY="4" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M0,0 L9,4 L0,8 Z" class="mk-spawn"/>
+    </marker>
+  </defs>
+
+  <!-- proc-1 -->
+  <rect class="box" x="30" y="90" width="280" height="180" rx="10"/>
+  <text class="title" x="170" y="117" text-anchor="middle">proc-1 · root</text>
+  <line class="divider" x1="48" y1="129" x2="292" y2="129"/>
+  <text class="body" x="170" y="155" text-anchor="middle">conversation w/ the model</text>
+  <text class="body" x="170" y="175" text-anchor="middle">tools: spawn · send · stop · list</text>
+  <rect class="mail" x="60" y="198" width="220" height="44" rx="6"/>
+  <text class="maillabel" x="170" y="225" text-anchor="middle">mailbox</text>
+
+  <!-- proc-2 -->
+  <rect class="box" x="450" y="90" width="280" height="180" rx="10"/>
+  <text class="title" x="590" y="117" text-anchor="middle">proc-2 · worker</text>
+  <line class="divider" x1="468" y1="129" x2="712" y2="129"/>
+  <text class="body" x="590" y="155" text-anchor="middle">conversation w/ the model</text>
+  <text class="body" x="590" y="175" text-anchor="middle">tools: spawn · send · stop · list</text>
+  <rect class="mail" x="480" y="198" width="220" height="44" rx="6"/>
+  <text class="maillabel" x="590" y="225" text-anchor="middle">mailbox</text>
+
+  <!-- spawn arrow, over the top -->
+  <path class="spawn" d="M 310 108 C 350 66, 410 66, 446 104" marker-end="url(#arr-spawn)"/>
+  <text class="spawnlabel" x="380" y="58" text-anchor="middle">spawn_process</text>
+
+  <!-- send_message arrows, crossing into each other's mailboxes -->
+  <path class="send" d="M 310 162 C 372 162, 412 220, 474 220" marker-end="url(#arr-send)"/>
+  <path class="send" d="M 450 162 C 388 162, 348 220, 286 220" marker-end="url(#arr-send)"/>
+  <text class="label" x="380" y="148" text-anchor="middle">send_message</text>
+</svg>
