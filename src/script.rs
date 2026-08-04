@@ -1437,85 +1437,16 @@ fn finish(sys: &Arc<System>, me: &Meta, reason: &str) {
     sys.signal_stalled(&me.id, &format!("{} — {reason}", me.label()));
 }
 
-/// The API a script is written against. Emitted next to the source when
-/// typechecking so `bitty.onMail`, `api.fs.read` and the rest are known
-/// symbols rather than errors — a typecheck against an undeclared API would
-/// report nothing but noise.
-const TYPES: &str = r#"
-interface BittyMail { from: string; fromName: string | null; body: string;
-  priority: "high" | "low"; replyTo: string | null; }
-interface BittyExec { code: number | null; stdout: string; stderr: string; }
-interface BittyEntry { name: string; path: string; dir: boolean; }
-interface BittySocket {
-  id: number;
-  send(text: string | object): void;
-  recv(): Promise<string | null>;
-  close(): void;
-  [Symbol.asyncIterator](): AsyncIterableIterator<string>;
-}
-interface BittyApi {
-  id: string; name: string | null; parent: string; instructions: string;
-  resumed: boolean;
-  onMail(handler: (mail: BittyMail, api: BittyApi) => unknown): void;
-  send(to: string | string[], message: string, priority?: "high" | "low"): string;
-  stop(targets: string | string[], cascade?: boolean): string;
-  list(): string;
-  spawn(specs: object | object[]): string[];
-  log(text: string): void;
-  fs: {
-    read(path: string): string;
-    write(path: string, contents: string): string;
-    list(path: string): BittyEntry[];
-    mkdir(path: string): string;
-    remove(path: string): string;
-  };
-  exec(program: string, args?: string[], cwd?: string): BittyExec;
-  fetch(url: string, opts?: { method?: string; body?: string | object; headers?: Record<string, string> }): { status: number; body: string; headers: Record<string, string> };
-  env(name: string): string;
-  envNames(): string[];
-  sleep(ms: number): Promise<void>;
-  connect(url: string): Promise<BittySocket>;
-  sys(key: string): string;
-}
-declare const bitty: BittyApi;
-
-declare class Headers {
-  constructor(init?: Record<string, string> | Iterable<[string, string]>);
-  get(name: string): string | null;
-  set(name: string, value: string): void;
-  has(name: string): boolean;
-  delete(name: string): void;
-  entries(): IterableIterator<[string, string]>;
-  forEach(fn: (value: string, name: string, parent: Headers) => void): void;
-  toJSON(): Record<string, string>;
-  [Symbol.iterator](): IterableIterator<[string, string]>;
-}
-declare class Request {
-  constructor(url: string, init?: { method?: string; headers?: Record<string, string> | Headers; body?: string });
-  readonly url: string;
-  readonly method: string;
-  readonly headers: Headers;
-  text(): Promise<string>;
-  json(): Promise<any>;
-}
-declare class Response {
-  constructor(body?: string | null, init?: { status?: number; headers?: Record<string, string> | Headers });
-  static json(value: unknown, init?: { status?: number; headers?: Record<string, string> | Headers }): Response;
-  readonly status: number;
-  readonly ok: boolean;
-  readonly headers: Headers;
-  text(): Promise<string>;
-  json(): Promise<any>;
-}
-"#;
-
 /// Validate a script before anything is spawned, so a mistake is reported to
 /// whoever wrote it instead of killing a process that already claimed an id.
 ///
-/// Syntax is always checked. Types are checked too when the `deno` binary is
-/// available — it is the real compiler, so the diagnostics match what the
-/// author would see locally. Without it we degrade to syntax only rather than
-/// pretending nothing is wrong.
+/// Syntax only, via the same embedded transpiler that runs the script —
+/// no subprocess, no temp files, no dependency on a `deno` binary being
+/// installed on the host. A full type-check would need the TypeScript
+/// compiler itself, which isn't embedded; shelling out to a host `deno`
+/// for that traded a self-contained harness for one that silently picks up
+/// whatever `deno` happens to be on PATH, which is exactly what broke when
+/// it resolved a wrapper script belonging to an unrelated project.
 pub fn precheck(name: &str, source: &str) -> Result<(), String> {
     precheck_as(name, source, false)
 }
@@ -1533,64 +1464,8 @@ pub fn precheck_as(name: &str, source: &str, inline: bool) -> Result<(), String>
     } else {
         source.to_string()
     };
-    let source = checked.as_str();
-    transpile(name, source).map_err(|e| format!("TypeScript syntax error: {e}"))?;
-
-    let Ok(dir) = std::env::temp_dir().join(format!("bitty-check-{name}")).canonicalize().or_else(
-        |_| {
-            let dir = std::env::temp_dir().join(format!("bitty-check-{name}"));
-            std::fs::create_dir_all(&dir).map(|_| dir)
-        },
-    ) else {
-        return Ok(());
-    };
-    let types = dir.join("bitty.d.ts");
-    let file = dir.join("script.ts");
-    if std::fs::write(&types, TYPES).is_err()
-        || std::fs::write(
-            &file,
-            format!("/// <reference path=\"./bitty.d.ts\" />\n{source}"),
-        )
-        .is_err()
-    {
-        return Ok(());
-    }
-
-    let output = std::process::Command::new("deno")
-        .args(["check", "--no-lock", "--quiet"])
-        .arg(&file)
-        .output();
-    let _ = std::fs::remove_dir_all(&dir);
-    match output {
-        // No deno binary: syntax has already been checked, which is the most
-        // we can honestly promise here.
-        Err(_) => Ok(()),
-        Ok(output) if output.status.success() => Ok(()),
-        Ok(output) => {
-            let report = String::from_utf8_lossy(&output.stderr);
-            // deno colors its diagnostics; the escapes are noise in a tool
-            // result and worse in a terminal.
-            let plain = strip_ansi(report.trim());
-            Err(format!("TypeScript errors — fix these:\n{plain}"))
-        }
-    }
-}
-
-fn strip_ansi(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut chars = text.chars();
-    while let Some(c) = chars.next() {
-        if c == '\u{1b}' {
-            for c in chars.by_ref() {
-                if c.is_ascii_alphabetic() {
-                    break;
-                }
-            }
-        } else {
-            out.push(c);
-        }
-    }
-    out
+    transpile(name, &checked).map_err(|e| format!("TypeScript syntax error: {e}"))?;
+    Ok(())
 }
 
 /// Strip TypeScript types. Deno's own transpiler, so the accepted syntax

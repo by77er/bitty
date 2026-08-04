@@ -246,7 +246,13 @@ impl Client {
         self.compaction.load(Ordering::Relaxed)
     }
 
+    /// Callers pass whatever they have — a tier alias ("small") or a concrete
+    /// id — but `Caps::guess` only recognizes concrete ids, so every lookup
+    /// resolves through the tier first. Keying the cache on the alias would
+    /// make every tier fall through to `Caps::guess`'s modern default and
+    /// relearn the same rejections on the model's first turn, every run.
     fn caps(&self, model: &str) -> Caps {
+        let model = Tier::parse(model).map(Tier::anthropic).unwrap_or(model);
         *self
             .caps
             .lock()
@@ -258,6 +264,7 @@ impl Client {
     /// Read a rejection and turn off whatever the server named. Returns true
     /// when something changed, meaning the caller should retry.
     fn learn_from(&self, model: &str, text: &str, tag: &Tag) -> bool {
+        let model = Tier::parse(model).map(Tier::anthropic).unwrap_or(model);
         let mut caps = self.caps.lock().unwrap();
         let entry = caps.entry(model.to_string()).or_insert_with(|| Caps::guess(model));
         let before = (entry.adaptive, entry.effort, entry.fallbacks, entry.compaction);
