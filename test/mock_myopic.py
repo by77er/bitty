@@ -12,6 +12,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 STORE = """
 bitty.onMail((mail): string => {
+  if (mail.body === "spawn") {
+    const ids = bitty.spawn({ name: "hatchling", instructions: "wait", can_send_to: [] });
+    return "spawned:" + ids.join(",");
+  }
   const args = JSON.parse(mail.body);
   return args.key === "answer" ? "42" : "unknown";
 });
@@ -114,6 +118,9 @@ class H(BaseHTTPRequestHandler):
         elif "lookup" in names:
             return self.fail("only the reader should see the alias")
 
+        elif "process proc-1" not in system:   # anything else spawned: idle
+            ev = turn([("text", "Idle.\n")], "end_turn")
+
         elif n == 0:
             ev = turn([("tool_use", "t1", "spawn_topology", {"processes": [
                 {"name": "store", "instructions": "key-value store", "script": STORE,
@@ -130,11 +137,19 @@ class H(BaseHTTPRequestHandler):
             if r["is_error"]:
                 return self.fail(f"topology failed: {r['content']}")
             # A myopic worker is a normal thing to spawn, not an error.
+            # A script must be able to create processes itself.
+            ev = turn([("tool_use", "t8", "call_process",
+                        {"process_id": "proc-2", "message": "spawn", "timeout_seconds": 20})],
+                      "tool_use")
+        elif n == 2:
+            r = results(messages[-1])[0]
+            if r["is_error"] or "spawned:proc-" not in r["content"]:
+                return self.fail(f"a script should be able to spawn: {r}")
             ev = turn([("tool_use", "t2", "spawn_process",
                         {"name": "solo", "instructions": "y", "can_send_to": [],
                          "tools": [{"name": "ask", "description": "d", "target": "parent"}]})],
                       "tool_use")
-        elif n == 2:
+        elif n == 3:
             r = results(messages[-1])[0]
             if r["is_error"]:
                 return self.fail(f"a mute worker holding tools must be allowed: {r['content']}")

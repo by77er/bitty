@@ -870,7 +870,7 @@ fn validate(schema: &Value, input: &Value) -> Result<(), String> {
 
 /// Read `tools` off a spawn spec: named, schema-typed aliases that are really
 /// calls to another process.
-fn alias_specs(spec: &Value) -> Result<Vec<ToolAlias>, String> {
+pub fn alias_specs(spec: &Value) -> Result<Vec<ToolAlias>, String> {
     let Some(items) = spec["tools"].as_array() else {
         return Ok(Vec::new());
     };
@@ -914,7 +914,7 @@ const RESERVED_TOOLS: [&str; 7] = [
 /// means "inherit from me"; an empty list means "nobody". Everything is
 /// clamped to the spawner's own grants during resolution, so a request can
 /// only ever narrow.
-fn grant_spec(spec: &Value) -> GrantSpec {
+pub fn grant_spec(spec: &Value) -> GrantSpec {
     let list = |value: &Value| -> Option<Vec<String>> {
         value.as_array().map(|items| {
             items
@@ -1350,6 +1350,10 @@ opens a WebSocket you await rather than poll — `const socket = await bitty.con
 closes. A process stays reachable by mail the whole time it is awaiting, so long-lived listeners \
 are ordinary actors. Reach for a socket or an event stream before you reach for a polling loop; \
 polling is what you do when the service gives you nothing better.
+- Scripts can spawn processes too: bitty.spawn(spec) or bitty.spawn([spec, ...]), taking the same \
+shape spawn_topology takes and returning the new ids. So the mechanical half of a topology — one \
+worker per item, retired when the item is done — costs no model turn at all. Reach for that before \
+writing an agent whose only job is to create and reap other processes.
 - A script process can serve HTTP with Deno.serve, which is how you expose anything to the outside \
 world. Binding needs a network grant covering that host:port, exactly as reaching out does. Each \
 request arrives as mail and is handled one at a time, so a server is an ordinary actor that \

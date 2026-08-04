@@ -68,6 +68,21 @@ fn op_bitty_stop(
     host_call(state, |sys, me| actions::stop(sys, me, targets, cascade))
 }
 
+/// Create processes from JSON specs — the same shape `spawn_topology` takes.
+#[op2]
+#[string]
+fn op_bitty_spawn(
+    state: &mut OpState,
+    #[string] specs: String,
+) -> Result<String, deno_error::JsErrorBox> {
+    let nodes: Vec<Value> = match serde_json::from_str(&specs) {
+        Ok(Value::Array(nodes)) => nodes,
+        Ok(single) => vec![single],
+        Err(e) => return Err(fs_error(format!("spawn expects a process spec: {e}"))),
+    };
+    host_call(state, |sys, me| actions::spawn(sys, me, &nodes))
+}
+
 #[op2]
 #[string]
 fn op_bitty_list(state: &mut OpState) -> Result<String, deno_error::JsErrorBox> {
@@ -754,6 +769,11 @@ globalThis.bitty = (() => {
       return ops.op_bitty_stop(Array.isArray(targets) ? targets : [targets], !!cascade);
     },
     list() { return ops.op_bitty_list(); },
+    // Create processes. Takes one spec or a list of them, the same shape
+    // spawn_topology takes, and returns the new ids.
+    spawn(specs) {
+      return ops.op_bitty_spawn(JSON.stringify(specs)).split(",").filter(Boolean);
+    },
     // Filesystem access is whatever this process was granted; every call is
     // canonicalized and checked against those roots, and throws otherwise.
     fs: {
@@ -1307,6 +1327,7 @@ async fn boot(sys: &Arc<System>, me: &Meta, instructions: &str, source: &str, re
         op_bitty_send(),
         op_bitty_stop(),
         op_bitty_list(),
+        op_bitty_spawn(),
         op_bitty_reply(),
         op_bitty_reply_error(),
         op_bitty_log(),
@@ -1439,6 +1460,7 @@ interface BittyApi {
   send(to: string | string[], message: string, priority?: "high" | "low"): string;
   stop(targets: string | string[], cascade?: boolean): string;
   list(): string;
+  spawn(specs: object | object[]): string[];
   log(text: string): void;
   fs: {
     read(path: string): string;

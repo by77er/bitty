@@ -7,7 +7,8 @@
 //! policy would drift, and the drift would be a privilege bug.
 
 use crate::grants::Capability;
-use crate::system::{Mail, Meta, Priority, System};
+use crate::system::{Kind, Mail, Meta, NodeSpec, Priority, System};
+use serde_json::Value;
 use std::sync::Arc;
 
 /// Deliver a message to each target. Returns (report, is_error); the report
@@ -120,6 +121,54 @@ pub fn stop(sys: &Arc<System>, me: &Meta, targets: Vec<String>, cascade: bool) -
             }
             (report, false)
         }
+        Err(e) => (e, true),
+    }
+}
+
+/// Create processes. Scripts reach this too, so the mechanical half of a
+/// topology — spawning a worker per item, retiring it when done — does not have
+/// to cost a model turn just because only agents could call it.
+///
+/// Capability, attenuation and the group cap are all enforced inside
+/// `spawn_group`, so a script is refused exactly what an agent would be, in the
+/// same words.
+pub fn spawn(sys: &Arc<System>, me: &Meta, nodes: &[Value]) -> (String, bool) {
+    let mut specs = Vec::with_capacity(nodes.len());
+    for node in nodes {
+        let Some(instructions) = node["instructions"].as_str() else {
+            return ("each process needs an 'instructions' string".into(), true);
+        };
+        let aliases = match crate::agent::alias_specs(node) {
+            Ok(aliases) => aliases,
+            Err(e) => return (e, true),
+        };
+        specs.push(NodeSpec {
+            instructions: instructions.to_string(),
+            name: node["name"].as_str().map(String::from),
+            persona: node["role"].as_str().map(String::from),
+            // A script has no conversation, so there is nothing to inherit.
+            inherited: None,
+            wants: crate::agent::grant_spec(node),
+            link: node["link"].as_bool().unwrap_or(true),
+            model: node["model"].as_str().map(String::from),
+            effort: node["effort"].as_str().map(String::from),
+            kind: match node["script"].as_str() {
+                Some(source) => Kind::Script(source.to_string()),
+                None => Kind::Agent,
+            },
+            aliases,
+        });
+    }
+    match sys.spawn_group(&me.id, specs) {
+        // spawn_group hands back (label, id) pairs; a script wants the ids.
+        Ok(spawned) => (
+            spawned
+                .iter()
+                .map(|(_, id)| id.clone())
+                .collect::<Vec<_>>()
+                .join(","),
+            false,
+        ),
         Err(e) => (e, true),
     }
 }
