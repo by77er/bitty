@@ -754,6 +754,7 @@ const PRELUDE: &str = r#"
 globalThis.bitty = (() => {
   const ops = Deno.core.ops;
   let handler = null;
+  let stopHandler = null;
   const api = {
     onMail(fn) {
       handler = fn;
@@ -761,6 +762,13 @@ globalThis.bitty = (() => {
       // meantime is delivered now rather than answered with silence.
       const waiting = pending.splice(0, pending.length);
       for (const mail of waiting) globalThis.__bitty_deliver(mail);
+    },
+    // Runs once, right before this process's runtime is torn down — on
+    // stop_process and on patch_script replacing this code. Close sockets,
+    // flush anything not already written down; there is no turn after this
+    // one to do it in.
+    onStop(fn) {
+      stopHandler = fn;
     },
     send(to, message, priority = "high") {
       return ops.op_bitty_send(Array.isArray(to) ? to : [to], String(message), priority);
@@ -1093,6 +1101,14 @@ globalThis.bitty = (() => {
       ops.op_bitty_reply(mail.replyTo, result === undefined || result === null ? "" : String(result));
     }
   };
+  globalThis.__bitty_stop = async () => {
+    if (!stopHandler) return;
+    try {
+      await stopHandler(api);
+    } catch (e) {
+      api.log(`cleanup handler raised: ${e && e.message ? e.message : e}`);
+    }
+  };
   globalThis.__bitty_init = (info) => { Object.assign(api, info); };
   return api;
 })();
@@ -1200,6 +1216,10 @@ async fn actor_loop(
             }
             Wake::Ctl(Some(Control::Replace(source))) => {
                 ui::trace(&me.tag, "⟳ replacing script code");
+                // The old code's sockets and closures die with this runtime,
+                // so its onStop is the last chance to close them cleanly.
+                run_cleanup(runtime.as_mut().expect("runtime is present while the loop runs"), &me.tag)
+                    .await;
                 drop(runtime.take());
                 match boot(&sys, &me, &instructions, &source, true).await {
                     Some(fresh) => runtime = Some(fresh),
@@ -1210,7 +1230,11 @@ async fn actor_loop(
             }
             // The sender is dropped when this process is stopped, which is how
             // a blocked script learns to exit.
-            Wake::Ctl(None) | Wake::Mail(None) => return,
+            Wake::Ctl(None) | Wake::Mail(None) => {
+                run_cleanup(runtime.as_mut().expect("runtime is present while the loop runs"), &me.tag)
+                    .await;
+                return;
+            }
             Wake::Mail(Some(mail)) => mail,
         };
 
@@ -1431,6 +1455,27 @@ async fn boot(sys: &Arc<System>, me: &Meta, instructions: &str, source: &str, re
     Some(runtime)
 }
 
+/// Give a stopping script's registered `onStop` a chance to run — closing
+/// sockets, flushing anything not already written down — before its runtime
+/// is dropped. Bounded like boot's own startup settle above: a handler that
+/// never resolves must not hang the stop it is trying to clean up after.
+async fn run_cleanup(runtime: &mut JsRuntime, tag: &ui::Tag) {
+    if let Err(e) = runtime.execute_script("[bitty:stop]", "globalThis.__bitty_stop();") {
+        ui::warn(tag, &format!("cleanup handler failed: {e}"));
+        return;
+    }
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        runtime.run_event_loop(PollEventLoopOptions::default()),
+    )
+    .await
+    {
+        Ok(Err(e)) => ui::warn(tag, &format!("cleanup handler failed: {e}")),
+        Err(_) => ui::warn(tag, "cleanup handler timed out after 10s"),
+        Ok(Ok(())) => {}
+    }
+}
+
 /// A script that ends on its own is a normal exit; its links are told.
 fn finish(sys: &Arc<System>, me: &Meta, reason: &str) {
     me.set_status(Status::Stopped);
@@ -1490,4 +1535,78 @@ fn transpile(name: &str, source: &str) -> anyhow::Result<String> {
         },
     )?;
     Ok(transpiled.into_source().text)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::grants::{Grant, Grants, PathGrant};
+    use std::collections::HashSet;
+    use std::sync::atomic::AtomicU64;
+
+    fn test_meta(id: &str, write_root: std::path::PathBuf) -> Meta {
+        Meta {
+            id: id.to_string(),
+            name: None,
+            parent: "user".to_string(),
+            tag: ui::Tag::new(id, 0),
+            status: Arc::new(std::sync::Mutex::new(Status::Running)),
+            persona: None,
+            grants: Grants {
+                send: Grant::Nobody,
+                stop: Grant::Ids(HashSet::from([id.to_string()])),
+                spawn: Grant::Nobody,
+                run: Grant::Nobody,
+                net: Grant::Nobody,
+                env: Grant::Nobody,
+                sys: Grant::Nobody,
+                read: PathGrant::Nowhere,
+                write: PathGrant::Under(vec![write_root]),
+            },
+            labels: std::collections::HashMap::new(),
+            context_tokens: Arc::new(AtomicU64::new(0)),
+            aliases: Vec::new(),
+            model: Arc::new(std::sync::Mutex::new("small".to_string())),
+            effort: Arc::new(std::sync::Mutex::new(None)),
+        }
+    }
+
+    // Proves the onStop wiring end to end: JS registers a handler, run_cleanup
+    // drives it via __bitty_stop, and the handler's own async fs write (the
+    // same thing a real cleanup would do — close a socket, flush state) lands
+    // on disk before run_cleanup returns.
+    #[tokio::test]
+    async fn on_stop_handler_runs_before_the_runtime_is_torn_down() {
+        // SAFETY (test-only): no other test in this binary reads or writes
+        // ANTHROPIC_API_KEY, and Client::from_env only reads it — it never
+        // makes a network call, since script processes never touch sys.api.
+        unsafe { std::env::set_var("ANTHROPIC_API_KEY", "sk-ant-test-not-real") };
+        // Real grant roots are always canonicalized at spawn time (system.rs);
+        // macOS's temp dir is itself a symlink (/var -> /private/var), so
+        // skipping that here would reject every write as "outside" the root.
+        let temp = std::env::temp_dir().canonicalize().unwrap();
+        let marker = temp.join(format!("bitty-onstop-test-{}", std::process::id()));
+        let _ = std::fs::remove_file(&marker);
+
+        let client = crate::api::Client::from_env().unwrap();
+        let sys = Arc::new(System::new(client));
+        let me = test_meta("proc-test", temp);
+
+        let source = format!(
+            r#"
+            bitty.onMail(async () => {{}});
+            bitty.onStop(async () => {{
+              await Deno.writeTextFile({marker:?}, "cleaned up");
+            }});
+            "#
+        );
+
+        let mut runtime = boot(&sys, &me, "test", &source, false).await.expect("boot should succeed");
+        run_cleanup(&mut runtime, &me.tag).await;
+
+        let contents =
+            std::fs::read_to_string(&marker).expect("onStop should have written the marker file");
+        assert_eq!(contents, "cleaned up");
+        let _ = std::fs::remove_file(&marker);
+    }
 }
