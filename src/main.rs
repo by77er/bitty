@@ -4,11 +4,17 @@
 //!   bitty "initial task for the root process"
 //!   bitty --once "task"          # exit when every process is idle or stopped
 //!   bitty --role "you are ..."   # system prompt for the root process
-//!   bitty --allow-read DIR --allow-write DIR   # filesystem roots (repeatable)
-//!   bitty -A                                   # shorthand for read+write everywhere
-//!   bitty --allow-run cargo,python3           # programs scripts may execute
-//!   bitty --allow-net api.example.com         # hosts they may reach
-//!   bitty --allow-env HOME,PATH --allow-sys   # environment and system facts
+//!
+//! Permissions, Deno's own convention: bare means unrestricted, a value (as
+//! `--allow-X=v1,v2` or `--allow-X v1,v2`) scopes it, and omitting a flag
+//! entirely denies that capability. Repeatable; scoped values accumulate.
+//!   bitty --allow-read --allow-write            # read/write anywhere
+//!   bitty --allow-read=DIR --allow-write=DIR    # only these directories
+//!   bitty -A                                    # shorthand for all six, unrestricted
+//!   bitty --allow-run=cargo,python3             # only these programs
+//!   bitty --allow-net=api.example.com           # only this host
+//!   bitty --allow-env=HOME,PATH --allow-sys     # only these vars, any system fact
+//!
 //!   bitty --resume NAME                        # bring back a session by name
 //!   bitty --resume [\"message\"]                 # the most recent one, optionally with a nudge
 //!   bitty --journal DIR                        # journal somewhere specific instead
@@ -120,6 +126,64 @@ fn latest_session() -> Option<String> {
     }
     best.map(|(_, name)| name)
 }
+
+/// One `--allow-X` category's state, Deno's own three-way split: never
+/// mentioned (denied), mentioned bare (unrestricted), or mentioned with
+/// values (scoped to exactly those, accumulating across repeats).
+enum Allow {
+    Unset,
+    All,
+    Only(Vec<String>),
+}
+
+impl Allow {
+    /// `None` from `allow_values` means bare — jump straight to `All`,
+    /// discarding any values already accumulated (a superset makes them
+    /// moot). `Some` accumulates, so repeating the flag adds rather than
+    /// replaces.
+    fn apply(&mut self, values: Option<Vec<String>>) {
+        match values {
+            None => *self = Allow::All,
+            Some(more) => match self {
+                Allow::Only(existing) => existing.extend(more),
+                _ => *self = Allow::Only(more),
+            },
+        }
+    }
+
+    /// The `GrantSpec` field this becomes: `None` inherits the console's
+    /// ceiling (unrestricted, for every category console_authority grants
+    /// `All`/everywhere), `Some` is an explicit list — empty for "never
+    /// mentioned", which is how an omitted flag ends up denied rather than
+    /// inherited.
+    fn into_spec(self) -> Option<Vec<String>> {
+        match self {
+            Allow::Unset => Some(Vec::new()),
+            Allow::All => None,
+            Allow::Only(values) => Some(values),
+        }
+    }
+}
+
+/// One `--allow-X` flag's value, however it was written. `arg=v1,v2` is
+/// always the value; otherwise the next token is taken as the value unless
+/// it looks like another flag or there is none, in which case the whole
+/// flag is bare — Deno's own reading of `--allow-net` alone as "any host".
+fn allow_values(
+    inline: Option<&str>,
+    args: &mut std::iter::Peekable<impl Iterator<Item = String>>,
+) -> Option<Vec<String>> {
+    if let Some(v) = inline {
+        return Some(v.split(',').map(String::from).collect());
+    }
+    match args.peek() {
+        Some(next) if !next.starts_with("--") => {
+            Some(args.next().unwrap().split(',').map(String::from).collect())
+        }
+        _ => None,
+    }
+}
+
 use std::time::Duration;
 use system::{Mail, NodeSpec, System};
 use tokio::sync::mpsc;
@@ -131,13 +195,13 @@ async fn main() -> anyhow::Result<()> {
     let mut role: Option<String> = None;
     // The filesystem is outside the harness, so nothing reaches it unless the
     // human grants a root here. Everything below the root attenuates from this.
-    let mut allow_read: Vec<String> = Vec::new();
-    let mut allow_write: Vec<String> = Vec::new();
+    let mut allow_read = Allow::Unset;
+    let mut allow_write = Allow::Unset;
     let mut allow_all = false;
-    let mut allow_run: Vec<String> = Vec::new();
-    let mut allow_net: Vec<String> = Vec::new();
-    let mut allow_env: Vec<String> = Vec::new();
-    let mut allow_sys: Vec<String> = Vec::new();
+    let mut allow_run = Allow::Unset;
+    let mut allow_net = Allow::Unset;
+    let mut allow_env = Allow::Unset;
+    let mut allow_sys = Allow::Unset;
     let mut journal_dir: Option<String> = None;
     let mut env_file: Option<String> = None;
     let mut session: Option<String> = None;
@@ -148,8 +212,12 @@ async fn main() -> anyhow::Result<()> {
             "--once" => once = true,
             // Deno's spelling, and the same meaning: everything.
             "--allow-all" | "-A" => {
-                allow_read.push("/".into());
-                allow_write.push("/".into());
+                allow_read = Allow::All;
+                allow_write = Allow::All;
+                allow_run = Allow::All;
+                allow_net = Allow::All;
+                allow_env = Allow::All;
+                allow_sys = Allow::All;
                 allow_all = true;
             }
             "--env-file" => match args.next() {
@@ -182,35 +250,30 @@ async fn main() -> anyhow::Result<()> {
                 });
                 session = named.or_else(latest_session);
             }
-            "--allow-run" => match args.next() {
-                Some(v) => allow_run.extend(v.split(',').map(String::from)),
-                None => { eprintln!("--allow-run needs a program name"); std::process::exit(2); }
-            },
-            "--allow-net" => match args.next() {
-                Some(v) => allow_net.extend(v.split(',').map(String::from)),
-                None => { eprintln!("--allow-net needs a host"); std::process::exit(2); }
-            },
-            "--allow-env" => match args.next() {
-                Some(v) => allow_env.extend(v.split(',').map(String::from)),
-                None => { eprintln!("--allow-env needs a variable name"); std::process::exit(2); }
-            },
-            "--allow-sys" => {
-                allow_sys.extend(["hostname", "osRelease", "arch", "cwd"].map(String::from));
+            _ if arg == "--allow-run" || arg.starts_with("--allow-run=") => {
+                let inline = arg.strip_prefix("--allow-run=");
+                allow_run.apply(allow_values(inline, &mut args));
             }
-            "--allow-read" => match args.next() {
-                Some(path) => allow_read.push(path),
-                None => {
-                    eprintln!("--allow-read needs a directory");
-                    std::process::exit(2);
-                }
-            },
-            "--allow-write" => match args.next() {
-                Some(path) => allow_write.push(path),
-                None => {
-                    eprintln!("--allow-write needs a directory");
-                    std::process::exit(2);
-                }
-            },
+            _ if arg == "--allow-net" || arg.starts_with("--allow-net=") => {
+                let inline = arg.strip_prefix("--allow-net=");
+                allow_net.apply(allow_values(inline, &mut args));
+            }
+            _ if arg == "--allow-env" || arg.starts_with("--allow-env=") => {
+                let inline = arg.strip_prefix("--allow-env=");
+                allow_env.apply(allow_values(inline, &mut args));
+            }
+            _ if arg == "--allow-sys" || arg.starts_with("--allow-sys=") => {
+                let inline = arg.strip_prefix("--allow-sys=");
+                allow_sys.apply(allow_values(inline, &mut args));
+            }
+            _ if arg == "--allow-read" || arg.starts_with("--allow-read=") => {
+                let inline = arg.strip_prefix("--allow-read=");
+                allow_read.apply(allow_values(inline, &mut args));
+            }
+            _ if arg == "--allow-write" || arg.starts_with("--allow-write=") => {
+                let inline = arg.strip_prefix("--allow-write=");
+                allow_write.apply(allow_values(inline, &mut args));
+            }
             "--role" | "--system" => match args.next() {
                 Some(text) => role = Some(text),
                 None => {
@@ -226,8 +289,8 @@ async fn main() -> anyhow::Result<()> {
     // something to do, since it exits as soon as everything settles.
     if prompt.trim().is_empty() && !resume && once {
         eprintln!(
-            "usage: bitty [--once] [--role \"prompt\"] [-A | --allow-read DIR --allow-write DIR] \
-             \"initial task\""
+            "usage: bitty [--once] [--role \"prompt\"] [-A | --allow-read[=DIR] \
+             --allow-write[=DIR]] \"initial task\""
         );
         std::process::exit(2);
     }
@@ -236,8 +299,8 @@ async fn main() -> anyhow::Result<()> {
         ui::system(
             "--allow-all: every capability is granted — read and write anywhere, any program, \
              any host, any environment variable. Nothing spawned below can exceed it because \
-             nothing is bounded. Prefer naming what the task needs: --allow-read DIR \
-             --allow-write DIR --allow-run PROGRAM --allow-net HOST --allow-env NAME.",
+             nothing is bounded. Prefer naming what the task needs: --allow-read=DIR \
+             --allow-write=DIR --allow-run=PROGRAM --allow-net=HOST --allow-env=NAME.",
         );
     }
 
@@ -248,7 +311,7 @@ async fn main() -> anyhow::Result<()> {
     let named_file = env_file.is_some();
     match load_env_file(env_file.as_deref().unwrap_or(".env")) {
         Ok(names) if !names.is_empty() => {
-            ui::system(&format!("loaded {} from .env — grant with --allow-env {}",
+            ui::system(&format!("loaded {} from .env — grant with --allow-env={}",
                 names.join(", "), names.join(",")));
         }
         Ok(_) => {}
@@ -339,19 +402,18 @@ async fn main() -> anyhow::Result<()> {
                 // Root sets the tree's default: anything it spawns inherits
                 // this effort unless the spawn names its own.
                 effort: Some(api::DEFAULT_EFFORT.to_string()),
-                // Always explicit, never inherited: the console's ceiling is
-                // the whole filesystem, so falling through to "inherit" would
-                // silently hand root everything. Empty means no access.
-                // Omitting a field inherits the console's authority, which is
-                // everything — so --allow-all simply leaves them unset, and
-                // otherwise each is pinned to exactly what was granted.
+                // A bare `--allow-X` (or `-A`) leaves the field `None`, which
+                // inherits the console's ceiling — everything, for every one
+                // of these — while a never-mentioned flag becomes `Some([])`,
+                // denied. Never inherited by falling through unnoticed: an
+                // omitted field would otherwise silently hand root everything.
                 wants: system::GrantSpec {
-                    run: (!allow_all).then_some(allow_run),
-                    net: (!allow_all).then_some(allow_net),
-                    env: (!allow_all).then_some(allow_env),
-                    sys: (!allow_all).then_some(allow_sys),
-                    read: (!allow_all).then_some(allow_read),
-                    write: (!allow_all).then_some(allow_write),
+                    run: allow_run.into_spec(),
+                    net: allow_net.into_spec(),
+                    env: allow_env.into_spec(),
+                    sys: allow_sys.into_spec(),
+                    read: allow_read.into_spec(),
+                    write: allow_write.into_spec(),
                     ..Default::default()
                 },
                 ..Default::default()
@@ -475,5 +537,69 @@ async fn run_until_idle(sys: &Arc<System>) {
         } else {
             settled = 0;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Allow, allow_values};
+
+    fn peekable(args: &[&str]) -> std::iter::Peekable<std::vec::IntoIter<String>> {
+        args.iter().map(|s| s.to_string()).collect::<Vec<_>>().into_iter().peekable()
+    }
+
+    #[test]
+    fn bare_flag_with_nothing_following_is_unrestricted() {
+        let mut rest = peekable(&[]);
+        assert_eq!(allow_values(None, &mut rest), None);
+    }
+
+    #[test]
+    fn bare_flag_followed_by_another_flag_is_unrestricted() {
+        let mut rest = peekable(&["--allow-write"]);
+        assert_eq!(allow_values(None, &mut rest), None);
+        // The next flag must still be there for the loop to see it next.
+        assert_eq!(rest.next().as_deref(), Some("--allow-write"));
+    }
+
+    #[test]
+    fn a_bare_value_token_is_taken_as_scoped_values() {
+        let mut rest = peekable(&["host1,host2"]);
+        assert_eq!(
+            allow_values(None, &mut rest),
+            Some(vec!["host1".to_string(), "host2".to_string()])
+        );
+        assert_eq!(rest.next(), None); // the value was consumed
+    }
+
+    #[test]
+    fn an_inline_equals_value_never_touches_the_iterator() {
+        let mut rest = peekable(&["--allow-write"]); // would misparse as bare if consulted
+        assert_eq!(
+            allow_values(Some("a,b"), &mut rest),
+            Some(vec!["a".to_string(), "b".to_string()])
+        );
+        assert_eq!(rest.next().as_deref(), Some("--allow-write"));
+    }
+
+    #[test]
+    fn repeated_scoped_values_accumulate() {
+        let mut allow = Allow::Unset;
+        allow.apply(Some(vec!["a".to_string()]));
+        allow.apply(Some(vec!["b".to_string()]));
+        assert_eq!(allow.into_spec(), Some(vec!["a".to_string(), "b".to_string()]));
+    }
+
+    #[test]
+    fn a_later_bare_flag_upgrades_scoped_values_to_unrestricted() {
+        let mut allow = Allow::Unset;
+        allow.apply(Some(vec!["a".to_string()]));
+        allow.apply(None);
+        assert_eq!(allow.into_spec(), None);
+    }
+
+    #[test]
+    fn never_mentioned_denies_rather_than_inheriting() {
+        assert_eq!(Allow::Unset.into_spec(), Some(Vec::new()));
     }
 }
