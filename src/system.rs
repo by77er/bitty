@@ -807,11 +807,16 @@ impl System {
                 Ok(granted)
             };
 
-            // An explicit allowlist means exactly that — messaging the spawner
-            // is a policy choice, not an invariant, and the topology default
-            // already grants it when the field is omitted. Self-stop is the one
-            // true invariant: a process that cannot stop itself cannot exit.
-            let send = checked(send_req.clone(), &ceiling.send, &[], "messaging", "message")?;
+            // A child may always be granted permission to message the process
+            // that spawned it — that's structural wiring, not authority handed
+            // away, so it must not be checked against the spawner's own
+            // ceiling.send (who *it* may message, an unrelated question from
+            // whether its children may reach it). Widened into the ceiling
+            // rather than force-added after attenuation, so an explicit `[]`
+            // (isolate it entirely) still denies it — only Nobody survives
+            // attenuation against Nobody regardless of what the ceiling holds.
+            let send_ceiling = ceiling.send.clone().with(&[parent.to_string()]);
+            let send = checked(send_req.clone(), &send_ceiling, &[], "messaging", "message")?;
             // Stop authority is granted deliberately, never drifted into.
             // Inherit it only from a spawner that holds it over everything;
             // otherwise a process defaults to stopping just itself, so a
