@@ -393,66 +393,7 @@ async fn execute_tool(
             if targets.len() > 1 {
                 ui::trace(&me.tag, &format!("  fan-out to {} recipients", targets.len()));
             }
-            return actions::send(sys, me, targets, body, priority);
-            #[allow(unreachable_code)]
-
-            let (mut delivered, mut denied, mut failed) = (Vec::new(), Vec::new(), Vec::new());
-            for to in targets {
-                if to == me.id {
-                    denied.push(format!("{to} (yourself)"));
-                    continue;
-                }
-                if !sys.is_visible(me, &to) {
-                    // Outside this process's namespace: report it the way a
-                    // genuinely absent id would be, rather than confirming
-                    // something exists that it should not know about.
-                    failed.push(format!("{to} (no such process)"));
-                    continue;
-                }
-                if !me.may(Capability::Send, &to) {
-                    denied.push(to);
-                    continue;
-                }
-                match sys.send(
-                    &to,
-                    Mail {
-                        from: me.id.clone(),
-                        from_name: me.name.clone(),
-                        body: body.to_string(),
-                        priority,
-                        reply_to: None,
-                        seq: 0,
-                    },
-                ) {
-                    Ok(_) => delivered.push(to),
-                    Err(e) => failed.push(format!("{to} ({e})")),
-                }
-            }
-
-            // Report partial success honestly rather than collapsing to one
-            // verdict: the sender needs to know exactly who missed out.
-            let mut parts = Vec::new();
-            if !delivered.is_empty() {
-                parts.push(match priority {
-                    Priority::High => format!("Delivered to {}.", delivered.join(", ")),
-                    Priority::Low => format!(
-                        "Queued for {} at low priority — they will not be woken, and will see \
-                         this the next time they run.",
-                        delivered.join(", ")
-                    ),
-                });
-            }
-            if !denied.is_empty() {
-                parts.push(format!(
-                    "Not permitted: {}. You may only message {}.",
-                    denied.join(", "),
-                    me.permitted(Capability::Send)
-                ));
-            }
-            if !failed.is_empty() {
-                parts.push(format!("Undeliverable: {}.", failed.join(", ")));
-            }
-            (parts.join(" "), delivered.is_empty())
+            actions::send(sys, me, targets, body, priority)
         }
         "stop_process" => {
             let targets = match resolve_stop_targets(sys, me, input) {
@@ -462,7 +403,7 @@ async fn execute_tool(
             let (visible, unseen): (Vec<String>, Vec<String>) =
                 targets.into_iter().partition(|t| sys.is_visible(me, t));
             let (allowed, denied): (Vec<String>, Vec<String>) =
-                visible.into_iter().partition(|t| me.may(Capability::Stop, t));
+                visible.into_iter().partition(|t| sys.may(me, Capability::Stop, t));
             if allowed.is_empty() {
                 let mut why = Vec::new();
                 if !denied.is_empty() {
@@ -522,7 +463,7 @@ async fn execute_tool(
             if !sys.is_visible(me, to) {
                 return (format!("No process with id '{to}'."), true);
             }
-            if !me.may(Capability::Send, to) {
+            if !sys.may(me, Capability::Send, to) {
                 return (
                     format!(
                         "Not permitted: you may only message {}.",
@@ -560,7 +501,7 @@ async fn execute_tool(
             }
             // Replacing what a process runs is at least as powerful as killing
             // it, and creates code, so it takes both authorities.
-            if !me.may(Capability::Stop, target) {
+            if !sys.may(me, Capability::Stop, target) {
                 return (
                     format!(
                         "Not permitted: you may only stop {}, and replacing a process's code \
@@ -1025,9 +966,12 @@ fn tool_definitions(me: &Meta) -> Value {
                     Grant::Ids(ids) => ids.iter().any(|id| *id != me.id),
                 }
         }
-        // Running code inline is the same authority as creating a process to
-        // run it, so it rides on the same capability.
-        "spawn_process" | "spawn_topology" | "run_script" => me.grants.spawn.is_permissive(),
+        // Creates a new process, so it needs spawn authority. run_script does
+        // not: it runs inline in this same process against this same
+        // process's own read/write/run/net grants, each checked at the point
+        // of use — a process with no spawn authority still needs it for
+        // everything those grants (or plain computation) allow.
+        "spawn_process" | "spawn_topology" => me.grants.spawn.is_permissive(),
         "stop_process" => me.grants.stop.is_permissive(),
         // Replacing a script's code needs authority over the process and the
         // right to create code in the first place.

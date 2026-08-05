@@ -33,7 +33,7 @@ pub fn send(
             failed.push(format!("{to} (no such process)"));
             continue;
         }
-        if !me.may(Capability::Send, &to) {
+        if !sys.may(me, Capability::Send, &to) {
             denied.push(to);
             continue;
         }
@@ -90,7 +90,7 @@ pub fn stop(sys: &Arc<System>, me: &Meta, targets: Vec<String>, cascade: bool) -
     let (visible, unseen): (Vec<String>, Vec<String>) =
         targets.into_iter().partition(|t| sys.is_visible(me, t));
     let (allowed, denied): (Vec<String>, Vec<String>) =
-        visible.into_iter().partition(|t| me.may(Capability::Stop, t));
+        visible.into_iter().partition(|t| sys.may(me, Capability::Stop, t));
 
     if allowed.is_empty() {
         let mut why = Vec::new();

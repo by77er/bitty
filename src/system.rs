@@ -300,7 +300,10 @@ impl Meta {
         }
     }
 
-    /// The single permission check. Every verb goes through here.
+    /// The grant-only permission check. Stop (and anything that needs stop's
+    /// authority, like patch_script) should go through `System::may` instead
+    /// — a static grant can't cover a process's own future children, which
+    /// this alone knows nothing about.
     pub fn may(&self, cap: Capability, target: &str) -> bool {
         self.grants.get(cap).permits(target)
     }
@@ -1443,6 +1446,35 @@ impl System {
         }
     }
 
+    /// True if `target` is `ancestor` itself or descends from it through the
+    /// live spawn tree, regardless of any grant.
+    fn spawned_by(&self, ancestor: &str, target: &str) -> bool {
+        let procs = self.procs.lock().unwrap();
+        let mut current = target.to_string();
+        loop {
+            if current == ancestor {
+                return true;
+            }
+            match procs.iter().find(|p| p.id == current) {
+                Some(p) if p.parent != current => current = p.parent.clone(),
+                _ => return false,
+            }
+        }
+    }
+
+    /// The permission check for a capability that targets another process.
+    /// A static grant alone would leave a process unable to stop or message
+    /// anything it spawns after its own grants were fixed — those ids don't
+    /// exist yet at that point, so no allowlist could ever have named them.
+    /// Stopping (and so, since it is at least as powerful, patching) and
+    /// messaging your own descendants is always permitted on top of whatever
+    /// the grant itself says.
+    pub fn may(&self, viewer: &Meta, cap: Capability, target: &str) -> bool {
+        viewer.may(cap, target)
+            || (matches!(cap, Capability::Stop | Capability::Send)
+                && self.spawned_by(&viewer.id, target))
+    }
+
     /// Announce once when nothing is left running, so the human knows the
     /// system is waiting on them rather than wedged.
     pub fn note_quiesced(&self) {
@@ -1663,7 +1695,7 @@ fn format_tokens(n: u64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::tombstones_to_drop;
+    use super::*;
 
     #[test]
     fn keeps_everything_under_the_cap() {
@@ -1686,5 +1718,101 @@ mod tests {
     #[test]
     fn all_living_is_a_no_op() {
         assert!(tombstones_to_drop(&[false, false], 0).is_empty());
+    }
+
+    fn test_entry(id: &str, parent: &str, stop: Grant) -> Entry {
+        Entry {
+            id: id.to_string(),
+            name: None,
+            parent: parent.to_string(),
+            sender: Mutex::new(None),
+            status: Arc::new(Mutex::new(Status::Running)),
+            handle: Mutex::new(None),
+            context_tokens: Arc::new(AtomicU64::new(0)),
+            linked: true,
+            grants: Grants {
+                send: Grant::Nobody,
+                stop,
+                spawn: Grant::Nobody,
+                run: Grant::Nobody,
+                net: Grant::Nobody,
+                env: Grant::Nobody,
+                sys: Grant::Nobody,
+                read: PathGrant::Nowhere,
+                write: PathGrant::Nowhere,
+            },
+            model: Arc::new(Mutex::new("small".to_string())),
+            effort: Arc::new(Mutex::new(None)),
+            runs: "small".to_string(),
+            control: Mutex::new(None),
+            seq: AtomicU64::new(0),
+        }
+    }
+
+    fn test_meta_for(entry: &Entry) -> Meta {
+        Meta {
+            id: entry.id.clone(),
+            name: entry.name.clone(),
+            parent: entry.parent.clone(),
+            tag: Tag::new(&entry.id, 0),
+            status: entry.status.clone(),
+            persona: None,
+            grants: entry.grants.clone(),
+            labels: HashMap::new(),
+            context_tokens: entry.context_tokens.clone(),
+            aliases: Vec::new(),
+            model: entry.model.clone(),
+            effort: entry.effort.clone(),
+        }
+    }
+
+    // SAFETY (test-only): no other test in this binary reads or writes
+    // ANTHROPIC_API_KEY, and Client::from_env only reads it — no network call.
+    fn dummy_client() -> api::Client {
+        unsafe { std::env::set_var("ANTHROPIC_API_KEY", "sk-ant-test-not-real") };
+        api::Client::from_env().unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_process_may_always_stop_what_it_spawned_even_without_a_matching_grant() {
+        let sys = System::new(dummy_client());
+        // proc-1's own stop grant names only itself — resolved long before
+        // proc-2 was ever spawned, so it could never have named it.
+        let coordinator = test_entry("proc-1", "user", Grant::Ids(HashSet::from(["proc-1".to_string()])));
+        let coordinator_meta = test_meta_for(&coordinator);
+        let worker = test_entry("proc-2", "proc-1", Grant::Ids(HashSet::from(["proc-2".to_string()])));
+        let stranger = test_entry("proc-3", "user", Grant::Nobody);
+        *sys.procs.lock().unwrap() = vec![coordinator, worker, stranger];
+
+        assert!(sys.may(&coordinator_meta, Capability::Stop, "proc-2"));
+        // Not spawned by it and never granted: stays out of reach.
+        assert!(!sys.may(&coordinator_meta, Capability::Stop, "proc-3"));
+    }
+
+    #[tokio::test]
+    async fn the_descendant_bypass_reaches_grandchildren_too() {
+        let sys = System::new(dummy_client());
+        let coordinator = test_entry("proc-1", "user", Grant::Ids(HashSet::from(["proc-1".to_string()])));
+        let coordinator_meta = test_meta_for(&coordinator);
+        let child = test_entry("proc-2", "proc-1", Grant::Ids(HashSet::from(["proc-2".to_string()])));
+        let grandchild = test_entry("proc-3", "proc-2", Grant::Ids(HashSet::from(["proc-3".to_string()])));
+        *sys.procs.lock().unwrap() = vec![coordinator, child, grandchild];
+
+        assert!(sys.may(&coordinator_meta, Capability::Stop, "proc-3"));
+    }
+
+    #[tokio::test]
+    async fn the_descendant_bypass_also_covers_messaging_what_it_spawned() {
+        let sys = System::new(dummy_client());
+        // Same story as stop: proc-1's own send grant is empty, resolved
+        // before proc-2 existed to be named in it.
+        let coordinator = test_entry("proc-1", "user", Grant::Nobody);
+        let coordinator_meta = test_meta_for(&coordinator);
+        let worker = test_entry("proc-2", "proc-1", Grant::Nobody);
+        let stranger = test_entry("proc-3", "user", Grant::Nobody);
+        *sys.procs.lock().unwrap() = vec![coordinator, worker, stranger];
+
+        assert!(sys.may(&coordinator_meta, Capability::Send, "proc-2"));
+        assert!(!sys.may(&coordinator_meta, Capability::Send, "proc-3"));
     }
 }
