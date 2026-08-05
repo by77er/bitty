@@ -186,22 +186,35 @@ impl PathGrant {
     }
 
     /// The canonical path to use, or why it is refused. `creating` allows a
-    /// path that does not exist yet by checking its parent instead — a write
-    /// target has to be admissible before it exists.
+    /// path that does not exist yet by walking up to the nearest ancestor \
+    /// that does, canonicalizing that, and rejoining the rest — a target
+    /// several new directories deep (the whole point of `{recursive: true}`)
+    /// should not require every intermediate to already exist, only the
+    /// containing root to be admissible. The final containment check below
+    /// still applies to the rejoined result, so nothing is trusted before
+    /// it's re-verified to sit under a granted root.
     pub fn resolve(&self, path: &str, creating: bool) -> Result<PathBuf, String> {
         let PathGrant::Under(roots) = self else {
             return Err(format!("no filesystem access is granted (refused '{path}')"));
         };
         let raw = Path::new(path);
         let canonical = if creating {
-            let parent = raw.parent().unwrap_or(Path::new("."));
-            let base = parent
-                .canonicalize()
-                .map_err(|e| format!("cannot resolve '{}': {e}", parent.display()))?;
-            match raw.file_name() {
-                Some(name) => base.join(name),
-                None => return Err(format!("'{path}' does not name a file")),
-            }
+            let mut base = raw;
+            let mut tail: Vec<std::ffi::OsString> = Vec::new();
+            let existing = loop {
+                let probe = if base.as_os_str().is_empty() { Path::new(".") } else { base };
+                match probe.canonicalize() {
+                    Ok(canon) => break canon,
+                    Err(e) => match base.file_name() {
+                        Some(name) => {
+                            tail.push(name.to_os_string());
+                            base = base.parent().unwrap_or(Path::new(""));
+                        }
+                        None => return Err(format!("cannot resolve '{path}': {e}")),
+                    },
+                }
+            };
+            tail.into_iter().rev().fold(existing, |acc, name| acc.join(name))
         } else {
             raw.canonicalize()
                 .map_err(|e| format!("cannot resolve '{path}': {e}"))?
@@ -373,5 +386,114 @@ impl Grants {
             lines.push(format!("- Writing files under: {}", self.write.describe()));
         }
         lines.join("\n")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Grant;
+    use std::collections::HashSet;
+
+    fn ids(names: &[&str]) -> Grant {
+        Grant::Ids(names.iter().map(|s| s.to_string()).collect())
+    }
+
+    // Mirrors how system.rs's spawn path widens a spawner's own `send`
+    // ceiling with its own id before attenuating a child's requested
+    // `can_send_to` against it — messaging your own spawner is structural
+    // wiring, not authority the spawner has to hold over itself.
+    #[test]
+    fn a_child_can_always_message_the_process_that_spawned_it() {
+        let spawner_send = ids(&["proc-1", "user"]); // what proc-12 may itself message
+        let widened = spawner_send.with(&["proc-12".to_string()]);
+        let wanted = ids(&["proc-12"]); // explicit can_send_to: ["parent"]
+        let granted = wanted.clone().attenuate(&widened);
+        assert!(granted.dropped_from(&wanted).is_empty());
+        assert!(granted.permits("proc-12"));
+    }
+
+    #[test]
+    fn explicit_empty_send_list_still_isolates_from_the_parent() {
+        let spawner_send = ids(&["proc-1", "user"]);
+        let widened = spawner_send.with(&["proc-12".to_string()]);
+        let wanted = Grant::Nobody; // explicit can_send_to: []
+        let granted = wanted.attenuate(&widened);
+        assert!(!granted.is_permissive());
+        assert!(!granted.permits("proc-12"));
+    }
+
+    #[test]
+    fn omitting_send_now_inherits_the_ability_to_message_the_parent() {
+        let spawner_send = ids(&["proc-1", "user"]);
+        let widened = spawner_send.with(&["proc-12".to_string()]);
+        // The omitted-field default is `widened.with(&[])`, which `with`
+        // defines as a no-op — asserting on `widened` directly is the same.
+        assert!(widened.permits("proc-12"));
+        assert!(widened.permits("proc-1"));
+        assert_eq!(
+            widened.ids().cloned(),
+            Some(HashSet::from(["proc-1".to_string(), "user".to_string(), "proc-12".to_string()]))
+        );
+    }
+
+    use super::PathGrant;
+    use std::path::PathBuf;
+
+    // A per-test scratch dir under the system temp dir, cleaned up on drop so
+    // a failed assertion still leaves nothing behind.
+    struct ScratchDir(PathBuf);
+
+    impl ScratchDir {
+        fn new(name: &str) -> ScratchDir {
+            let dir = std::env::temp_dir().join(format!("bitty-grants-test-{name}"));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            ScratchDir(dir.canonicalize().unwrap())
+        }
+    }
+
+    impl Drop for ScratchDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn creating_resolves_a_single_new_component_with_no_slash() {
+        // resolve() only reads the filesystem (canonicalize), never writes,
+        // so this is safe against the real process cwd without mutating it
+        // or touching disk — important since tests run in parallel and share
+        // one process-wide cwd.
+        let cwd = std::env::current_dir().unwrap();
+        let grant = PathGrant::Under(vec![cwd.clone()]);
+        // No "/" in the target at all: Path::parent() for this is Some(""),
+        // not None, which used to skip the cwd fallback entirely.
+        let name = "bitty-grants-test-nonexistent-leaf";
+        let resolved = grant.resolve(name, true).unwrap();
+        assert_eq!(resolved, cwd.join(name));
+    }
+
+    #[test]
+    fn creating_resolves_several_missing_nested_directories_at_once() {
+        let root = ScratchDir::new("nested-levels");
+        let grant = PathGrant::Under(vec![root.0.clone()]);
+        // Neither "rlm-lab" nor "rlm-lab/notes" exists yet — the whole point
+        // of Deno.mkdir(path, {recursive: true}).
+        let resolved = grant.resolve(root.0.join("rlm-lab/notes").to_str().unwrap(), true).unwrap();
+        assert_eq!(resolved, root.0.join("rlm-lab/notes"));
+    }
+
+    #[test]
+    fn creating_still_rejects_a_target_outside_the_granted_root() {
+        let root = ScratchDir::new("escape-attempt");
+        let allowed = root.0.join("allowed");
+        std::fs::create_dir_all(&allowed).unwrap();
+        let grant = PathGrant::Under(vec![allowed.clone()]);
+        // "allowed/.." resolves to something real (root.0), which sits
+        // outside the granted root even though the walk-up successfully
+        // canonicalizes it — the final containment check must still catch it.
+        let target = allowed.join("../escaped/new-dir");
+        let err = grant.resolve(target.to_str().unwrap(), true).unwrap_err();
+        assert!(err.contains("outside the directories"), "unexpected error: {err}");
     }
 }
