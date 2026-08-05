@@ -566,19 +566,27 @@ impl System {
             return Err(format!("Process {target} has been stopped."));
         }
         let control = entry.control.lock().unwrap();
-        match control.as_ref() {
+        let sent = match control.as_ref() {
             None => Err(format!(
                 "{target} is an agent, not a script — there is no code to replace. Change what an \
                  agent does by messaging it."
             )),
-            Some(tx) => match tx.send(Control::Replace(source)) {
-                Ok(()) => Ok(format!(
-                    "Replaced the code running in {target}. Its id, mailbox, links and permissions \
-                     are unchanged; any state the old code held is gone."
-                )),
-                Err(_) => Err(format!("Process {target} is no longer running.")),
-            },
-        }
+            Some(tx) => tx
+                .send(Control::Replace(source.clone()))
+                .map_err(|_| format!("Process {target} is no longer running.")),
+        };
+        drop(control);
+        drop(procs);
+        sent?;
+        // Without this the replacement lives only in the isolate that is
+        // running it, and a restart brings back the process's first draft —
+        // every patch since then silently gone.
+        self.journal.record(target, &Event::Patched { source });
+        self.journal.flush(target);
+        Ok(format!(
+            "Replaced the code running in {target}. Its id, mailbox, links and permissions are \
+             unchanged; any state the old code held is gone."
+        ))
     }
 
     /// Spawn one process. Convenience wrapper over `spawn_group`.

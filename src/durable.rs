@@ -71,6 +71,10 @@ pub enum Event {
     /// this the switch would live only in memory and quietly revert on the
     /// next restart.
     Retuned { model: String, effort: Option<String> },
+    /// `patch_script` replaced a running script's code. Without this the
+    /// replacement would live only in the isolate that was running it, and a
+    /// restart would bring back the process's first draft instead.
+    Patched { source: String },
     /// A fold of everything before it, standing in for those events entirely.
     ///
     /// This is exactly what `restore` computes, written back out — which is
@@ -349,6 +353,7 @@ pub fn restore(
     let mut enqueued: Vec<MailRecord> = Vec::new();
     let mut consumed_through = 0u64;
     let mut retuned: Option<(String, Option<String>)> = None;
+    let mut patched: Option<String> = None;
     for event in events {
         match event {
             Event::Spawned(spawned) => record = Some(spawned),
@@ -362,6 +367,7 @@ pub fn restore(
             }
             Event::Stopped { .. } => stopped = true,
             Event::Retuned { model, effort } => retuned = Some((model, effort)),
+            Event::Patched { source } => patched = Some(source),
             Event::Compacted { history: summarised } => history = summarised,
             // A checkpoint supersedes everything before it: reset, then keep
             // folding whatever was appended afterward.
@@ -401,6 +407,11 @@ pub fn restore(
             if effort.is_some() {
                 record.effort = effort;
             }
+        }
+        // Only a script has code to replace, but a stray event on an agent's
+        // log would be a bug elsewhere, not something to unwrap and panic on.
+        if let Some(source) = patched {
+            record.kind = crate::system::Kind::Script(source);
         }
         (record, history, stopped, pending)
     })
@@ -521,5 +532,34 @@ mod tests {
         events.push(Event::Stopped { reason: "done".into() });
         let (_, _, stopped, _) = restore(vec![checkpoint_of(events)]).unwrap();
         assert!(stopped);
+    }
+
+    fn script_record(id: &str, source: &str) -> ProcessRecord {
+        ProcessRecord { kind: crate::system::Kind::Script(source.into()), ..record(id) }
+    }
+
+    /// The bug this event exists to fix: patch_script's replacement has to
+    /// win over the source the process was first spawned with, or a restart
+    /// brings back the first draft.
+    #[test]
+    fn a_patch_replaces_the_spawned_source_on_restore() {
+        let events = vec![
+            Event::Spawned(script_record("proc-2", "v1")),
+            Event::Patched { source: "v2".into() },
+        ];
+        let (record, ..) = restore(events).unwrap();
+        assert!(matches!(record.kind, crate::system::Kind::Script(s) if s == "v2"));
+    }
+
+    /// Compaction folds through `restore` (see `checkpoint_of`), so a patch
+    /// has to survive being checkpointed the same way a retune does.
+    #[test]
+    fn a_patch_survives_being_folded_into_a_checkpoint() {
+        let events = vec![
+            Event::Spawned(script_record("proc-2", "v1")),
+            Event::Patched { source: "v2".into() },
+        ];
+        let (record, ..) = restore(vec![checkpoint_of(events)]).unwrap();
+        assert!(matches!(record.kind, crate::system::Kind::Script(s) if s == "v2"));
     }
 }
