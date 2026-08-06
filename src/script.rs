@@ -19,12 +19,67 @@ use serde_json::{Value, json};
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use tokio::sync::mpsc::UnboundedReceiver;
 
 /// What the ops need to act on the system on the script's behalf.
 struct Host {
     sys: Arc<System>,
     me: Meta,
+    /// The process group of the child this isolate is currently blocked in.
+    children: Arc<ExecGroup>,
+}
+
+/// The process group of the child an isolate's thread is inside, or 0 for
+/// none.
+///
+/// Where this can be read from is the whole point of the type. When an exec
+/// wedges — the failure this exists for was a detached grandchild that
+/// inherited an output pipe and held it open, so the wait never saw EOF — the
+/// thread that has to do something about it is not the thread that is stuck.
+/// So the pgid must be readable from another thread *while* the owning thread
+/// sits in a blocking wait, and it must be readable without acquiring anything
+/// that thread could be holding. One atomic word gives both: the timeout path
+/// does a load and a killpg, so there is no lock to inherit, nothing to time
+/// out on, and no second way to deadlock. A mutex would work only for as long
+/// as nobody ever held it across the wait, which is a rule this file would
+/// have to keep remembering; an atomic cannot be held at all.
+///
+/// One slot is enough because both exec ops are synchronous: an isolate runs
+/// exactly one of them at a time and nothing else runs on its thread while one
+/// is in flight. If either op ever becomes async, this has to become a set.
+#[derive(Default)]
+struct ExecGroup(AtomicI32);
+
+impl ExecGroup {
+    /// The child's pid, which is also its pgid: children are spawned with
+    /// `process_group(0)`, so each one leads a group of its own and everything
+    /// it forks stays in that group unless it deliberately leaves.
+    fn entered(&self, pgid: i32) {
+        self.0.store(pgid, Ordering::SeqCst);
+    }
+
+    fn left(&self) {
+        self.0.store(0, Ordering::SeqCst);
+    }
+
+    /// Signal the whole group. Returns the pgid if there was one to signal.
+    ///
+    /// The slot is cleared the instant the wait returns, so the window in
+    /// which this could name a reaped pid is a few instructions wide — and a
+    /// recycled pid would additionally have to have become a group leader to
+    /// be hit by it.
+    fn signal(&self, signal: i32) -> Option<i32> {
+        let pgid = self.0.load(Ordering::SeqCst);
+        if pgid <= 0 {
+            return None;
+        }
+        // SAFETY: a pgid this process created, and killpg on a group that has
+        // already gone simply fails with ESRCH — which is why the result is
+        // discarded rather than reported.
+        unsafe { libc::killpg(pgid, signal) };
+        Some(pgid)
+    }
 }
 
 fn host_call(
@@ -217,11 +272,39 @@ fn run_program(
     // The working directory has to be somewhere this process can already read,
     // so running a command cannot become a way to reach outside its roots.
     let dir = host.me.grants.read.resolve(cwd, false).map_err(fs_error)?;
-    std::process::Command::new(program)
+    let children = host.children.clone();
+
+    use std::os::unix::process::CommandExt;
+    let mut command = std::process::Command::new(program);
+    command
         .args(args)
         .current_dir(&dir)
-        .output()
-        .map_err(|e| fs_error(format!("{program}: {e}")))
+        // Never inherited. A child that reads the terminal would fight the TUI
+        // for it, and — the reason this line is here — a child handed an fd it
+        // never reads can keep that pipe open long after it has stopped caring
+        // about it.
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        // Its own process group, so one signal reaches the child *and*
+        // whatever it forked. Without this, a grandchild that outlives its
+        // parent keeps the output pipe open and the wait below never returns:
+        // there is then nothing anyone can kill by name, because the process
+        // this harness knows about has already exited.
+        .process_group(0);
+    let child = command
+        .spawn()
+        .map_err(|e| fs_error(format!("{program}: {e}")))?;
+
+    // Deliberately not `output()`: the pid is needed *before* the wait, and
+    // the wait is where a wedge happens. There is no timer around it on
+    // purpose — this harness legitimately execs builds that run for minutes,
+    // so the only bound on a child is the caller's own run_script timeout,
+    // which arrives here as a signal to this group.
+    children.entered(child.id() as i32);
+    let waited = child.wait_with_output();
+    children.left();
+    waited.map_err(|e| fs_error(format!("{program}: {e}")))
 }
 
 /// `api.exec`: output as text, which is what a script handling a command's
@@ -1319,10 +1402,14 @@ async fn actor_loop(
     source: String,
     resumed: bool,
 ) {
+    // Outlives the isolate deliberately: a restart builds a new runtime, and
+    // the exec slot belongs to the *thread*, which is the same one either way.
+    let children = Arc::new(ExecGroup::default());
     // Held as an Option so the old isolate can be dropped *before* the
     // replacement is built. Two isolates alive at once on the same thread
     // leaves V8 without a current handle scope and aborts the process.
-    let mut runtime = match boot(&sys, &me, &instructions, &source, resumed, false).await {
+    let mut runtime = match boot(&sys, &me, &instructions, &source, resumed, false, &children).await
+    {
         Some(runtime) => Some(runtime),
         None => return,
     };
@@ -1395,7 +1482,7 @@ async fn actor_loop(
                 )
                 .await;
                 drop(runtime.take());
-                match boot(&sys, &me, &instructions, &source, true, false).await {
+                match boot(&sys, &me, &instructions, &source, true, false, &children).await {
                     Some(fresh) => runtime = Some(fresh),
                     None => return,
                 }
@@ -1503,32 +1590,74 @@ globalThis.__bitty_session_names = () => {
 /// restarts, like a script process's heap: anything that must survive belongs
 /// in a file.
 pub struct Session {
+    /// Replaced wholesale if a wedged incarnation has to be written off, so
+    /// that an eval takes the channel and the handles as one consistent set.
+    live: std::sync::Mutex<Arc<Live>>,
+}
+
+/// One incarnation of the session: a thread, its isolate, and the two things
+/// another thread needs in order to interrupt it.
+struct Live {
     tx: tokio::sync::mpsc::UnboundedSender<EvalRequest>,
     /// The isolate's thread-safe handle, for cancelling an eval that never
     /// finishes without losing the session.
     isolate: Arc<std::sync::Mutex<Option<deno_core::v8::IsolateHandle>>>,
+    /// The process group of the child this thread is blocked in, if any.
+    children: Arc<ExecGroup>,
+    /// Set when this incarnation has been written off. The thread checks it
+    /// before running anything, so requests that piled up behind a wedge do
+    /// not execute late, after their callers were told they had failed.
+    retired: Arc<AtomicBool>,
 }
+
+/// SIGTERM first, so a child that traps it can tidy up; SIGKILL if the group
+/// is still there this long afterwards. Short on purpose: by the time this
+/// runs the caller is already past its own deadline.
+const KILL_GRACE: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// How long the session gets to answer a script that costs nothing to run,
+/// after its runaway eval was killed. A health check, not a cap on anyone's
+/// work: it starts only once an eval has already exceeded the caller's own
+/// timeout.
+const RECOVERY_PROBE: std::time::Duration = std::time::Duration::from_secs(5);
 
 struct EvalRequest {
     source: String,
     call_id: String,
 }
 
-impl Session {
-    /// Start the session thread. Evals fail individually if the runtime
-    /// cannot start; the owning process is unaffected.
-    pub fn open(sys: Arc<System>, me: Meta) -> Session {
+impl Live {
+    /// Start a session thread. Evals fail individually if the runtime cannot
+    /// start; the owning process is unaffected.
+    fn start(sys: Arc<System>, me: Meta) -> Arc<Live> {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<EvalRequest>();
         let isolate = Arc::new(std::sync::Mutex::new(None));
-        let slot = isolate.clone();
+        let children = Arc::new(ExecGroup::default());
+        let retired = Arc::new(AtomicBool::new(false));
+        let (slot, group, flag) = (isolate.clone(), children.clone(), retired.clone());
         let started = std::thread::Builder::new()
             .name(format!("{}-session", me.id))
-            .spawn(move || session_thread(sys, me, rx, slot));
+            .spawn(move || session_thread(sys, me, rx, slot, group, flag));
         if let Err(e) = started {
             // tx's receiver lives on the failed thread; evals will report.
             eprintln!("could not start a session thread: {e}");
         }
-        Session { tx, isolate }
+        Arc::new(Live {
+            tx,
+            isolate,
+            children,
+            retired,
+        })
+    }
+}
+
+impl Session {
+    /// Start the session thread. Evals fail individually if the runtime
+    /// cannot start; the owning process is unaffected.
+    pub fn open(sys: Arc<System>, me: Meta) -> Session {
+        Session {
+            live: std::sync::Mutex::new(Live::start(sys, me)),
+        }
     }
 
     /// Evaluate one script in the session. The result comes back through the
@@ -1544,8 +1673,12 @@ impl Session {
         if let Err(e) = precheck_as("inline", source, true) {
             return (e, true);
         }
+        // Cloned out from under the lock, never held across an await: an
+        // eval that started against one incarnation keeps talking to that one
+        // even if it is retired underneath it.
+        let live = self.live.lock().unwrap().clone();
         let (id, rx) = sys.register_call(&me.id, &me.id);
-        if self
+        if live
             .tx
             .send(EvalRequest {
                 source: source.to_string(),
@@ -1560,26 +1693,115 @@ impl Session {
             Ok(Ok(Ok(value))) => (value, false),
             Ok(Ok(Err(e))) => (e, true),
             Ok(Err(_)) => ("the script ended without producing a value".into(), true),
-            Err(_) => {
-                // Cancel the runaway execution but keep the session: state
-                // already written to g.* survives, only this eval dies.
-                if let Some(handle) = self.isolate.lock().unwrap().as_ref() {
-                    handle.terminate_execution();
-                }
-                sys.resolve_call(&id, Err("timed out".into()));
-                ui::warn(
-                    &me.tag,
-                    "session eval timed out; the running code was terminated",
-                );
-                (
-                    "the script did not finish in time and was terminated. The session and its \
-                     g.* state survive. If the work is genuinely long-running, do it in a script \
-                     process instead."
-                        .into(),
-                    true,
-                )
+            Err(_) => self.recover(sys, me, &live, &id).await,
+        }
+    }
+
+    /// An eval overran its deadline. Escalate: kill whatever the thread is
+    /// blocked in, interrupt its JavaScript, then find out whether it is
+    /// actually answering again — and only if it is not, replace it.
+    ///
+    /// The order is the point. `terminate_execution` interrupts JavaScript and
+    /// nothing else, so against the failure this exists for — a native op
+    /// blocked reading a child's pipe — it does nothing at all; the thread is
+    /// not in V8 to be interrupted. Killing the child's process group is what
+    /// returns the thread to JavaScript, and only then is there anything for
+    /// the isolate handle to act on.
+    async fn recover(
+        &self,
+        sys: &Arc<System>,
+        me: &Meta,
+        live: &Arc<Live>,
+        id: &str,
+    ) -> (String, bool) {
+        sys.resolve_call(id, Err("timed out".into()));
+        let killed = live.children.signal(libc::SIGTERM).is_some();
+        if killed {
+            tokio::time::sleep(KILL_GRACE).await;
+            live.children.signal(libc::SIGKILL);
+        }
+        if let Some(handle) = live.isolate.lock().unwrap().as_ref() {
+            handle.terminate_execution();
+        }
+        if self.answers(sys, me, live).await {
+            ui::warn(
+                &me.tag,
+                "session eval timed out; the running code was terminated",
+            );
+            let note = if killed {
+                " The subprocess it was blocked in was killed, along with everything else in \
+                 that subprocess's process group."
+            } else {
+                ""
+            };
+            return (
+                format!(
+                    "the script did not finish in time and was terminated.{note} The session and \
+                     its g.* state survive. If the work is genuinely long-running, do it in a \
+                     script process instead."
+                ),
+                true,
+            );
+        }
+        // Nothing reached the thread, so it is stuck somewhere neither a
+        // signal nor the isolate handle can help with. Write it off and serve
+        // this process from a new one. Leaving it in place would be worse than
+        // it sounds: every later request queues behind a wedge that will never
+        // clear, so the process goes mute with nothing saying so, and an agent
+        // told "your session is stuck, restart the process" cannot restart
+        // itself — fail-fast alone would only relocate the silence.
+        //
+        // The old thread is abandoned rather than joined; it is inside a
+        // blocking call by definition. Dropping the last sender closes its
+        // queue, so it exits on its own if it ever does come back.
+        live.retired.store(true, Ordering::SeqCst);
+        let fresh = Live::start(sys.clone(), me.clone());
+        {
+            let mut slot = self.live.lock().unwrap();
+            // Another eval may have rebuilt it already; last writer wins is
+            // wrong here, first writer wins is what keeps the two agreeing.
+            if Arc::ptr_eq(&slot, live) {
+                *slot = fresh;
             }
         }
+        ui::warn(
+            &me.tag,
+            "session was wedged and could not be recovered; rebuilt, g.* state lost",
+        );
+        (
+            "the script did not finish in time, and the session did not come back after the \
+             runaway work was killed, so it has been REBUILT: a fresh runtime is serving this \
+             process now and everything held in g.* is gone. Anything you still need has to be \
+             recomputed. If the work is genuinely long-running, do it in a script process instead."
+                .into(),
+            true,
+        )
+    }
+
+    /// Ask the session for a value that costs nothing to produce. One that has
+    /// genuinely been unblocked answers within milliseconds; a wedged one
+    /// never picks the request up at all, because it is still inside the one
+    /// before it.
+    async fn answers(&self, sys: &Arc<System>, me: &Meta, live: &Arc<Live>) -> bool {
+        let (id, rx) = sys.register_call(&me.id, &me.id);
+        if live
+            .tx
+            .send(EvalRequest {
+                source: "return 1".into(),
+                call_id: id.clone(),
+            })
+            .is_err()
+        {
+            sys.resolve_call(&id, Err(String::new()));
+            return false;
+        }
+        // An *error* still proves the thread is running scripts again; only
+        // silence counts against it.
+        if matches!(tokio::time::timeout(RECOVERY_PROBE, rx).await, Ok(Ok(_))) {
+            return true;
+        }
+        sys.resolve_call(&id, Err("abandoned".into()));
+        false
     }
 
     /// What the session is holding: (global names created by evals, keys of
@@ -1613,6 +1835,8 @@ fn session_thread(
     me: Meta,
     mut rx: UnboundedReceiver<EvalRequest>,
     slot: Arc<std::sync::Mutex<Option<deno_core::v8::IsolateHandle>>>,
+    children: Arc<ExecGroup>,
+    retired: Arc<AtomicBool>,
 ) {
     let Ok(rt) = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -1621,7 +1845,7 @@ fn session_thread(
         return;
     };
     rt.block_on(async move {
-        let Some(mut runtime) = boot(&sys, &me, "", "", false, true).await else {
+        let Some(mut runtime) = boot(&sys, &me, "", "", false, true, &children).await else {
             while let Some(req) = rx.recv().await {
                 sys.resolve_call(&req.call_id, Err("the session runtime failed to start".into()));
             }
@@ -1660,9 +1884,18 @@ fn session_thread(
                 // The Session was dropped: its owner stopped.
                 Wake::Req(None) => return,
                 Wake::Req(Some(req)) => {
-                    // A previous eval may have been terminated on timeout;
-                    // clear the flag or this one dies with it.
-                    runtime.v8_isolate().cancel_terminate_execution();
+                    // This incarnation was written off after it wedged and a
+                    // fresh one is serving the process now. Whatever queued up
+                    // behind the wedge was reported as failed long ago, so
+                    // running it late would be a side effect nobody asked for
+                    // twice.
+                    if retired.load(Ordering::SeqCst) {
+                        sys.resolve_call(
+                            &req.call_id,
+                            Err("the session was rebuilt; this request was abandoned".into()),
+                        );
+                        continue;
+                    }
                     let wrapped = format!(
                         "(async () => {{\n  const __value = await (async () => {{\n{}\n}})();\n  \
                          Deno.core.ops.op_bitty_reply({id:?}, globalThis.__bitty_render(__value));\n\
@@ -1677,6 +1910,16 @@ fn session_thread(
                     // syntax error.
                     match transpile("inline", &wrapped) {
                         Ok(js) => {
+                            // A previous eval may have been terminated on
+                            // timeout; clear the flag or this one dies with
+                            // it. Cancelled here rather than on entry to this
+                            // arm: terminate_execution comes from another
+                            // thread and can land at any moment up to the
+                            // point V8 is re-entered, and transpiling is not
+                            // instant. Immediately before execute_script there
+                            // is no window left for the flag to be set in and
+                            // then executed against.
+                            runtime.v8_isolate().cancel_terminate_execution();
                             if let Err(e) = runtime.execute_script("[inline]", js) {
                                 sys.resolve_call(&req.call_id, Err(format!("script error: {e}")));
                             }
@@ -1706,6 +1949,7 @@ async fn boot(
     source: &str,
     resumed: bool,
     for_session: bool,
+    children: &Arc<ExecGroup>,
 ) -> Option<JsRuntime> {
     const OPS: &[OpDecl] = &[
         op_bitty_send(),
@@ -1738,6 +1982,7 @@ async fn boot(
     let host = Host {
         sys: sys.clone(),
         me: me.clone(),
+        children: children.clone(),
     };
     let ext = Extension {
         name: "bitty",
@@ -1987,7 +2232,8 @@ mod tests {
             "#
         );
 
-        let mut runtime = boot(&sys, &me, "test", &source, false, false)
+        let children = Arc::new(ExecGroup::default());
+        let mut runtime = boot(&sys, &me, "test", &source, false, false, &children)
             .await
             .expect("boot should succeed");
         run_cleanup(&mut runtime, &me.tag).await;
@@ -2050,7 +2296,8 @@ mod tests {
             }}
             "#
         );
-        let runtime = boot(&sys, &me, "test", &source, false, false).await;
+        let children = Arc::new(ExecGroup::default());
+        let runtime = boot(&sys, &me, "test", &source, false, false, &children).await;
         assert!(runtime.is_some(), "the test script should have loaded");
         let raw = std::fs::read_to_string(&marker)
             .expect("the test script should have written its result");
@@ -2310,6 +2557,184 @@ mod tests {
         assert_eq!(
             v["buffer"], "ABCD",
             "an ArrayBuffer should still decode, got {v}"
+        );
+    }
+
+    /// fd 0 of the test process, as (device, inode) — the identity a child
+    /// would inherit if stdin were passed through.
+    fn own_stdin_identity() -> (u64, u64) {
+        // SAFETY (test-only): fstat on a descriptor this process already owns,
+        // into a zeroed stat the kernel fills in completely.
+        let stat = unsafe {
+            let mut stat = std::mem::zeroed::<libc::stat>();
+            assert_eq!(libc::fstat(0, &mut stat), 0, "fstat(0) should succeed");
+            stat
+        };
+        (stat.st_dev as u64, stat.st_ino)
+    }
+
+    /// A child must never inherit this process's stdin. The incident behind
+    /// the process-group work started with an fd a child was handed and never
+    /// read: the descriptor stayed open and the parent's wait for EOF never
+    /// ended. /dev/null cannot be held open in a way that matters.
+    ///
+    /// Two assertions because either alone can pass for the wrong reason: the
+    /// child's stdin must *be* /dev/null, and it must not be the descriptor
+    /// this process is holding — the second is vacuous only when the test
+    /// runner's own stdin already is /dev/null.
+    #[tokio::test]
+    async fn a_spawned_child_gets_dev_null_for_stdin() {
+        let v = eval_json(
+            r#"const probe = "import os, sys; s = os.fstat(0); sys.stdout.write(f\"{'null' if os.path.samestat(s, os.stat('/dev/null')) else 'other'}|{s.st_dev}|{s.st_ino}|{sys.stdin.read()!r}\")";
+               const out = new Deno.Command("python3", { args: ["-c", probe], cwd: TMP }).outputSync();
+               const [kind, dev, ino, read] = new TextDecoder().decode(out.stdout).split("|");
+               return { kind, dev: Number(dev), ino: Number(ino), read, code: out.code };"#,
+        )
+        .await;
+        assert_eq!(
+            v["code"], 0,
+            "the probe should have exited cleanly, got {v}"
+        );
+        assert_eq!(v["kind"], "null", "stdin should be /dev/null, got {v}");
+        assert_eq!(v["read"], "''", "stdin should read empty, got {v}");
+        let (dev, ino) = own_stdin_identity();
+        let inherited = (v["dev"].as_u64(), v["ino"].as_u64()) == (Some(dev), Some(ino));
+        assert!(
+            !inherited || v["kind"] == "null",
+            "the child was handed this process's own stdin, got {v}"
+        );
+    }
+
+    /// The mechanism the timeout path depends on: a child is put in a process
+    /// group of its own, so one signal reaches it and everything it forks
+    /// without touching the harness. If this regresses, killing a wedged exec
+    /// would signal the harness's own group — which is why it is pinned
+    /// separately from the behaviour built on top of it.
+    ///
+    /// The child's pgid is not asserted to equal its pid: python3 here can be
+    /// a wrapper that runs the interpreter as a child, in which case the group
+    /// leader is the wrapper. Group membership is the property that matters.
+    #[tokio::test]
+    async fn a_spawned_child_leads_its_own_process_group() {
+        let v = eval_json(
+            r#"const probe = "import os, sys; sys.stdout.write(f'{os.getpid()},{os.getpgrp()}')";
+               const out = new Deno.Command("python3", { args: ["-c", probe], cwd: TMP }).outputSync();
+               const [pid, pgrp] = new TextDecoder().decode(out.stdout).split(",").map(Number);
+               return { pid, pgrp };"#,
+        )
+        .await;
+        // SAFETY (test-only): getpgrp takes no arguments and cannot fail.
+        let ours = i64::from(unsafe { libc::getpgrp() });
+        assert_ne!(
+            v["pgrp"].as_i64(),
+            Some(ours),
+            "the child should not share the harness's process group ({ours}), got {v}"
+        );
+        assert!(
+            v["pgrp"].as_i64().is_some_and(|p| p > 0),
+            "the child should report a real process group, got {v}"
+        );
+    }
+
+    /// A session with permission to run python3 in the temp directory. The
+    /// wedge is a property of the *session* — one thread serving a queue — so
+    /// nothing below can be tested through a one-shot isolate.
+    fn test_session(id: &str) -> (Arc<System>, Meta, Session, std::path::PathBuf) {
+        test_key();
+        let temp = std::env::temp_dir().canonicalize().unwrap();
+        let client = crate::api::Client::from_env().unwrap();
+        let sys = Arc::new(System::new(client));
+        let mut me = test_meta(id, temp.clone());
+        me.grants.run = Grant::Ids(HashSet::from(["python3".to_string()]));
+        me.grants.read = PathGrant::Under(vec![temp.clone()]);
+        let session = Session::open(sys.clone(), me.clone());
+        (sys, me, session, temp)
+    }
+
+    /// terminate_execution sets a flag on the isolate that stays set until it
+    /// is cancelled. Cancel it too early — or not at all — and the *next*
+    /// script dies of the previous one's timeout, which looks like a session
+    /// that has silently stopped working.
+    #[tokio::test]
+    async fn a_terminated_eval_leaves_the_next_one_in_the_session_untouched() {
+        let (sys, me, session, _temp) = test_session("proc-terminate");
+        let (out, failed) = session.eval(&sys, &me, "while (true) {}", 1).await;
+        assert!(
+            failed,
+            "a runaway loop should not report success, got {out}"
+        );
+        let (out, failed) = session.eval(&sys, &me, "return 6 * 7;", 10).await;
+        assert!(!failed, "the next eval should run normally, got {out}");
+        assert_eq!(
+            out, "42",
+            "the next eval should return its value, got {out}"
+        );
+    }
+
+    /// REGRESSION, and the reason all of this exists. A run_script call
+    /// spawned a child that left a grandchild holding the output pipe open;
+    /// the child exited, the grandchild did not, and the wait for EOF never
+    /// returned. The session is one thread serving a queue, so that single
+    /// blocked *native* op wedged everything behind it: later evals, down to
+    /// returning 1 + 1, sat in the queue until their own timeouts and returned
+    /// nothing. terminate_execution could not help — it interrupts JavaScript,
+    /// and the thread was not in JavaScript.
+    ///
+    /// So: wedge a session exactly that way, let the eval time out, and
+    /// require the NEXT eval in the SAME session to run normally and quickly.
+    /// Quickly matters as much as normally — the grandchild outlives the
+    /// assertions on purpose, so a pass proves the group was killed rather
+    /// than that the test simply waited the sleeper out.
+    #[tokio::test]
+    async fn a_child_holding_a_pipe_open_does_not_wedge_the_session() {
+        let (sys, me, session, temp) = test_session("proc-wedge");
+        let (out, failed) = session
+            .eval(&sys, &me, "g.marker = 7; return g.marker;", 10)
+            .await;
+        assert!(!failed, "the session should start healthy, got {out}");
+
+        // The grandchild keeps the stdout pipe it inherited; the direct child
+        // exits immediately. Its sleep is bounded so that even a total failure
+        // of the fix cannot leave anything behind for longer than that.
+        let wedge = "import subprocess, sys; \
+                     subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(12)']); \
+                     sys.exit(0)";
+        let started = std::time::Instant::now();
+        let (out, failed) = session
+            .eval(
+                &sys,
+                &me,
+                &format!("return bitty.exec('python3', ['-c', {wedge:?}], {temp:?});"),
+                2,
+            )
+            .await;
+        assert!(failed, "the wedged eval should have timed out, got {out}");
+        assert!(
+            !out.contains("REBUILT"),
+            "killing the process group should have unblocked the thread, so the session should \
+             not have needed rebuilding: {out}"
+        );
+
+        let (out, failed) = session.eval(&sys, &me, "return 1 + 1;", 6).await;
+        let elapsed = started.elapsed();
+        assert!(
+            !failed,
+            "the next eval in the same session should run, got {out}"
+        );
+        assert_eq!(out, "2", "the next eval should return its value, got {out}");
+        // The sharp end of it: the same isolate, still holding what earlier
+        // evals put in it. A rebuilt session would answer "2" just as happily
+        // and have lost this.
+        let (out, failed) = session.eval(&sys, &me, "return g.marker;", 6).await;
+        assert!(!failed, "reading g.* back should not fail, got {out}");
+        assert_eq!(
+            out, "7",
+            "g.* state should have survived the wedge, got {out}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(9),
+            "the session should have recovered by killing the process group, not by outliving \
+             the sleeper; recovery took {elapsed:?}"
         );
     }
 }
