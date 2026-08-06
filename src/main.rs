@@ -3,6 +3,7 @@
 //! Usage:
 //!   bitty "initial task for the root process"
 //!   bitty --once "task"          # exit when every process is idle or stopped
+//!   bitty --tui "task"           # alternate-screen live dashboard
 //!   bitty --role "you are ..."   # system prompt for the root process
 //!
 //! Permissions, Deno's own convention: bare means unrestricted, a value (as
@@ -32,17 +33,19 @@
 //!   /stop proc-3      → stop a process (add --cascade for its descendants)
 //!   /quit             → exit
 
+mod actions;
 mod agent;
 mod anthropic;
-mod durable;
-mod grants;
-mod actions;
 mod api;
 mod codex;
-mod system;
+mod dashboard;
+mod durable;
+mod grants;
 mod script;
+mod system;
 mod ui;
 
+use std::io::IsTerminal;
 use std::sync::Arc;
 
 /// Where processes are recorded unless told otherwise.
@@ -50,6 +53,53 @@ const DEFAULT_JOURNAL: &str = ".bitty/journal";
 /// Each run gets its own directory under here, so sessions accumulate side by
 /// side and can be resumed by name rather than by remembering a path.
 const SESSION_ROOT: &str = ".bitty/sessions";
+
+const HELP: &str = r#"Bitty — an actor-style agent harness
+
+Usage:
+  bitty [OPTIONS] [PROMPT...]
+  bitty --resume[=NAME] [MESSAGE...]
+
+Run mode:
+      --tui                    Open the live alternate-screen dashboard
+      --once                   Exit after every process settles
+      --role, --system TEXT    Add role text to the root process
+      --max-tokens N           Ask the system to wind down after N billable tokens
+      --gate COMMAND           With --once, require COMMAND to pass at quiescence
+      --gate-attempts N        Maximum gate failures (default: 3)
+
+Sessions and environment:
+      --resume[=NAME]          Resume NAME, or the most recent session
+      --journal DIR            Store the process journal in DIR
+      --env-file FILE          Load KEY=value entries before client setup
+
+Permissions (omitted means denied; a bare flag means unrestricted):
+  -A, --allow-all              Grant every capability without a scope
+      --allow-read[=PATHS]     Read anywhere, or below comma-separated paths
+      --allow-write[=PATHS]    Write anywhere, or below comma-separated paths
+      --allow-run[=PROGRAMS]   Run any program, or the named programs
+      --allow-net[=HOSTS]      Reach any host, or the named hosts
+      --allow-env[=NAMES]      Read any environment variable, or the named variables
+      --allow-sys[=KEYS]       Query any system fact, or the named keys
+
+Other:
+  -h, --help                   Print this help and exit
+
+Interactive commands:
+  text                         Send text to the root process
+  @proc-N message              Send to one process (@* broadcasts)
+  /ps                          List processes
+  /graph                       Show the supervision and messaging graph
+  /model proc-N MODEL [EFFORT] Change a process model for its next turn
+  /stop proc-N [--cascade]     Stop one or more processes
+  /quit                        Exit
+
+TUI keys:
+  Up/Down select a process and filter its output and incoming mail; Esc clears.
+  Mouse wheel or PgUp/PgDn scrolls the transcript; End jumps to the latest.
+  t toggles trace lines when input is empty (Ctrl-T always toggles); Enter sends.
+  Ctrl-C exits.
+"#;
 
 /// A name a person can retype from memory an hour later. Two words carry the
 /// recall and the epoch tail carries the uniqueness — a bare timestamp is
@@ -193,6 +243,8 @@ use tokio::sync::mpsc;
 async fn main() -> anyhow::Result<()> {
     let mut args = std::env::args().skip(1).peekable();
     let mut once = false;
+    let mut tui = false;
+    let mut help = false;
     let mut role: Option<String> = None;
     // The filesystem is outside the harness, so nothing reaches it unless the
     // human grants a root here. Everything below the root attenuates from this.
@@ -214,6 +266,8 @@ async fn main() -> anyhow::Result<()> {
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--once" => once = true,
+            "--tui" => tui = true,
+            "--help" | "-h" => help = true,
             // Verification gates: run at quiesce, and a failure sends the
             // bounded output back to root as work to do instead of ending the
             // run. Only meaningful with --once, which is the mode that ends.
@@ -312,6 +366,23 @@ async fn main() -> anyhow::Result<()> {
             _ => rest.push(arg),
         }
     }
+    if help {
+        print!("{HELP}");
+        return Ok(());
+    }
+    if tui && (!std::io::stdin().is_terminal() || !std::io::stdout().is_terminal()) {
+        eprintln!("--tui requires an interactive stdin and stdout terminal");
+        std::process::exit(2);
+    }
+    // Subscribe before the first startup line so the dashboard can replay the
+    // complete console stream once it takes over the terminal.
+    let mut dashboard_events = if tui {
+        let receiver = ui::tap().subscribe();
+        ui::set_dashboard_active(true);
+        Some(receiver)
+    } else {
+        None
+    };
     let prompt = rest.join(" ");
     // With no prompt, come up idle and wait for the console. Only --once needs
     // something to do, since it exits as soon as everything settles.
@@ -339,8 +410,11 @@ async fn main() -> anyhow::Result<()> {
     let named_file = env_file.is_some();
     match load_env_file(env_file.as_deref().unwrap_or(".env")) {
         Ok(names) if !names.is_empty() => {
-            ui::system(&format!("loaded {} from .env — grant with --allow-env={}",
-                names.join(", "), names.join(",")));
+            ui::system(&format!(
+                "loaded {} from .env — grant with --allow-env={}",
+                names.join(", "),
+                names.join(",")
+            ));
         }
         Ok(_) => {}
         // Only complain when a file was actually asked for; a missing .env is
@@ -353,7 +427,10 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let api = api::Client::from_env()?;
-    ui::system(&format!("bitty · model {} · /ps /graph /model /stop /quit · '@proc-N msg' targets a process, plain text goes to root", api.model));
+    ui::system(&format!(
+        "bitty · model {} · /ps /graph /model /stop /quit · '@proc-N msg' targets a process, plain text goes to root",
+        api.model
+    ));
 
     // Persistence is the default, not something to remember to switch on: an
     // interactive run that dies having built a world of scripts should be
@@ -392,7 +469,7 @@ async fn main() -> anyhow::Result<()> {
         let mut brought_back = 0;
         let mut highest = 0;
         for id in journal.processes() {
-            let Some((record, mut history, stopped, pending, dropped)) =
+            let Some((record, mut history, stopped, pending, dropped, mail_cursor)) =
                 durable::restore(journal.replay(&id))
             else {
                 continue;
@@ -413,7 +490,12 @@ async fn main() -> anyhow::Result<()> {
                     record.id
                 ));
                 durable::attach_restart_notice(&mut history, &notice);
-                journal.record(&id, &durable::Event::Compacted { history: history.clone() });
+                journal.record(
+                    &id,
+                    &durable::Event::Compacted {
+                        history: history.clone(),
+                    },
+                );
                 journal.flush(&id);
             }
             sys.resume_ids_after(highest);
@@ -423,7 +505,7 @@ async fn main() -> anyhow::Result<()> {
                 history.len(),
                 pending.len()
             ));
-            sys.restore(record, history, pending);
+            sys.restore(record, history, pending, mail_cursor);
             brought_back += 1;
         }
         sys.resume_ids_after(highest);
@@ -443,8 +525,7 @@ async fn main() -> anyhow::Result<()> {
         // just a message to the existing root rather than a new tree.
         String::from("proc-1")
     } else {
-        sys
-        .spawn(
+        sys.spawn(
             "user",
             NodeSpec {
                 instructions: prompt.clone(),
@@ -486,7 +567,45 @@ async fn main() -> anyhow::Result<()> {
         tokio::spawn(watch_budget(sys.clone(), root.clone(), budget));
     }
 
+    let dashboard_session = session
+        .clone()
+        .or_else(|| {
+            journal_dir.as_ref().and_then(|directory| {
+                std::path::Path::new(directory)
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+            })
+        })
+        .unwrap_or_else(|| if once { "one-shot" } else { "interactive" }.into());
     if once {
+        if tui {
+            let receiver = dashboard_events
+                .take()
+                .expect("TUI receiver was initialized");
+            let command_system = sys.clone();
+            let command_root = root.clone();
+            // Both futures are scoped here so whichever loses the race is
+            // dropped — and therefore restores the alternate screen — before
+            // any process exit below.
+            let outcome: anyhow::Result<Option<bool>> = {
+                let dashboard =
+                    dashboard::run(sys.as_ref(), &dashboard_session, receiver, move |line| {
+                        dispatch_console(line, &command_system, &command_root) == ConsoleFlow::Quit
+                    });
+                let settle = run_until_idle(&sys, &root, &gates, gate_attempts, &snapshot_roots);
+                tokio::pin!(dashboard);
+                tokio::pin!(settle);
+                tokio::select! {
+                    result = &mut dashboard => result.map(|()| None),
+                    ok = &mut settle => Ok(Some(ok)),
+                }
+            };
+            ui::set_dashboard_active(false);
+            if matches!(outcome?, Some(false)) {
+                std::process::exit(1);
+            }
+            return Ok(());
+        }
         let ok = run_until_idle(&sys, &root, &gates, gate_attempts, &snapshot_roots).await;
         if !ok {
             std::process::exit(1);
@@ -494,7 +613,23 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
     if !gates.is_empty() {
-        ui::system("--gate only applies with --once (an interactive session never ends on its own)");
+        ui::system(
+            "--gate only applies with --once (an interactive session never ends on its own)",
+        );
+    }
+
+    if tui {
+        let receiver = dashboard_events
+            .take()
+            .expect("TUI receiver was initialized");
+        let command_system = sys.clone();
+        let command_root = root.clone();
+        let result = dashboard::run(sys.as_ref(), &dashboard_session, receiver, move |line| {
+            dispatch_console(line, &command_system, &command_root) == ConsoleFlow::Quit
+        })
+        .await;
+        ui::set_dashboard_active(false);
+        return result;
     }
 
     // Forward stdin lines from a blocking thread into the async world.
@@ -509,74 +644,89 @@ async fn main() -> anyhow::Result<()> {
     });
 
     while let Some(line) = lines.recv().await {
-        let line = line.trim().to_string();
-        match line.as_str() {
-            "" => continue,
-            "/quit" | "/exit" => break,
-            "/ps" => ui::system(&sys.list()),
-            "/graph" | "/tree" => ui::system(&sys.graph()),
-            _ if line.starts_with("/model") => {
-                let args: Vec<&str> = line["/model".len()..].split_whitespace().collect();
-                match args.as_slice() {
-                    [id, model, rest @ ..] => {
-                        match sys.set_model(id, model, rest.first().copied()) {
-                            Ok(report) => ui::system(&report),
-                            Err(why) => ui::system(&why),
-                        }
-                    }
-                    _ => ui::system("usage: /model proc-1 claude-opus-5 [high]"),
-                }
-            }
-            _ if line.starts_with("/stop") => {
-                let rest = line["/stop".len()..].trim();
-                let cascade = rest.split_whitespace().any(|t| t == "--cascade");
-                let mut targets: Vec<String> = rest
-                    .split_whitespace()
-                    .filter(|t| !t.starts_with("--"))
-                    .flat_map(|t| t.split(','))
-                    .filter(|t| !t.is_empty())
-                    .map(String::from)
-                    .collect();
-                if targets.iter().any(|t| t == "*") {
-                    targets = sys.live_ids("");
-                }
-                if targets.is_empty() {
-                    ui::system("usage: /stop proc-2 [proc-3 ...|*] [--cascade]");
-                    continue;
-                }
-                // No initiator: a human-ordered stop is abnormal from the
-                // perspective of anything linked to the target.
-                if let Err(e) = sys.stop(&targets, cascade, None) {
-                    ui::system(&e);
-                }
-            }
-            _ if line.starts_with('@') => {
-                let (spec, body) = line[1..]
-                    .split_once(char::is_whitespace)
-                    .unwrap_or((&line[1..], ""));
-                if body.trim().is_empty() {
-                    ui::system("usage: @proc-2[,proc-3,...|*] your message");
-                    continue;
-                }
-                let targets: Vec<String> = if spec == "*" {
-                    sys.live_ids("")
-                } else {
-                    spec.split(',').filter(|t| !t.is_empty()).map(String::from).collect()
-                };
-                for target in targets {
-                    if let Err(e) = sys.send(&target, user_mail(body)) {
-                        ui::system(&e);
-                    }
-                }
-            }
-            _ => {
-                if let Err(e) = sys.send(&root, user_mail(&line)) {
-                    ui::system(&e);
-                }
-            }
+        if dispatch_console(&line, &sys, &root) == ConsoleFlow::Quit {
+            break;
         }
     }
     Ok(())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConsoleFlow {
+    Continue,
+    Quit,
+}
+
+/// The one command path used by both the line console and the dashboard.
+fn dispatch_console(line: &str, sys: &Arc<System>, root: &str) -> ConsoleFlow {
+    let line = line.trim();
+    match line {
+        "" => {}
+        "/quit" | "/exit" => return ConsoleFlow::Quit,
+        "/ps" => ui::system(&sys.list()),
+        "/graph" | "/tree" => ui::system(&sys.graph()),
+        _ if line.starts_with("/model") => {
+            let args: Vec<&str> = line["/model".len()..].split_whitespace().collect();
+            match args.as_slice() {
+                [id, model, rest @ ..] => match sys.set_model(id, model, rest.first().copied()) {
+                    Ok(report) => ui::system(&report),
+                    Err(why) => ui::system(&why),
+                },
+                _ => ui::system("usage: /model proc-1 claude-opus-5 [high]"),
+            }
+        }
+        _ if line.starts_with("/stop") => {
+            let rest = line["/stop".len()..].trim();
+            let cascade = rest.split_whitespace().any(|token| token == "--cascade");
+            let mut targets: Vec<String> = rest
+                .split_whitespace()
+                .filter(|token| !token.starts_with("--"))
+                .flat_map(|token| token.split(','))
+                .filter(|target| !target.is_empty())
+                .map(String::from)
+                .collect();
+            if targets.iter().any(|target| target == "*") {
+                targets = sys.live_ids("");
+            }
+            if targets.is_empty() {
+                ui::system("usage: /stop proc-2 [proc-3 ...|*] [--cascade]");
+                return ConsoleFlow::Continue;
+            }
+            // No initiator: a human-ordered stop is abnormal from the
+            // perspective of anything linked to the target.
+            if let Err(error) = sys.stop(&targets, cascade, None) {
+                ui::system(&error);
+            }
+        }
+        _ if line.starts_with('@') => {
+            let (spec, body) = line[1..]
+                .split_once(char::is_whitespace)
+                .unwrap_or((&line[1..], ""));
+            if body.trim().is_empty() {
+                ui::system("usage: @proc-2[,proc-3,...|*] your message");
+                return ConsoleFlow::Continue;
+            }
+            let targets: Vec<String> = if spec == "*" {
+                sys.live_ids("")
+            } else {
+                spec.split(',')
+                    .filter(|target| !target.is_empty())
+                    .map(String::from)
+                    .collect()
+            };
+            for target in targets {
+                if let Err(error) = sys.send(&target, user_mail(body)) {
+                    ui::system(&error);
+                }
+            }
+        }
+        _ => {
+            if let Err(error) = sys.send(root, user_mail(line)) {
+                ui::system(&error);
+            }
+        }
+    }
+    ConsoleFlow::Continue
 }
 
 fn user_mail(body: &str) -> Mail {
@@ -730,7 +880,10 @@ fn bound(text: &str, cap: usize) -> String {
     }
     let head: String = chars[..cap / 2].iter().collect();
     let tail: String = chars[chars.len() - cap / 2..].iter().collect();
-    format!("{head}\n… [{} chars truncated] …\n{tail}", chars.len() - cap)
+    format!(
+        "{head}\n… [{} chars truncated] …\n{tail}",
+        chars.len() - cap
+    )
 }
 
 /// A cheap digest of everything under the scoped write roots: path, length,
@@ -748,7 +901,9 @@ fn snapshot(roots: &[String]) -> Option<u64> {
     for root in roots {
         let mut stack = vec![std::path::PathBuf::from(root)];
         while let Some(dir) = stack.pop() {
-            let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
             let mut items: Vec<_> = entries.flatten().map(|e| e.path()).collect();
             items.sort();
             for path in items {
@@ -763,7 +918,9 @@ fn snapshot(roots: &[String]) -> Option<u64> {
                     }
                     continue;
                 }
-                let Ok(meta) = std::fs::metadata(&path) else { continue };
+                let Ok(meta) = std::fs::metadata(&path) else {
+                    continue;
+                };
                 path.hash(&mut hasher);
                 meta.len().hash(&mut hasher);
                 if let Ok(modified) = meta.modified() {
@@ -805,10 +962,14 @@ async fn watch_budget(sys: Arc<System>, root: String, budget: u64) {
 
 #[cfg(test)]
 mod tests {
-    use super::{Allow, allow_values};
+    use super::{Allow, HELP, allow_values};
 
     fn peekable(args: &[&str]) -> std::iter::Peekable<std::vec::IntoIter<String>> {
-        args.iter().map(|s| s.to_string()).collect::<Vec<_>>().into_iter().peekable()
+        args.iter()
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>()
+            .into_iter()
+            .peekable()
     }
 
     #[test]
@@ -850,7 +1011,10 @@ mod tests {
         let mut allow = Allow::Unset;
         allow.apply(Some(vec!["a".to_string()]));
         allow.apply(Some(vec!["b".to_string()]));
-        assert_eq!(allow.into_spec(), Some(vec!["a".to_string(), "b".to_string()]));
+        assert_eq!(
+            allow.into_spec(),
+            Some(vec!["a".to_string(), "b".to_string()])
+        );
     }
 
     #[test]
@@ -864,5 +1028,13 @@ mod tests {
     #[test]
     fn never_mentioned_denies_rather_than_inheriting() {
         assert_eq!(Allow::Unset.into_spec(), Some(Vec::new()));
+    }
+
+    #[test]
+    fn help_covers_tui_and_console_controls() {
+        assert!(HELP.contains("--tui"));
+        assert!(HELP.contains("--help"));
+        assert!(HELP.contains("/model proc-N MODEL [EFFORT]"));
+        assert!(HELP.contains("Ctrl-C exits"));
     }
 }
