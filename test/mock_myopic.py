@@ -71,22 +71,23 @@ class H(BaseHTTPRequestHandler):
         names = [t["name"] for t in tools]
 
         if "process proc-3" in system:       # the reader: tools, and no graph
-            # Self-stop survives every narrowing on purpose, and names nobody
-            # but itself, so it is not a graph leak. Everything that could name
+            # Self-stop survives every narrowing on purpose, and run_script is
+            # where its functions are called. Everything that could name
             # another process must be gone.
-            leaked = [t for t in names if t not in ("lookup", "stop_process")]
+            leaked = [t for t in names if t not in ("run_script", "stop_process")]
             if leaked:
                 return self.fail(f"a myopic process should see only its own tools: {leaked}")
-            if "lookup" not in names:
-                return self.fail(f"the alias must survive having no messaging: {names}")
-            desc = tools[0]["description"]
-            if "proc-" in desc:
-                return self.fail(f"the alias must not name the process behind it: {desc!r}")
-            # The permissions section should not advertise a roster either.
+            if "await lookup(" not in system:
+                return self.fail("the identity block must document the session function")
+            # No mention of who answers, and no roster: the holder learns it
+            # has a function, not that it has a colleague.
+            if "Answered by" in system or "proc-2" in system:
+                return self.fail("the tool doc must not name the process behind it")
             if "list_processes" in system or "send_message" in system:
                 return self.fail("a myopic process should not be told about messaging tools")
             if n == 0:
-                ev = turn([("tool_use", "r1", "lookup", {"key": "answer"})], "tool_use")
+                ev = turn([("tool_use", "r1", "run_script",
+                            {"script": "return await lookup({key: \"answer\"});"})], "tool_use")
             elif n == 1:
                 r = results(messages[-1])[0]
                 if r["is_error"] or r["content"].strip() != "42":
@@ -112,11 +113,11 @@ class H(BaseHTTPRequestHandler):
             else:
                 ev = turn([("text", "Idle.\n")], "end_turn")
 
-        elif "ask" in names:        # the mute worker spawned below: nothing to do
+        elif "await ask(" in system:        # the mute worker spawned below: nothing to do
             ev = turn([("text", "Idle.\n")], "end_turn")
 
-        elif "lookup" in names:
-            return self.fail("only the reader should see the alias")
+        elif "await lookup(" in system:
+            return self.fail("only the reader should hold the lookup function")
 
         elif "process proc-1" not in system:   # anything else spawned: idle
             ev = turn([("text", "Idle.\n")], "end_turn")

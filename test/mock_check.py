@@ -9,9 +9,12 @@ bitty.onMail(async (mail, api): Promise<string> => {
   return `deno-api-ok:${text.trim().length}`;
 });
 """ % (json.dumps(REPO), json.dumps(REPO))
+# A syntax error, not a type error: the precheck is deliberately parse-only
+# (no host toolchain), so a wrong type runs and fails at runtime, but broken
+# syntax must still be refused before a process id is claimed.
 BAD = """
 bitty.onMail((mail): string => {
-  const n: number = "not a number";
+  const n: = ;
   return n;
 });
 """
@@ -43,7 +46,7 @@ class H(BaseHTTPRequestHandler):
         elif n==1:
             r=res(messages[-1])[0]
             if not r["is_error"]:
-                return self.fail("a script with a type error should not spawn")
+                return self.fail("a script with a syntax error should not spawn")
             if "TypeScript" not in r["content"]:
                 return self.fail(f"error should name the typecheck: {r['content'][:200]!r}")
             ev=turn([("tool_use","t2","spawn_process",{"name":"bad-model","instructions":"x","model":"gpt-4o"})],"tool_use")

@@ -1,5 +1,12 @@
-"""Inline TypeScript: runs with the caller's own capabilities, returns a value,
-is typechecked, and is hidden from a process that cannot spawn."""
+"""Inline TypeScript: runs in the caller's persistent session with the
+caller's own capabilities.
+
+Covers: annotations are stripped (transpiled, not merely ignored), the
+precheck is syntax-only by design (a type mismatch runs; a syntax error is
+caught before V8), filesystem grants bind the session, g.* persists across
+run_script calls, oversized results are stored as g.results.rN handles
+instead of landing in context, and run_script is offered independently of
+spawn authority (it is this-process authority, not delegation)."""
 import json, os
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 REPO=os.environ["BITTY_TEST_REPO"]
@@ -18,6 +25,7 @@ def turn(blocks, stop):
     return ev
 def res(m): return [b for b in m.get("content",[]) if isinstance(b,dict) and b.get("type")=="tool_result"]
 def flat(x): return x if isinstance(x,str) else " ".join(b.get("text","") for b in x)
+def script(src): return ("tool_use", "t", "run_script", {"script": src})
 class H(BaseHTTPRequestHandler):
     def log_message(self,*a): pass
     def fail(self,m):
@@ -28,32 +36,57 @@ class H(BaseHTTPRequestHandler):
         system=flat(b["system"]); messages=b["messages"]; names=[t["name"] for t in b["tools"]]
         n=len([m for m in messages if m["role"]=="assistant"])
         if "process proc-2" in system:
-            if "run_script" in names:
-                return self.fail(f"a process without spawn must not be offered run_script: {names}")
+            # run_script is this-process authority and rides no other grant;
+            # the spawn tools do, and this leaf was denied spawn.
+            if "run_script" not in names:
+                return self.fail(f"run_script does not require spawn authority, but the leaf lost it: {names}")
+            if "spawn_process" in names:
+                return self.fail(f"a process without spawn must not be offered spawn_process: {names}")
             return self.respond(turn([("text","leaf ok\n")],"end_turn"))
         if n==0:
             if "run_script" not in names:
-                return self.fail(f"root holds spawn and should be offered run_script: {names}")
-            return self.respond(turn([("tool_use","t1","run_script",
+                return self.fail(f"root should be offered run_script: {names}")
+            return self.respond(turn([script(
                 # Annotated on purpose: inline source has to be transpiled, not
-                # just typechecked, or every annotation reaches V8 as a syntax
-                # error at runtime.
-                {"script": "let n: number = 0; const dir: string = %s; for await (const _ of Deno.readDir(dir)) n++; return `count=${n}`;" % json.dumps(REPO+"/src")})],"tool_use"))
+                # just parsed, or every annotation reaches V8 as a syntax error.
+                "let c: number = 0; const dir: string = %s; for await (const _ of Deno.readDir(dir)) c++; return `count=${c}`;" % json.dumps(REPO+"/src"))],"tool_use"))
+        r = res(messages[-1])[0] if res(messages[-1]) else None
         if n==1:
-            r=res(messages[-1])[0]
             if r["is_error"] or "count=1" not in r["content"]:
                 return self.fail(f"inline script should read the granted dir: {r}")
-            return self.respond(turn([("tool_use","t2","run_script",{"script":"const n: number = \"nope\"; return n;"})],"tool_use"))
+            # A type mismatch is deliberately a runtime concern: the precheck
+            # is syntax-only (no host toolchain), so this runs and returns.
+            return self.respond(turn([script("const s: number = \"nope\"; return s;")],"tool_use"))
         if n==2:
-            r=res(messages[-1])[0]
-            if not r["is_error"] or "TypeScript" not in r["content"]:
-                return self.fail(f"inline script should be typechecked: {r}")
-            return self.respond(turn([("tool_use","t3","run_script",{"script":"return Deno.readTextFile(\"/etc/shadow\");"})],"tool_use"))
+            if r["is_error"] or r["content"] != "nope":
+                return self.fail(f"annotations are stripped, not type-checked; this should run: {r}")
+            return self.respond(turn([script("const = ;")],"tool_use"))
         if n==3:
-            r=res(messages[-1])[0]
+            if not r["is_error"] or "TypeScript" not in r["content"]:
+                return self.fail(f"a syntax error should be caught before V8: {r}")
+            return self.respond(turn([script("return Deno.readTextFile(\"/etc/shadow\");")],"tool_use"))
+        if n==4:
             if not r["is_error"]:
                 return self.fail("inline script escaped the caller's filesystem grant")
-            return self.respond(turn([("tool_use","t4","spawn_process",{"name":"leaf","instructions":"x","can_spawn":False})],"tool_use"))
+            return self.respond(turn([script("g.x = 42; return \"stored\";")],"tool_use"))
+        if n==5:
+            if r["is_error"] or "stored" not in r["content"]:
+                return self.fail(f"storing session state should succeed: {r}")
+            return self.respond(turn([script("return g.x + 1;")],"tool_use"))
+        if n==6:
+            if r["is_error"] or "43" not in r["content"]:
+                return self.fail(f"g.x must persist across run_script calls: {r}")
+            return self.respond(turn([script("return \"y\".repeat(20000);")],"tool_use"))
+        if n==7:
+            if r["is_error"] or "g.results.r1" not in r["content"]:
+                return self.fail(f"an oversized result should come back as a g.results handle: {r}")
+            if len(r["content"]) > 5000:
+                return self.fail(f"the handle must not carry the whole payload: {len(r['content'])} chars")
+            return self.respond(turn([script("return g.results.r1.length;")],"tool_use"))
+        if n==8:
+            if r["is_error"] or "20000" not in r["content"]:
+                return self.fail(f"the stored result should be sliceable later: {r}")
+            return self.respond(turn([("tool_use","t9","spawn_process",{"name":"leaf","instructions":"x","can_spawn":False})],"tool_use"))
         return self.respond(turn([("text","INLINE_OK\n")],"end_turn"))
     def respond(self, ev):
         p=sse(ev); self.send_response(200); self.send_header("content-type","text/event-stream")

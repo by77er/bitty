@@ -12,8 +12,12 @@
 //! rather than blocks inside a user message, and the streaming events have
 //! their own names.
 
+use crate::api::{Backend, Client, Failure, FailureKind, FinalMessage, Tier, Turn, classify};
+use crate::ui::{self, Tag};
 use anyhow::{Context, Result, anyhow, bail};
+use futures_util::StreamExt;
 use serde_json::{Value, json};
+use std::time::{Duration, Instant};
 
 const RESPONSES_URL: &str = "https://chatgpt.com/backend-api/codex/responses";
 const REFRESH_URL: &str = "https://auth.openai.com/oauth/token";
@@ -253,6 +257,10 @@ pub struct Accumulated {
     pub content: Vec<Value>,
     pub stop_reason: String,
     pub input_tokens: u64,
+    /// What this turn actually cost: uncached input plus output. Cache reads
+    /// are excluded, or a long conversation's budget is exhausted by
+    /// re-reading its own context.
+    pub billable: u64,
     /// This response's id, to thread the next turn onto.
     pub id: Option<String>,
 }
@@ -262,6 +270,7 @@ pub struct Stream {
     text: String,
     calls: Vec<Value>,
     input_tokens: u64,
+    billable: u64,
     id: Option<String>,
     failed: Option<String>,
 }
@@ -294,9 +303,11 @@ impl Stream {
                 }
             }
             "response.completed" => {
-                self.input_tokens = event["response"]["usage"]["input_tokens"]
-                    .as_u64()
-                    .unwrap_or(0);
+                let usage = &event["response"]["usage"];
+                self.input_tokens = usage["input_tokens"].as_u64().unwrap_or(0);
+                let cached = usage["input_tokens_details"]["cached_tokens"].as_u64().unwrap_or(0);
+                let output = usage["output_tokens"].as_u64().unwrap_or(0);
+                self.billable = self.input_tokens.saturating_sub(cached) + output;
                 self.id = event["response"]["id"].as_str().map(String::from);
             }
             "response.failed" | "error" => {
@@ -327,6 +338,7 @@ impl Stream {
             content,
             stop_reason: stop_reason.to_string(),
             input_tokens: self.input_tokens,
+            billable: self.billable,
             id: self.id,
         })
     }
@@ -383,4 +395,158 @@ pub fn body(
 
 pub fn endpoint() -> String {
     std::env::var("BITTY_CODEX_URL").unwrap_or_else(|_| RESPONSES_URL.to_string())
+}
+
+/// The Codex backend state: credentials, thread bookkeeping, and a refresh
+/// rate limit.
+pub struct Codex {
+    auth: tokio::sync::Mutex<Auth>,
+    /// Per-process (last response id, messages already sent) — groundwork for
+    /// server-side threading. Requests currently resend the conversation in
+    /// full; when threading is completed, thread-expiry handling belongs in
+    /// `attempt` alongside the id lookup.
+    threads: std::sync::Mutex<std::collections::HashMap<String, (String, usize)>>,
+    /// When the token was last refreshed. A 401 right after a successful
+    /// refresh means the account is dead, not the token stale — refreshing
+    /// again would loop.
+    last_refresh: std::sync::Mutex<Option<Instant>>,
+}
+
+impl Codex {
+    pub fn from_env() -> Result<Codex> {
+        Ok(Codex {
+            auth: tokio::sync::Mutex::new(Auth::load()?),
+            threads: std::sync::Mutex::new(std::collections::HashMap::new()),
+            last_refresh: std::sync::Mutex::new(None),
+        })
+    }
+}
+
+impl Backend for Codex {
+    async fn attempt(
+        &self,
+        client: &Client,
+        turn: &Turn<'_>,
+        tag: &Tag,
+    ) -> Result<FinalMessage, Failure> {
+        let tier = Tier::parse(turn.model).unwrap_or(Tier::Large);
+        let request = body(tier, turn.effort, turn.system, turn.messages, turn.tools, None);
+        let (token, account) = {
+            let auth = self.auth.lock().await;
+            (auth.access_token.clone(), auth.account_id.clone())
+        };
+        let resp = client
+            .http()
+            .post(endpoint())
+            .bearer_auth(&token)
+            .header("ChatGPT-Account-Id", &account)
+            .header("OpenAI-Beta", "responses=experimental")
+            .header("originator", "codex_cli_rs")
+            .header("accept", "text/event-stream")
+            .json(&request)
+            .send()
+            .await
+            .context("request failed")
+            .map_err(Failure::plain)?;
+        let status = resp.status();
+        if !status.is_success() {
+            let retry_after = resp
+                .headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok())
+                .map(String::from);
+            let text = resp.text().await.unwrap_or_default();
+            return Err(Failure {
+                error: anyhow!("HTTP {status}: {text}"),
+                retry_after,
+            });
+        }
+        let done = consume_stream(resp, tag).await.map_err(Failure::plain)?;
+        if let Some(id) = &done.thread {
+            self.threads
+                .lock()
+                .unwrap()
+                .insert(turn.process.to_string(), (id.clone(), turn.messages.len()));
+        }
+        Ok(done)
+    }
+
+    /// The one thing this backend can repair itself: an aged-out access
+    /// token. Everything else is the driver's call.
+    async fn recover(
+        &self,
+        client: &Client,
+        failure: &Failure,
+        _turn: &Turn<'_>,
+        tag: &Tag,
+    ) -> bool {
+        if classify(&failure.error) != FailureKind::Auth {
+            return false;
+        }
+        {
+            let last = self.last_refresh.lock().unwrap();
+            if last.is_some_and(|t| t.elapsed() < Duration::from_secs(60)) {
+                return false;
+            }
+        }
+        ui::trace(tag, "  … Codex token expired; refreshing");
+        match self.auth.lock().await.refresh(client.http()).await {
+            Ok(()) => {
+                *self.last_refresh.lock().unwrap() = Some(Instant::now());
+                true
+            }
+            Err(e) => {
+                ui::warn(tag, &format!("could not refresh the Codex token: {e}"));
+                false
+            }
+        }
+    }
+
+    fn context_window(&self, _tier: Tier) -> u64 {
+        // gpt-5.x context window, all tiers.
+        400_000
+    }
+}
+
+/// Fold the Responses SSE stream into a FinalMessage, printing text live.
+async fn consume_stream(resp: reqwest::Response, tag: &Tag) -> Result<FinalMessage> {
+    let mut acc = Stream::default();
+    let mut line_buf = String::new();
+    let mut buf = String::new();
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        buf.push_str(&String::from_utf8_lossy(&chunk.context("stream interrupted")?));
+        while let Some(cut) = buf.find('\n') {
+            let line = buf[..cut].trim().to_string();
+            buf.drain(..=cut);
+            let Some(payload) = line.strip_prefix("data:") else {
+                continue;
+            };
+            let payload = payload.trim();
+            if payload.is_empty() || payload == "[DONE]" {
+                continue;
+            }
+            let Ok(event) = serde_json::from_str::<Value>(payload) else {
+                continue;
+            };
+            if let Some(text) = acc.apply(&event) {
+                line_buf.push_str(&text);
+                while let Some(cut) = line_buf.find('\n') {
+                    ui::say(tag, &line_buf[..cut]);
+                    line_buf.drain(..=cut);
+                }
+            }
+        }
+    }
+    if !line_buf.is_empty() {
+        ui::say(tag, &line_buf);
+    }
+    let done = acc.finish()?;
+    Ok(FinalMessage {
+        thread: done.id,
+        content: done.content,
+        stop_reason: done.stop_reason,
+        input_tokens: done.input_tokens,
+        billable: done.billable,
+    })
 }

@@ -33,6 +33,7 @@
 //!   /quit             → exit
 
 mod agent;
+mod anthropic;
 mod durable;
 mod grants;
 mod actions;
@@ -206,10 +207,37 @@ async fn main() -> anyhow::Result<()> {
     let mut env_file: Option<String> = None;
     let mut session: Option<String> = None;
     let mut resume = false;
+    let mut gates: Vec<String> = Vec::new();
+    let mut gate_attempts: u32 = 3;
+    let mut max_tokens: Option<u64> = None;
     let mut rest: Vec<String> = Vec::new();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--once" => once = true,
+            // Verification gates: run at quiesce, and a failure sends the
+            // bounded output back to root as work to do instead of ending the
+            // run. Only meaningful with --once, which is the mode that ends.
+            "--gate" => match args.next() {
+                Some(cmd) => gates.push(cmd),
+                None => {
+                    eprintln!("--gate needs a shell command");
+                    std::process::exit(2);
+                }
+            },
+            "--gate-attempts" => match args.next().and_then(|v| v.parse().ok()) {
+                Some(n) => gate_attempts = n,
+                None => {
+                    eprintln!("--gate-attempts needs a number");
+                    std::process::exit(2);
+                }
+            },
+            "--max-tokens" => match args.next().and_then(|v| v.parse().ok()) {
+                Some(n) => max_tokens = Some(n),
+                None => {
+                    eprintln!("--max-tokens needs a number of billable tokens");
+                    std::process::exit(2);
+                }
+            },
             // Deno's spelling, and the same meaning: everything.
             "--allow-all" | "-A" => {
                 allow_read = Allow::All;
@@ -364,13 +392,29 @@ async fn main() -> anyhow::Result<()> {
         let mut brought_back = 0;
         let mut highest = 0;
         for id in journal.processes() {
-            let Some((record, history, stopped, pending)) = durable::restore(journal.replay(&id))
+            let Some((record, mut history, stopped, pending, dropped)) =
+                durable::restore(journal.replay(&id))
             else {
                 continue;
             };
             highest = highest.max(record.ordinal);
             if stopped {
                 continue; // a process that ended stays ended
+            }
+            // The last turn died mid-tools. Uncertain work is never replayed
+            // silently: warn the process which calls are in doubt, and write
+            // the corrected history back — otherwise the dropped turn is
+            // still in the log, and the *next* restart would replay it
+            // mid-conversation with its tool calls forever unanswered, which
+            // the API rejects.
+            if let Some(notice) = durable::restart_notice(&dropped) {
+                ui::system(&format!(
+                    "↻ {} was mid-turn at shutdown; telling it which tool calls are uncertain",
+                    record.id
+                ));
+                durable::attach_restart_notice(&mut history, &notice);
+                journal.record(&id, &durable::Event::Compacted { history: history.clone() });
+                journal.flush(&id);
             }
             sys.resume_ids_after(highest);
             ui::system(&format!(
@@ -387,6 +431,13 @@ async fn main() -> anyhow::Result<()> {
             ui::system("nothing to resume in the journal");
         }
     }
+    // What the gate's skip-if-unchanged snapshot walks: only explicitly
+    // scoped write roots. A bare grant ("everything") has no bounded set of
+    // files to digest, so the optimization simply never applies there.
+    let snapshot_roots: Vec<String> = match &allow_write {
+        Allow::Only(paths) => paths.clone(),
+        _ => Vec::new(),
+    };
     let root = if resume {
         // Everything that was running is already back; a prompt on a resume is
         // just a message to the existing root rather than a new tree.
@@ -428,9 +479,22 @@ async fn main() -> anyhow::Result<()> {
         let _ = sys.send(&root, user_mail(&prompt));
     }
 
+    // The budget is billable tokens (uncached input + cache writes + output).
+    // Exhaustion is a wind-down instruction to root, not a kill switch: the
+    // system still quiesces on its own terms, it just stops taking on work.
+    if let Some(budget) = max_tokens {
+        tokio::spawn(watch_budget(sys.clone(), root.clone(), budget));
+    }
+
     if once {
-        run_until_idle(&sys).await;
+        let ok = run_until_idle(&sys, &root, &gates, gate_attempts, &snapshot_roots).await;
+        if !ok {
+            std::process::exit(1);
+        }
         return Ok(());
+    }
+    if !gates.is_empty() {
+        ui::system("--gate only applies with --once (an interactive session never ends on its own)");
     }
 
     // Forward stdin lines from a blocking thread into the async world.
@@ -520,22 +584,221 @@ fn user_mail(body: &str) -> Mail {
     Mail::system("user", body.trim().to_string())
 }
 
-/// --once: poll until no process is running (idle or stopped) twice in a row.
-async fn run_until_idle(sys: &Arc<System>) {
+/// --once: poll until no process is running (idle or stopped) twice in a row,
+/// then run the gates. A gate failure is work, not an exit: the bounded output
+/// goes to root as mail and the run continues, up to `max_attempts` failures.
+/// Returns false when the gates never passed.
+async fn run_until_idle(
+    sys: &Arc<System>,
+    root: &str,
+    gates: &[String],
+    max_attempts: u32,
+    snapshot_roots: &[String],
+) -> bool {
+    /// The most a failing gate hands back: enough to act on, not enough to
+    /// blow out the recipient's context.
+    const GATE_OUTPUT_CAP: usize = 6_000;
     let mut settled = 0;
+    let mut attempts: u32 = 0;
+    // The failing command and the workspace digest taken *after* its run, so
+    // the gate's own side effects can't make the workspace look changed.
+    let mut last_failure: Option<(String, Option<u64>)> = None;
     loop {
         tokio::time::sleep(Duration::from_millis(700)).await;
-        if sys.all_settled() {
-            settled += 1;
-            if settled >= 2 {
-                ui::system(&format!(
-                    "all processes settled — exiting (--once) · peak context {}k tokens",
-                    sys.peak_context() / 1_000
-                ));
-                return;
-            }
-        } else {
+        if !sys.all_settled() {
             settled = 0;
+            continue;
+        }
+        settled += 1;
+        if settled < 2 {
+            continue;
+        }
+        settled = 0;
+
+        if gates.is_empty() {
+            announce_exit(sys);
+            return true;
+        }
+        // Skip-if-unchanged: re-running the gate against an untouched
+        // workspace can only fail the same way. The skipped run still burns
+        // an attempt, so an agent that keeps stopping without editing
+        // anything runs out of road rather than looping.
+        if let Some((prev_cmd, Some(prev_digest))) = &last_failure {
+            if snapshot(snapshot_roots) == Some(*prev_digest) {
+                attempts += 1;
+                if attempts >= max_attempts {
+                    ui::system(&format!(
+                        "gate `{prev_cmd}` still failing and the workspace is unchanged after \
+                         {attempts} attempt(s) — giving up (--once)"
+                    ));
+                    return false;
+                }
+                let _ = sys.send(
+                    root,
+                    Mail::system(
+                        "system",
+                        format!(
+                            "<gate>\nThe gate `{prev_cmd}` was not rerun: the workspace is \
+                             unchanged since it last failed. Edit source files or tests before \
+                             finishing again — attempt {attempts} of {max_attempts}.\n</gate>"
+                        ),
+                    ),
+                );
+                continue;
+            }
+        }
+        match run_gates(gates).await {
+            None => {
+                announce_exit(sys);
+                return true;
+            }
+            Some((cmd, code, output)) => {
+                attempts += 1;
+                last_failure = Some((cmd.clone(), snapshot(snapshot_roots)));
+                let bounded = bound(&output, GATE_OUTPUT_CAP);
+                if attempts >= max_attempts {
+                    ui::system(&format!(
+                        "gate `{cmd}` failed (exit {code}) on the final attempt — giving up \
+                         (--once)\n{bounded}"
+                    ));
+                    return false;
+                }
+                let _ = sys.send(
+                    root,
+                    Mail::system(
+                        "system",
+                        format!(
+                            "<gate>\nQuality gate failed (attempt {attempts} of {max_attempts}): \
+                             `{cmd}` exited with {code}.\n\nOutput:\n{bounded}\n\nThe run does \
+                             not end until this gate passes. Fix the failure, then finish \
+                             again.\n</gate>"
+                        ),
+                    ),
+                );
+            }
+        }
+    }
+}
+
+fn announce_exit(sys: &Arc<System>) {
+    let billable = sys.api.billable_spent();
+    ui::system(&format!(
+        "all processes settled — exiting (--once) · peak context {}k tokens · {}k billable tokens",
+        sys.peak_context() / 1_000,
+        billable / 1_000
+    ));
+}
+
+/// Run each gate in order; the first failure returns (command, exit code,
+/// combined output). None means they all passed.
+async fn run_gates(gates: &[String]) -> Option<(String, i32, String)> {
+    for cmd in gates {
+        ui::system(&format!("gate: running `{cmd}`"));
+        let result = tokio::time::timeout(
+            Duration::from_secs(300),
+            tokio::process::Command::new("sh")
+                .arg("-c")
+                .arg(cmd)
+                .stdin(std::process::Stdio::null())
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await;
+        match result {
+            Err(_) => return Some((cmd.clone(), -1, "timed out after 300s".into())),
+            Ok(Err(e)) => return Some((cmd.clone(), -1, format!("could not run: {e}"))),
+            Ok(Ok(out)) if out.status.success() => {
+                ui::system(&format!("gate: `{cmd}` passed"));
+            }
+            Ok(Ok(out)) => {
+                let code = out.status.code().unwrap_or(-1);
+                let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
+                text.push_str(&String::from_utf8_lossy(&out.stderr));
+                return Some((cmd.clone(), code, text));
+            }
+        }
+    }
+    None
+}
+
+/// Keep the head and tail of an oversized gate output — the error is usually
+/// at one end or the other.
+fn bound(text: &str, cap: usize) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() <= cap {
+        return text.to_string();
+    }
+    let head: String = chars[..cap / 2].iter().collect();
+    let tail: String = chars[chars.len() - cap / 2..].iter().collect();
+    format!("{head}\n… [{} chars truncated] …\n{tail}", chars.len() - cap)
+}
+
+/// A cheap digest of everything under the scoped write roots: path, length,
+/// mtime. None when there is nothing bounded to walk (bare grants, huge
+/// trees), which simply disables skip-if-unchanged — failing open means the
+/// gate reruns, never that it is wrongly skipped. Build artifacts and VCS
+/// bookkeeping are excluded so the gate's own run doesn't count as a change.
+fn snapshot(roots: &[String]) -> Option<u64> {
+    use std::hash::{Hash, Hasher};
+    if roots.is_empty() {
+        return None;
+    }
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    let mut walked = 0usize;
+    for root in roots {
+        let mut stack = vec![std::path::PathBuf::from(root)];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+            let mut items: Vec<_> = entries.flatten().map(|e| e.path()).collect();
+            items.sort();
+            for path in items {
+                walked += 1;
+                if walked > 20_000 {
+                    return None;
+                }
+                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                if path.is_dir() {
+                    if !matches!(name, ".git" | "target" | "node_modules" | ".bitty") {
+                        stack.push(path);
+                    }
+                    continue;
+                }
+                let Ok(meta) = std::fs::metadata(&path) else { continue };
+                path.hash(&mut hasher);
+                meta.len().hash(&mut hasher);
+                if let Ok(modified) = meta.modified() {
+                    if let Ok(d) = modified.duration_since(std::time::UNIX_EPOCH) {
+                        d.as_nanos().hash(&mut hasher);
+                    }
+                }
+            }
+        }
+    }
+    Some(hasher.finish())
+}
+
+/// Tell root, once, that the budget is spent. A wind-down instruction rather
+/// than a kill: the tree still gets to report and stop cleanly.
+async fn watch_budget(sys: Arc<System>, root: String, budget: u64) {
+    loop {
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        let spent = sys.api.billable_spent();
+        if spent >= budget {
+            ui::system(&format!(
+                "token budget exhausted: {spent} of {budget} billable tokens spent"
+            ));
+            let _ = sys.send(
+                &root,
+                Mail::system(
+                    "system",
+                    format!(
+                        "<budget>\nThe token budget for this run is exhausted: {spent} of \
+                         {budget} billable tokens spent. Wind down now — send your final report, \
+                         stop your workers, and stop yourself. Do not start new work.\n</budget>"
+                    ),
+                ),
+            );
+            return;
         }
     }
 }

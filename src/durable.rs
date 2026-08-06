@@ -243,7 +243,7 @@ impl Journal for FileJournal {
             .filter_map(|line| serde_json::from_str(line).ok())
             .collect();
         let before = events.len();
-        let Some((record, history, stopped, pending)) = restore(events) else {
+        let Some((record, history, stopped, pending, _)) = restore(events) else {
             // Nothing to fold onto — no spawn record means no process.
             return;
         };
@@ -343,10 +343,14 @@ impl Journal for FileJournal {
 ///
 /// An assistant turn whose tool calls have no matching results is dropped: the
 /// harness died mid-turn, and re-running it is both correct and cheaper than
-/// trying to reconstruct what the tools would have returned.
+/// trying to reconstruct what the tools would have returned. The dropped
+/// calls are returned so the caller can warn the process — some of them may
+/// have executed before the crash (mail, for one, is durable at the recipient
+/// the moment it is sent), and silently re-running them means duplicate
+/// messages and duplicate workers.
 pub fn restore(
     events: Vec<Event>,
-) -> Option<(ProcessRecord, Vec<Value>, bool, Vec<MailRecord>)> {
+) -> Option<(ProcessRecord, Vec<Value>, bool, Vec<MailRecord>, Vec<Value>)> {
     let mut record = None;
     let mut history: Vec<Value> = Vec::new();
     let mut stopped = false;
@@ -386,13 +390,25 @@ pub fn restore(
             }
         }
     }
+    let mut dropped: Vec<Value> = Vec::new();
     if let Some(last) = history.last() {
         let unanswered = last["role"] == "assistant"
             && last["content"]
                 .as_array()
                 .is_some_and(|blocks| blocks.iter().any(|b| b["type"] == "tool_use"));
         if unanswered {
-            history.pop();
+            if let Some(turn) = history.pop() {
+                dropped = turn["content"]
+                    .as_array()
+                    .map(|blocks| {
+                        blocks
+                            .iter()
+                            .filter(|b| b["type"] == "tool_use")
+                            .cloned()
+                            .collect()
+                    })
+                    .unwrap_or_default();
+            }
         }
     }
     // Whatever was never consumed is still owed to this process.
@@ -413,8 +429,51 @@ pub fn restore(
         if let Some(source) = patched {
             record.kind = crate::system::Kind::Script(source);
         }
-        (record, history, stopped, pending)
+        (record, history, stopped, pending, dropped)
     })
+}
+
+/// What a resumed process is told when its last turn was cut off mid-tools.
+/// Uncertain work is never replayed silently: some of the dropped calls may
+/// have executed before the crash (mail, for one, is durable at the recipient
+/// the moment it is sent), so the process has to check before it repeats
+/// anything with side effects.
+pub fn restart_notice(dropped: &[Value]) -> Option<String> {
+    if dropped.is_empty() {
+        return None;
+    }
+    let calls: Vec<String> = dropped
+        .iter()
+        .map(|b| {
+            let name = b["name"].as_str().unwrap_or("?");
+            let input: String = b["input"].to_string().chars().take(200).collect();
+            format!("- {name}({input})")
+        })
+        .collect();
+    Some(format!(
+        "<restart_notice>\nThe harness restarted while you were mid-turn. Your last turn was \
+         lost before its tool results were recorded, so these tool calls may or may not have \
+         taken effect:\n{}\nVerify before repeating anything with side effects — a process you \
+         spawned may already exist (list_processes), and a message you sent may already have \
+         been delivered. Then continue the work.\n</restart_notice>",
+        calls.join("\n")
+    ))
+}
+
+/// Put the restart notice where the resumed conversation will read it next:
+/// appended to the trailing user turn when there is one, or as a user turn of
+/// its own.
+pub fn attach_restart_notice(history: &mut Vec<Value>, notice: &str) {
+    let block = serde_json::json!({"type": "text", "text": notice});
+    if let Some(last) = history.last_mut() {
+        if last["role"] == "user" {
+            if let Some(blocks) = last["content"].as_array_mut() {
+                blocks.push(block);
+                return;
+            }
+        }
+    }
+    history.push(serde_json::json!({"role": "user", "content": [block]}));
 }
 
 #[cfg(test)]
@@ -453,7 +512,7 @@ mod tests {
     /// Fold the way `compact` does, so the test exercises the same derivation
     /// the compactor uses rather than a parallel one.
     fn checkpoint_of(events: Vec<Event>) -> Event {
-        let (record, history, stopped, pending) = restore(events).expect("has a spawn record");
+        let (record, history, stopped, pending, _) = restore(events).expect("has a spawn record");
         let consumed_through = pending
             .iter()
             .map(|m| m.seq)
@@ -464,8 +523,8 @@ mod tests {
     }
 
     fn same(a: Vec<Event>, b: Vec<Event>) -> bool {
-        let (ar, ah, as_, ap) = restore(a).unwrap();
-        let (br, bh, bs, bp) = restore(b).unwrap();
+        let (ar, ah, as_, ap, _) = restore(a).unwrap();
+        let (br, bh, bs, bp, _) = restore(b).unwrap();
         ar.id == br.id
             && ar.instructions == br.instructions
             && ah == bh
@@ -521,7 +580,7 @@ mod tests {
     /// Unconsumed mail is the one thing a checkpoint must never lose.
     #[test]
     fn pending_mail_survives() {
-        let (_, _, _, pending) = restore(vec![checkpoint_of(stream())]).unwrap();
+        let (_, _, _, pending, _) = restore(vec![checkpoint_of(stream())]).unwrap();
         assert_eq!(pending.iter().map(|m| m.seq).collect::<Vec<_>>(), vec![3]);
     }
 
@@ -530,7 +589,7 @@ mod tests {
     fn stopped_survives() {
         let mut events = stream();
         events.push(Event::Stopped { reason: "done".into() });
-        let (_, _, stopped, _) = restore(vec![checkpoint_of(events)]).unwrap();
+        let (_, _, stopped, _, _) = restore(vec![checkpoint_of(events)]).unwrap();
         assert!(stopped);
     }
 
@@ -561,5 +620,75 @@ mod tests {
         ];
         let (record, ..) = restore(vec![checkpoint_of(events)]).unwrap();
         assert!(matches!(record.kind, crate::system::Kind::Script(s) if s == "v2"));
+    }
+
+    /// A log ending mid-turn: the unanswered assistant turn is dropped AND its
+    /// tool calls are reported, so the resumed process can be warned that they
+    /// may already have run.
+    fn mid_turn_events() -> Vec<Event> {
+        vec![
+            Event::Spawned(record("proc-2")),
+            Event::Input { content: serde_json::json!([{"type": "text", "text": "go"}]) },
+            Event::Output {
+                content: serde_json::json!([
+                    {"type": "text", "text": "spawning"},
+                    {"type": "tool_use", "id": "t1", "name": "spawn_process",
+                     "input": {"instructions": "count things"}}
+                ]),
+            },
+        ]
+    }
+
+    #[test]
+    fn a_dropped_turn_reports_its_tool_calls() {
+        let (_, history, _, _, dropped) = restore(mid_turn_events()).unwrap();
+        assert_eq!(history.len(), 1, "the unanswered turn is gone");
+        assert_eq!(dropped.len(), 1);
+        assert_eq!(dropped[0]["name"], "spawn_process");
+        let notice = restart_notice(&dropped).expect("a dropped call warrants a notice");
+        assert!(notice.contains("spawn_process"));
+        assert!(notice.contains("may or may not have taken effect"));
+    }
+
+    /// The corrective Compacted event a resume writes has to converge: a
+    /// second restore of [original events + correction] must see the notice
+    /// and no unanswered turn — without the correction, the dropped Output
+    /// stays in the log and the next restart replays it mid-history with its
+    /// tool calls forever unanswered, which the API rejects.
+    #[test]
+    fn the_resume_correction_converges() {
+        let mut events = mid_turn_events();
+        let (_, mut history, _, _, dropped) = restore(mid_turn_events()).unwrap();
+        let notice = restart_notice(&dropped).unwrap();
+        attach_restart_notice(&mut history, &notice);
+        events.push(Event::Compacted { history: history.clone() });
+        // The resumed process then runs a full turn.
+        events.push(Event::Output {
+            content: serde_json::json!([{"type": "text", "text": "verified; continuing"}]),
+        });
+
+        let (_, replayed, _, _, dropped_again) = restore(events).unwrap();
+        assert!(dropped_again.is_empty(), "the correction leaves nothing dangling");
+        let text = serde_json::to_string(&replayed).unwrap();
+        assert!(text.contains("restart_notice"));
+        let unanswered_mid_history = replayed.iter().any(|turn| {
+            turn["role"] == "assistant"
+                && turn["content"]
+                    .as_array()
+                    .is_some_and(|blocks| blocks.iter().any(|b| b["type"] == "tool_use"))
+        });
+        assert!(!unanswered_mid_history, "no orphaned tool_use survives the correction");
+    }
+
+    /// The notice lands inside the trailing user turn when there is one, so
+    /// the conversation still alternates roles.
+    #[test]
+    fn the_notice_joins_the_trailing_user_turn() {
+        let mut history = vec![
+            serde_json::json!({"role": "user", "content": [{"type": "text", "text": "go"}]}),
+        ];
+        attach_restart_notice(&mut history, "<restart_notice>x</restart_notice>");
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0]["content"].as_array().unwrap().len(), 2);
     }
 }

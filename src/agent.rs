@@ -28,7 +28,7 @@ const UNMANAGED_CONTEXT_WARN: u64 = 500_000;
 
 /// Caps on an inherited-context snapshot, so a fork can't blow out the child's
 /// window with the parent's entire history.
-const DEFAULT_CALL_TIMEOUT: u64 = 60;
+pub(crate) const DEFAULT_CALL_TIMEOUT: u64 = 60;
 const MAX_CALL_TIMEOUT: u64 = 300;
 
 const MAX_BLOCK_CHARS: usize = 4_000;
@@ -89,6 +89,13 @@ async fn drive(
     let mut deferred: Vec<Mail> = Vec::new();
     let mut consecutive_failures: u32 = 0;
     let mut warned_unmanaged = false;
+    // One recovery per incident: an overflow triggers a compaction and a
+    // retry, and if the compacted prompt still does not fit, that is a real
+    // failure rather than a loop.
+    let mut compacted_for_overflow = false;
+    // This process's persistent evaluation session, opened on first
+    // run_script and kept for its whole life.
+    let mut session: Option<crate::script::Session> = None;
 
     loop {
         // Nothing to answer: either the conversation has not started, or it
@@ -105,18 +112,19 @@ async fn drive(
         {
             return;
         }
-        // Summarise before the window is a problem, not after: a turn that is
-        // refused for length has already cost the round trip, and the process
-        // has no way to recover on its own.
-        if !sys.api.compacts_for_us() && conversation_size(&history) > compact_above() {
-            compact_conversation(&sys, &me, &system_prompt, &mut history).await;
-        }
-
         me.set_status(Status::Running);
         sys.note_running();
         // Read per turn, so a model switched from the console takes effect on
         // the next request rather than the next restart.
         let (model, effort) = (me.model(), me.effort());
+        // Summarise before the window is a problem, not after: a turn that is
+        // refused for length has already cost the round trip, and the process
+        // has no way to recover on its own. Real tokens from the last turn's
+        // usage are the primary signal; chars/4 covers what has been added
+        // since (and the first turn, which has no usage yet).
+        if !sys.api.compacts_for_us(&model) && over_budget(&sys, &me, &model, &history) {
+            compact_conversation(&sys, &me, &system_prompt, &mut history, session.as_ref()).await;
+        }
         // Thinking-block signatures belong to the model that produced them, so
         // replaying them into a different one is rejected. Dropping the traces
         // is the cost of changing models mid-conversation.
@@ -139,6 +147,7 @@ async fn drive(
         let resp = match sys.api.message(turn, &me.tag).await {
             Ok(resp) => {
                 consecutive_failures = 0;
+                compacted_for_overflow = false;
                 me.context_tokens.store(resp.input_tokens, Ordering::Relaxed);
                 if !warned_unmanaged
                     && resp.input_tokens > UNMANAGED_CONTEXT_WARN
@@ -157,6 +166,21 @@ async fn drive(
                 resp
             }
             Err(e) => {
+                // A prompt that no longer fits is not a transient failure and
+                // retrying it verbatim can never succeed — the recovery is to
+                // compact and try once more. This is the routine, recoverable
+                // case when the size estimate ran behind reality.
+                if crate::api::classify(&e) == crate::api::FailureKind::Overflow
+                    && !compacted_for_overflow
+                {
+                    compacted_for_overflow = true;
+                    ui::warn(
+                        &me.tag,
+                        "the prompt no longer fits the context window; compacting and retrying",
+                    );
+                    compact_conversation(&sys, &me, &system_prompt, &mut history, session.as_ref()).await;
+                    continue;
+                }
                 consecutive_failures += 1;
                 ui::warn(&me.tag, &format!("turn failed: {e:#}"));
                 if consecutive_failures >= 3 {
@@ -184,7 +208,8 @@ async fn drive(
                     let name = block["name"].as_str().unwrap_or("");
                     let input = &block["input"];
                     ui::trace(&me.tag, &format!("→ {name} {}", truncate(&input.to_string(), 200)));
-                    let (result, is_error) = execute_tool(&sys, &me, name, input, &history).await;
+                    let (result, is_error) =
+                        execute_tool(&sys, &me, name, input, &history, &mut session).await;
                     if is_error {
                         // The model gets the full text in its tool result; the
                         // console gets one line. A compiler diagnostic dumped
@@ -302,6 +327,7 @@ async fn execute_tool(
     name: &str,
     input: &Value,
     history: &[Value],
+    session: &mut Option<crate::script::Session>,
 ) -> (String, bool) {
     match name {
         "spawn_process" => {
@@ -352,7 +378,7 @@ async fn execute_tool(
             let tools = if contracts.is_empty() {
                 String::new()
             } else {
-                format!(" It sees {} as tools.", contracts.join(", "))
+                format!(" It can call {} from inside run_script.", contracts.join(", "))
             };
             (
                 format!("Spawned {id}{shown}. It is now working on your instructions.{tools}{reach}"),
@@ -376,7 +402,9 @@ async fn execute_tool(
             };
             // Answering a synchronous call goes back to the blocked caller
             // rather than into a mailbox.
-            if let Some(id) = input["in_reply_to"].as_str() {
+            // An empty string is a model spelling "not set", not a reply to a
+            // call nobody registered — treat it as absent.
+            if let Some(id) = input["in_reply_to"].as_str().filter(|id| !id.is_empty()) {
                 if !sys.call_is_pending(id) {
                     return (
                         format!("Nobody is waiting on '{id}' — it already timed out or was answered."),
@@ -487,8 +515,12 @@ async fn execute_tool(
                 .as_u64()
                 .unwrap_or(DEFAULT_CALL_TIMEOUT)
                 .clamp(1, MAX_CALL_TIMEOUT);
-            ui::trace(me_tag(me), "  … running inline TypeScript");
-            crate::script::run_inline(sys.clone(), me.clone(), source.to_string(), seconds).await
+            ui::trace(me_tag(me), "  … evaluating in this process's session");
+            // Lazily opened, then kept for the process's whole life: this is
+            // what makes run_script a REPL — g.* persists call to call.
+            let session = session
+                .get_or_insert_with(|| crate::script::Session::open(sys.clone(), me.clone()));
+            session.eval(sys, me, source, seconds).await
         }
         "patch_script" => {
             let (Some(target), Some(source)) =
@@ -725,7 +757,7 @@ fn resolve_stop_targets(
 
 /// Send and block until the answer arrives. Shared by `call_process` and by
 /// every tool alias, so a typed alias and a raw call behave identically.
-async fn call(
+pub(crate) async fn call(
     sys: &Arc<System>,
     me: &Meta,
     to: &str,
@@ -767,7 +799,7 @@ async fn call(
 /// A deliberately small JSON Schema check: enough to catch the mistakes a
 /// model actually makes (missing field, wrong type, value outside an enum)
 /// without pretending to be a full validator.
-fn validate(schema: &Value, input: &Value) -> Result<(), String> {
+pub(crate) fn validate(schema: &Value, input: &Value) -> Result<(), String> {
     if let Some(required) = schema["required"].as_array() {
         for field in required.iter().filter_map(|f| f.as_str()) {
             if input[field].is_null() {
@@ -992,33 +1024,15 @@ fn tool_definitions(me: &Meta) -> Value {
             optional.push(tool.clone());
         }
     }
-    // A process holding none of the always-present tools is myopic by
-    // construction: it sees its own aliases and nothing else, so there is no
-    // shared prefix left to mark.
+    // Parent-created tools are *not* schema tools: they are injected into the
+    // process's session as async functions and documented in its identity
+    // block. The tool list therefore stays one of a small number of
+    // capability shapes, fully shared through the cache — a process with its
+    // own tools no longer pays even for a tail.
     let boundary = always.len().checked_sub(1);
     always.extend(optional);
     if let Some(i) = boundary {
         always[i]["cache_control"] = json!({"type": "ephemeral"});
-    }
-    for alias in &me.aliases {
-        // Naming the process that answers is orientation for a holder that can
-        // already see it, and a graph leak for one that cannot. A myopic
-        // process should learn that it has a tool, not that it has a colleague.
-        let answered_by = me
-            .grants
-            .send
-            .permits(&alias.target)
-            .then(|| format!("Answered by {}. ", alias.target))
-            .unwrap_or_default();
-        always.push(json!({
-            "name": alias.name,
-            "description": format!(
-                "{} ({answered_by}Arguments are validated against this schema before \
-                 delivery, and the reply comes back inside this turn.)",
-                alias.description
-            ),
-            "input_schema": alias.input_schema,
-        }));
     }
     Value::Array(always)
 }
@@ -1063,7 +1077,7 @@ fn base_tools() -> Value {
                     },
                     "tools": {
                         "type": "array",
-                        "description": "Named tools this process should see that are really calls to another process. Each gives it a real contract — a name, a description, a validated argument schema — instead of composing free text and hoping. Arguments are checked before delivery and the reply arrives inside its turn. A tool may only target a process it is already permitted to message, so this cannot hand out reach its permissions do not.",
+                        "description": "Named tools for this process that are really calls to another process. Each appears to it as an async function in its run_script session, documented in its system prompt with your description and schema — a real contract instead of composing free text and hoping. Arguments are validated against the schema before delivery and the reply is the function's return value. A tool may only target a process it is already permitted to message, so this cannot hand out reach its permissions do not.",
                         "items": {
                             "type": "object",
                             "properties": {
@@ -1092,7 +1106,7 @@ fn base_tools() -> Value {
                     "effort": {
                         "type": "string",
                         "enum": ["low", "medium", "high", "xhigh", "max"],
-                        "description": "Reasoning effort for this process. Defaults to yours. Use low for mechanical or well-specified work and reserve high effort for genuinely hard reasoning."
+                        "description": "Reasoning effort for this process. Defaults to \"low\": a spawned worker is assumed mechanical until you say otherwise. Explicitly raise it for genuinely hard reasoning — higher intelligence is a request you make, not something a worker drifts into."
                     },
                     "can_stop": {
                         "type": "array",
@@ -1132,11 +1146,11 @@ fn base_tools() -> Value {
                                 "can_stop": {"type": "array", "items": {"type": "string"}, "description": "Which processes it may stop: sibling names, running process ids, 'self', 'parent'. Defaults to itself only. Pass [] to forbid stopping."},
                                 "can_spawn": {"type": "boolean", "description": "Whether it may spawn processes of its own. Defaults to whatever you hold; pass false for a leaf worker."},
                                 "script": {"type": "string", "description": "TypeScript source; makes this node a deterministic script process costing no API tokens. It registers bitty.onMail((mail, api) => ...) and gets send/stop/list/log under the same permissions as any other process."},
-                                "tools": {"type": "array", "description": "Named, schema-typed tools for this node that are really calls to another process (see spawn_process). Give a worker a typed tool instead of telling it to message a peer in prose.", "items": {"type": "object", "properties": {"name": {"type": "string"}, "description": {"type": "string"}, "input_schema": {"type": "object"}, "target": {"type": "string"}}, "required": ["name", "description", "target"]}},
+                                "tools": {"type": "array", "description": "Named, schema-typed tools for this node that are really calls to another process, appearing as async functions in its run_script session (see spawn_process). Give a worker a typed tool instead of telling it to message a peer in prose.", "items": {"type": "object", "properties": {"name": {"type": "string"}, "description": {"type": "string"}, "input_schema": {"type": "object"}, "target": {"type": "string"}}, "required": ["name", "description", "target"]}},
                                 "can_read": {"type": "array", "items": {"type": "string"}, "description": "Directories this node may read. Defaults to yours; narrow it to what the role needs."},
                                 "can_write": {"type": "array", "items": {"type": "string"}, "description": "Directories this node may write. Prefer [] for reviewers and analyzers."},
                                 "model": {"type": "string", "description": "Model for this node — use a smaller one for mechanical work. Defaults to yours."},
-                                "effort": {"type": "string", "enum": ["low", "medium", "high", "xhigh", "max"], "description": "Reasoning effort for this node. Defaults to yours; use low for well-specified mechanical work."}
+                                "effort": {"type": "string", "enum": ["low", "medium", "high", "xhigh", "max"], "description": "Reasoning effort for this node. Defaults to \"low\"; explicitly raise it for nodes doing genuinely hard reasoning."}
                             },
                             "required": ["name", "instructions"]
                         }
@@ -1205,7 +1219,7 @@ fn base_tools() -> Value {
         },
         {
             "name": "run_script",
-            "description": "Run TypeScript once, right now, and get its value back as this tool's result. It executes with your own capabilities — the same files, hosts, programs and environment you can reach — so use it for work you want done rather than delegated: computing, parsing, reshaping data, reading a handful of files, checking something on disk. The last expression you return is the answer; throwing returns the error. No process is created, so there is nothing to message or clean up afterwards. Prefer this over spawning a script process for anything that ends immediately; spawn a process when it needs to persist, hold state, or receive messages.\n\nExample: return Deno.readTextFile(path).then(t => t.split(\"\\n\").length);",
+            "description": "Run TypeScript in your persistent session and get the returned value back as this tool's result. The session is a REPL scoped to you, alive for your whole life: anything you assign to g.* (g is globalThis) survives across calls, so build helpers once and reuse them, and keep working data out of your context instead of pasting it through messages. A returned value over ~8000 chars is not dumped into your context — it is stored as g.results.rN and you get a preview plus the handle; slice or query it in a later call (e.g. return g.results.r1.length, or return g.results.r1.slice(5000, 6000)). Prefer holding big data in the session and returning only what you actually need — reading a large file into g and returning a filtered slice costs a fraction of returning the file.\n\nIt executes with your own capabilities — the same files, hosts, programs and environment you can reach — so use it for work you want done rather than delegated: computing, parsing, reshaping data, reading files, checking something on disk. Use `return` for the value; throwing returns the error. Session state does not survive a harness restart — anything durable belongs in a file. Spawn a script process instead when the job must run independently, hold a mailbox, or serve.\n\nExample: g.log = await Deno.readTextFile(path); return g.log.split(\"\\n\").filter(l => l.includes(\"ERROR\")).slice(0, 20);",
             "input_schema": {
                 "type": "object",
                 "properties": {
@@ -1303,7 +1317,10 @@ happens to have a socket — and it stays up until the process is stopped.
 You hold very few tools directly: messaging, spawning, and the ability to run TypeScript. \
 Everything mechanical — reading and writing files, running programs, fetching URLs, searching, \
 parsing, arithmetic, formatting — is done by writing a script, inline with run_script for a \
-one-off or as a script process when the job will recur. Reaching for a script the moment you \
+one-off or as a script process when the job will recur. run_script runs in your persistent \
+session: state you assign to g.* survives from call to call for your whole life, and oversized \
+results are parked in g.results rather than pasted into your context — hold data there and \
+return only the slice you need. Reaching for a script the moment you \
 notice a missing primitive is the correct instinct, and it is almost always faster than the \
 alternative. Simulating a primitive in prose is not: walking a directory from memory, interpreting \
 code in your head, or guessing a file's contents produces answers that look right and are not, and \
@@ -1324,27 +1341,29 @@ completely with explicit instructions, not a vague task — it starts with zero 
 you give it. Use spawn_process for one helper, spawn_topology when several need defined roles and \
 a defined graph. Don't make yourself the bottleneck: give workers tools to reach each other \
 directly instead of relaying everything through you.
-- Match the model and effort you give a process to the work it will do. A mechanical, \
-well-specified task does not need your model or your effort level, and spawning it smaller is by \
-far the biggest saving available to you — much larger than writing shorter messages.
+- Match the model and effort you give a process to the work it will do. A spawned process \
+defaults to \"low\" effort — mechanical until stated otherwise — so name a higher effort \
+explicitly when a task genuinely needs hard reasoning. Model is inherited: spawning smaller is \
+by far the biggest saving available to you, much larger than writing shorter messages.
 - A spawned process starts with an empty context by default. Pass context: \"inherit\" when it \
 genuinely needs your history as background; prefer a well-written briefing over inheriting, \
 since inherited context costs tokens on every one of its turns.
 - Give a worker tools, not instructions, whenever the thing it needs is another process. Passing \
 `tools` on spawn turns an instruction like \"send proc-4 a path and it will reply with the \
-contents\" into a read_file tool with a checked argument schema, and the worker never learns a \
-graph exists — it just has a tool. That is worth doing even for a single edge: a contract survives \
-being handed to a cheaper model, a convention does not.
+contents\" into an `await read_file({path})` function in the worker's run_script session, with a \
+checked argument schema — and the worker never learns a graph exists; it just has a function. \
+That is worth doing even for a single edge: a contract survives being handed to a cheaper model, \
+a convention does not.
 - Finish that move by passing can_send_to: [], can_stop: [] and can_spawn: false alongside the \
 tools. Then it is not a preference but the shape of the world: send_message, list_processes and \
 the spawn tools are not in that worker's tool list at all, and it is not told a graph exists — so \
 there is no id to guess at, no roster to enumerate, and no way to route around the contract you \
-wrote. It keeps every tool you gave it, because a tool carries its own authority rather than \
-borrowing the holder's. Prefer this whenever a worker's job is a function of its arguments; it is \
-the version that stays true after the worker is handed to a cheaper model or its context is \
-compacted. Note that such a worker cannot report back — it acts through its tools and then ends \
-its turn — so if you need an answer from it, either call it and let it reply, or leave it \
-can_send_to: [\"parent\"].
+wrote. It keeps every tool you gave it (run_script always remains, since that is where they are \
+called), because a tool carries its own authority rather than borrowing the holder's. Prefer this \
+whenever a worker's job is a function of its arguments; it is the version that stays true after \
+the worker is handed to a cheaper model or its context is compacted. Note that such a worker \
+cannot report back — it acts through its tools and then ends its turn — so if you need an answer \
+from it, either call it and let it reply, or leave it can_send_to: [\"parent\"].
 - Start an edge as an agent because prose is the fastest way to specify judgment, then demote it \
 to a script once the judgment turns out to be mechanical. The caller does not change, because it \
 only ever knew the tool. Routing, scoring, retrying, formatting and aggregating are all better as \
@@ -1439,12 +1458,45 @@ fn process_identity(me: &Meta) -> String {
         )
     };
 
+    // Parent-created tools live in the session, so this prose is their whole
+    // interface: name, contract, and how to call them. Naming the process
+    // that answers is orientation for a holder that can already see it, and a
+    // graph leak for one that cannot — a myopic process should learn that it
+    // has a tool, not that it has a colleague.
+    let tools = if me.aliases.is_empty() {
+        String::new()
+    } else {
+        let lines: Vec<String> = me
+            .aliases
+            .iter()
+            .map(|alias| {
+                let answered_by = me
+                    .grants
+                    .send
+                    .permits(&alias.target)
+                    .then(|| format!(" Answered by {}.", alias.target))
+                    .unwrap_or_default();
+                format!(
+                    "- await {}(args) — {}{} Arguments schema: {}",
+                    alias.name, alias.description, answered_by, alias.input_schema
+                )
+            })
+            .collect();
+        format!(
+            "\n\nYour tools, available inside run_script as async session functions. Arguments \
+             are validated against the schema before delivery, and the reply is the return \
+             value — e.g. `return await {}({{...}});`:\n{}",
+            me.aliases[0].name,
+            lines.join("\n")
+        )
+    };
+
     let persona = match &me.persona {
         Some(persona) => format!("\n\nYour role:\n{persona}"),
         None => String::new(),
     };
 
-    format!("You are process {identity}.\n{role}{wiring}{persona}")
+    format!("You are process {identity}.\n{role}{wiring}{tools}{persona}")
 }
 
 fn envelope(mail: &Mail) -> String {
@@ -1468,18 +1520,30 @@ fn text_block(text: &str) -> Value {
     json!({"type": "text", "text": text})
 }
 
-/// If a server-side fallback happened mid-output, blocks before the last
-/// `fallback` marker must drop thinking/tool_use before being echoed back.
-/// Roughly how large a conversation may get before it is summarised. Set well
-/// below what the provider will actually refuse, because compaction itself
-/// needs to fit.
-const COMPACT_ABOVE_DEFAULT: usize = 500_000;
+/// Window headroom held back from the compaction threshold: room for the
+/// turn's own output (MAX_TOKENS) plus the compaction request itself.
+const COMPACT_RESERVE: u64 = 80_000;
 
-fn compact_above() -> usize {
+/// Prompt tokens a conversation may reach before it is summarised: the
+/// model's window minus the reserve. `BITTY_COMPACT_ABOVE` (tokens)
+/// overrides, which is how tests compact small conversations on demand.
+fn compact_above(sys: &Arc<System>, model: &str) -> u64 {
     std::env::var("BITTY_COMPACT_ABOVE")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(COMPACT_ABOVE_DEFAULT)
+        .unwrap_or_else(|| sys.api.context_window(model).saturating_sub(COMPACT_RESERVE))
+}
+
+/// True when this conversation is close enough to the model's window that the
+/// next turn may not fit. The last turn's real prompt total is the primary
+/// signal; a chars/4 estimate stands in for what has been appended since the
+/// last turn (and for a first turn, which has no usage yet). JSON overhead
+/// makes the estimate run high, which errs toward compacting early — the
+/// cheap direction to be wrong in.
+fn over_budget(sys: &Arc<System>, me: &Meta, model: &str, history: &[Value]) -> bool {
+    let real = me.context_tokens.load(Ordering::Relaxed);
+    let estimated = (conversation_size(history) / 4) as u64;
+    real.max(estimated) > compact_above(sys, model)
 }
 
 /// What Codex's own compaction asks for, near enough: a handoff to a model
@@ -1546,12 +1610,36 @@ async fn compact_conversation(
     me: &Meta,
     system_prompt: &Value,
     history: &mut Vec<Value>,
+    session: Option<&crate::script::Session>,
 ) {
     let before = conversation_size(history);
+    // Recompaction merges into the previous summary rather than resummarising
+    // it as ordinary history — a summary of a summary compounds loss, and the
+    // facts a prior compaction chose to keep were kept for a reason.
+    let has_prior = history.iter().any(|turn| {
+        turn["content"].as_array().is_some_and(|blocks| {
+            blocks.iter().any(|b| {
+                b["text"]
+                    .as_str()
+                    .is_some_and(|t| t.starts_with("<compacted_context>"))
+            })
+        })
+    });
+    let prompt = if has_prior {
+        format!(
+            "{COMPACT_PROMPT}\n\nA <compacted_context> block from an earlier compaction is part \
+             of the conversation above. Merge it, do not resummarise it: preserve every fact, \
+             id, path and decision it records, move items between FINISHED / IN PROGRESS / NEXT \
+             only where their status has actually changed, and drop nothing merely because it \
+             is old."
+        )
+    } else {
+        COMPACT_PROMPT.to_string()
+    };
     let mut asking = history.clone();
     asking.push(json!({
         "role": "user",
-        "content": [text_block(COMPACT_PROMPT)],
+        "content": [text_block(&prompt)],
     }));
     ui::trace(&me.tag, &format!("  … compacting {}k of conversation", before / 1_000));
 
@@ -1566,17 +1654,50 @@ async fn compact_conversation(
         model: &model,
         effort: effort.as_deref(),
     };
-    let summary = match sys.api.message(turn, &me.tag).await {
-        Ok(response) => response
+    let extract = |response: crate::api::FinalMessage| {
+        response
             .content
             .iter()
             .filter(|b| b["type"] == "text")
             .filter_map(|b| b["text"].as_str())
             .collect::<Vec<_>>()
-            .join("\n"),
+            .join("\n")
+    };
+    let summary = match sys.api.message(turn, &me.tag).await {
+        Ok(response) => extract(response),
         Err(e) => {
-            ui::warn(&me.tag, &format!("could not compact ({e}); continuing uncompacted"));
-            return;
+            // The summarize request can itself be the thing that no longer
+            // fits — this path runs precisely when the conversation is
+            // oversized. Fall back to summarising a bounded rendered
+            // transcript, which cannot overflow, rather than giving up.
+            ui::warn(
+                &me.tag,
+                &format!("could not compact in place ({e}); retrying against a bounded transcript"),
+            );
+            let rendered = render_transcript(history);
+            let fallback = vec![json!({
+                "role": "user",
+                "content": [text_block(&format!(
+                    "<conversation_transcript>\nThis is a flattened, truncated transcript of \
+                     your own conversation so far.\n\n{rendered}\n</conversation_transcript>\n\n\
+                     {prompt}"
+                ))],
+            })];
+            let turn = Turn {
+                process: &me.id,
+                system: system_prompt,
+                messages: &fallback,
+                tools: &no_tools,
+                model: &model,
+                effort: effort.as_deref(),
+            };
+            match sys.api.message(turn, &me.tag).await {
+                Ok(response) => extract(response),
+                Err(e) => {
+                    ui::warn(&me.tag, &format!("could not compact ({e}); continuing uncompacted"));
+                    return;
+                }
+            }
         }
     };
     if summary.trim().is_empty() {
@@ -1596,6 +1717,35 @@ async fn compact_conversation(
     if let Some(opening) = opening {
         compacted.push(opening);
     }
+    // The summary replaces the turns that created the session's state, so
+    // without this the model forgets what it is holding and redefines (or
+    // re-fetches) it. Prime-agent ships the same probe for its kernel.
+    let session_note = match session {
+        Some(session) => match session.state(sys, me).await {
+            Some((names, results)) if !names.is_empty() || !results.is_empty() => {
+                let shown: Vec<&String> = names.iter().take(40).collect();
+                let mut note = format!(
+                    "\n\nYour run_script session survived compaction. These globals still \
+                     exist — reuse them, do not redefine or re-fetch them: {}.",
+                    shown.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
+                );
+                if !results.is_empty() {
+                    note.push_str(&format!(
+                        " Stored large results: {}.",
+                        results
+                            .iter()
+                            .map(|r| format!("g.results.{r}"))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ));
+                }
+                note
+            }
+            _ => String::new(),
+        },
+        None => String::new(),
+    };
+
     compacted.push(json!({
         "role": "user",
         "content": [text_block(&format!(
@@ -1603,12 +1753,17 @@ async fn compact_conversation(
              replaced by the summary below to fit the context window. Treat the summary as your \
              own memory — anything it records as finished is finished, and must not be done or \
              announced again. The turns after this block are the most recent and are verbatim, so \
-             where they and the summary disagree, they are right.\n\n{}\n</compacted_context>",
-            summary
+             where they and the summary disagree, they are right.\n\n{}{}\n</compacted_context>",
+            summary, session_note
         ))],
     }));
     compacted.extend(tail);
     *history = compacted;
+    // The token gauge still reads the pre-compaction prompt total, and
+    // over_budget trusts it — left alone it would re-trigger compaction on
+    // every iteration until the next successful turn overwrites it.
+    me.context_tokens
+        .store((conversation_size(history) / 4) as u64, Ordering::Relaxed);
 
     sys.journal.record(&me.id, &Event::Compacted { history: history.clone() });
     sys.journal.flush(&me.id);

@@ -64,19 +64,23 @@ class H(BaseHTTPRequestHandler):
         names = [t["name"] for t in body["tools"]]
 
         if "process proc-3" in system:      # the worker holding the alias
-            if "add" not in names:
-                return self.fail(f"the worker should see its alias as a tool: {names}")
+            if "add" in names:
+                return self.fail(f"aliases are session functions, not schema tools: {names}")
+            if "run_script" not in names:
+                return self.fail(f"the worker needs run_script to call its functions: {names}")
+            if "await add(" not in system:
+                return self.fail("the identity block must document the session function")
             if not any(t.get("cache_control") for t in body["tools"]):
-                return self.fail("base tools should carry a cache breakpoint before aliases")
-            if names.index("add") != len(names) - 1:
-                return self.fail(f"aliases must come after the shared base tools: {names}")
+                return self.fail("the shared tool list should carry a cache breakpoint")
             if n == 0:
-                ev = turn([("tool_use", "w1", "add", {"a": 2, "b": 40})], "tool_use")
+                ev = turn([("tool_use", "w1", "run_script",
+                            {"script": "return await add({a: 2, b: 40});"})], "tool_use")
             elif n == 1:
                 r = results(messages[-1])[0]
                 if r["is_error"] or r["content"].strip() != "42":
-                    return self.fail(f"alias should return the computed answer: {r}")
-                ev = turn([("tool_use", "w2", "add", {"a": "two"})], "tool_use")
+                    return self.fail(f"the session function should return the computed answer: {r}")
+                ev = turn([("tool_use", "w2", "run_script",
+                            {"script": "return await add({a: \"two\"});"})], "tool_use")
             elif n == 2:
                 r = results(messages[-1])[0]
                 if not r["is_error"]:
@@ -87,11 +91,11 @@ class H(BaseHTTPRequestHandler):
             else:
                 ev = turn([("text", "Idle.\n")], "end_turn")
 
-        elif "reach" in names:      # the mute helper spawned below: nothing to do
+        elif "await reach(" in system:      # the mute helper spawned below: nothing to do
             ev = turn([("text", "Idle.\n")], "end_turn")
 
-        elif "add" in names:
-            return self.fail("only the worker should see the alias")
+        elif "await add(" in system:
+            return self.fail("only the worker should hold the add function")
 
         elif n == 0:
             ev = turn([("tool_use", "t1", "spawn_topology", {"processes": [

@@ -74,6 +74,8 @@ class Handler(BaseHTTPRequestHandler):
         first_turn = json.dumps(messages[0])
 
         if "process proc-1" in system:
+            if body.get("output_config", {}).get("effort") != "high":
+                return self.fail(f"root keeps its own explicit effort: {body.get('output_config')}")
             if n == 0:
                 blocks = [("tool_use", "t1", "spawn_topology", {"processes": [
                     {"name": "writer", "role": "You are a terse technical writer.",
@@ -98,6 +100,10 @@ class Handler(BaseHTTPRequestHandler):
             if n == 0:
                 if "terse technical writer" not in system:
                     return self.fail("writer's role text missing from its system prompt")
+                # Spawned effort is low unless explicitly raised — a worker
+                # must not quietly inherit its coordinator's effort level.
+                if body.get("output_config", {}).get("effort") != "low":
+                    return self.fail(f"a spawned node should default to low effort: {body.get('output_config')}")
                 if "proc-3 (editor)" not in system:
                     return self.fail("writer's wiring allowlist missing from its system prompt")
                 if "inherited_context" not in first_turn or "spawn_topology" not in first_turn:

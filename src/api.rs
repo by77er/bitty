@@ -1,20 +1,26 @@
-//! Minimal Anthropic Messages API client over raw HTTP (there is no official
-//! Rust SDK). Always streams (SSE) so long agentic turns can't hit HTTP
-//! timeouts, and accumulates the events back into a complete message.
+//! The provider contract and the one retry driver.
 //!
-//! Content blocks are kept as raw `serde_json::Value` end to end so thinking
-//! blocks (signatures included) and server compaction blocks round-trip
-//! unchanged into the next request.
+//! A backend (`anthropic.rs`, `codex.rs`) sends a single attempt and reports
+//! failures; it never sleeps and never loops. All retry policy — backoff,
+//! failure classification, attempt budgets, billable accounting — lives in
+//! `Client::drive`, written once. That split exists because it was violated
+//! once: the Codex path had its own retry loop and quietly lacked the
+//! mid-stream-failure case the Anthropic loop had always handled, so every
+//! network blip surfaced as a failed turn. A new backend implements
+//! `Backend` and cannot repeat that mistake.
+//!
+//! The internal message shape is Anthropic's, as raw `serde_json::Value`
+//! blocks: the journal is written in it, thinking-block signatures and
+//! server-compaction blocks round-trip through it untouched, and other
+//! providers translate per request (see codex.rs). Adopting a third-party
+//! provider crate would put a typed model exactly where that invariant
+//! lives, which is why there isn't one.
 
 use crate::ui::{self, Tag};
-use anyhow::{Context, Result, anyhow, bail};
-use futures_util::StreamExt;
-use serde_json::{Value, json};
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use anyhow::Result;
+use serde_json::Value;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
-
-const API_VERSION: &str = "2023-06-01";
 
 /// How much model a process gets, independent of who is serving it.
 ///
@@ -68,64 +74,88 @@ impl Tier {
         }
     }
 }
+
 /// What the root process comes up as. Everything it spawns inherits its model
 /// unless the spawn names one, so this is the ceiling of the whole tree rather
 /// than only the first process — put a cheaper model on the workers.
 const DEFAULT_MODEL: &str = "large";
-/// Root's reasoning effort. Spawned processes inherit it the same way.
+/// Root's reasoning effort; spawned processes default to low instead.
 pub const DEFAULT_EFFORT: &str = "high";
-const MAX_TOKENS: u64 = 64_000;
-const MAX_ATTEMPTS: u32 = 4;
+/// Attempts per turn, shared by every backend.
+const MAX_ATTEMPTS: u32 = 5;
 
-const BETA_FALLBACK: &str = "server-side-fallback-2026-07-01";
-const BETA_COMPACT: &str = "compact-2026-01-12";
-const BETA_OAUTH: &str = "oauth-2025-04-20";
-
-enum Auth {
-    ApiKey(String),
-    Bearer(String),
+/// One request's worth of per-process configuration. Model and effort vary by
+/// process; `tools` deliberately does not — it renders before `system` in the
+/// cache prefix, so any variation there would fork the shared prefix at
+/// position zero and cost more than the tokens it saved.
+pub struct Turn<'a> {
+    /// Which process this turn belongs to, so a server-side thread can be kept
+    /// per process rather than per client.
+    pub process: &'a str,
+    pub system: &'a Value,
+    pub messages: &'a [Value],
+    pub tools: &'a Value,
+    pub model: &'a str,
+    pub effort: Option<&'a str>,
 }
 
-/// Which optional request features a model actually accepts. Sending one a
-/// model rejects fails the whole turn, so the body is built per model rather
-/// than assuming the newest surface everywhere.
-#[derive(Clone, Copy)]
-struct Caps {
-    adaptive: bool,
-    effort: bool,
-    fallbacks: bool,
-    compaction: bool,
+pub struct FinalMessage {
+    /// Codex only: the id to thread the next turn onto.
+    pub thread: Option<String>,
+    pub content: Vec<Value>,
+    pub stop_reason: String,
+    /// Total prompt size for this turn: uncached + cache-write + cache-read.
+    /// This is the number compaction watches, so it's what we surface.
+    pub input_tokens: u64,
+    /// What the turn actually cost: uncached input + cache writes + output.
+    /// Cache reads are excluded — counting them makes a long-running system
+    /// exhaust any budget by re-reading its own context. Filled by the
+    /// backend, accumulated by the driver.
+    pub billable: u64,
 }
 
-impl Caps {
-    /// A starting guess from the model id. Unknown models get the modern
-    /// surface and are corrected by the first rejection rather than being
-    /// permanently downgraded on a name we failed to recognize.
-    fn guess(model: &str) -> Caps {
-        let modern = Caps { adaptive: true, effort: true, fallbacks: false, compaction: true };
-        match model {
-            m if m.starts_with("claude-fable-") || m.starts_with("claude-mythos-") => {
-                Caps { fallbacks: true, ..modern }
-            }
-            m if m.starts_with("claude-opus-5") => Caps { fallbacks: true, ..modern },
-            m if m.starts_with("claude-haiku-") => {
-                Caps { adaptive: false, effort: false, fallbacks: false, compaction: false }
-            }
-            m if m.starts_with("claude-opus-4-5") || m.starts_with("claude-sonnet-4-5") => {
-                Caps { adaptive: false, ..modern }
-            }
-            _ => modern,
-        }
+/// A failed attempt: the error, plus any pacing the server volunteered.
+pub struct Failure {
+    pub error: anyhow::Error,
+    /// Server-provided delay from a 429, if any.
+    pub retry_after: Option<String>,
+}
+
+impl Failure {
+    pub fn plain(error: anyhow::Error) -> Failure {
+        Failure { error, retry_after: None }
     }
 }
 
-/// Which backend a turn is sent to. The rest of the harness is unaware: it
-/// hands over a `Turn` and receives a `FinalMessage` either way.
-pub enum Provider {
-    Anthropic,
-    /// OpenAI's Responses API, authenticated with the Codex CLI's stored
-    /// ChatGPT credentials.
-    Codex(tokio::sync::Mutex<crate::codex::Auth>),
+/// One provider. Implementations send exactly one attempt per call and
+/// report failures; the driver owns every retry decision.
+pub trait Backend {
+    /// One request: build, send, consume the stream. No retries, no sleeping.
+    async fn attempt(
+        &self,
+        client: &Client,
+        turn: &Turn<'_>,
+        tag: &Tag,
+    ) -> Result<FinalMessage, Failure>;
+
+    /// Provider-specific repair after a failed attempt — drop a parameter the
+    /// server rejected, refresh an aged-out token. True means something
+    /// changed and an immediate retry is worthwhile; false hands the decision
+    /// back to the driver's classification.
+    async fn recover(&self, client: &Client, failure: &Failure, turn: &Turn<'_>, tag: &Tag)
+    -> bool;
+
+    /// Roughly how many prompt tokens this provider's model for `tier`
+    /// accepts.
+    fn context_window(&self, tier: Tier) -> u64;
+}
+
+/// The configured backend. New providers add a variant here and an arm in
+/// the three matches below — everything else (retry, backoff, budgets,
+/// accounting) is inherited from the driver.
+enum Backends {
+    Anthropic(crate::anthropic::Anthropic),
+    Codex(crate::codex::Codex),
 }
 
 /// Exponential backoff, capped, with jitter, and deferring to `Retry-After`
@@ -152,560 +182,224 @@ fn backoff(attempt: u32, retry_after: Option<&str>) -> Duration {
 
 pub struct Client {
     http: reqwest::Client,
-    provider: Provider,
-    auth: Auth,
-    base_url: String,
+    backend: Backends,
     pub model: String,
-    /// Server-side compaction: on by default, latched off if the server
-    /// rejects it (unsupported model, account without the beta) so a whole
-    /// run doesn't die on a feature we can degrade without.
+    /// Server-side compaction: on by default, off via BITTY_COMPACTION=off.
+    /// Per-model support is the backend's own knowledge; this is the global
+    /// switch.
     compaction: AtomicBool,
-    /// Per-model feature flags, seeded by `Caps::guess` and narrowed whenever
-    /// the API tells us a parameter is unsupported. One rejected turn teaches
-    /// the client permanently instead of failing every turn after it.
-    caps: std::sync::Mutex<HashMap<String, Caps>>,
-    /// Codex only: per-process (last response id, messages already sent).
-    /// Threading is what makes a long conversation cheap — without it every
-    /// turn re-transmits the whole thing.
-    threads: std::sync::Mutex<HashMap<String, (String, usize)>>,
-}
-
-/// One request's worth of per-process configuration. Model and effort vary by
-/// process; `tools` deliberately does not — it renders before `system` in the
-/// cache prefix, so any variation there would fork the shared prefix at
-/// position zero and cost more than the tokens it saved.
-pub struct Turn<'a> {
-    /// Which process this turn belongs to, so a server-side thread can be kept
-    /// per process rather than per client.
-    pub process: &'a str,
-    pub system: &'a Value,
-    pub messages: &'a [Value],
-    pub tools: &'a Value,
-    pub model: &'a str,
-    pub effort: Option<&'a str>,
-}
-
-pub struct FinalMessage {
-    /// Codex only: the id to thread the next turn onto.
-    pub thread: Option<String>,
-    pub content: Vec<Value>,
-    pub stop_reason: String,
-    /// Total prompt size for this turn: uncached + cache-write + cache-read.
-    /// This is the number compaction watches, so it's what we surface.
-    pub input_tokens: u64,
+    /// Cumulative billable tokens this run, across every process.
+    billable: AtomicU64,
 }
 
 impl Client {
     pub fn from_env() -> Result<Self> {
-        let auth = if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
-            Auth::ApiKey(key)
-        } else if let Ok(token) = std::env::var("ANTHROPIC_AUTH_TOKEN") {
-            Auth::Bearer(token)
+        // Codex when asked for; Anthropic otherwise. Each backend loads only
+        // its own credentials — a Codex run no longer needs a dummy Anthropic
+        // key just to start.
+        let backend = if matches!(std::env::var("BITTY_PROVIDER").as_deref(), Ok("codex")) {
+            Backends::Codex(crate::codex::Codex::from_env()?)
         } else {
-            bail!(
-                "No Anthropic credentials found. Either:\n  \
-                 export ANTHROPIC_API_KEY=sk-ant-...\n  \
-                 or: ant auth login && eval \"$(ant auth print-credentials --env)\""
-            );
-        };
-        // Codex when asked for, or whenever its credentials are present and no
-        // Anthropic key is: the common case is a machine set up for one or the
-        // other, and guessing wrong costs a failed turn rather than money.
-        let wants_codex = matches!(std::env::var("BITTY_PROVIDER").as_deref(), Ok("codex"));
-        let provider = if wants_codex {
-            Provider::Codex(tokio::sync::Mutex::new(crate::codex::Auth::load()?))
-        } else {
-            Provider::Anthropic
+            Backends::Anthropic(crate::anthropic::Anthropic::from_env()?)
         };
         Ok(Client {
-            provider,
+            backend,
             http: reqwest::Client::builder()
                 .connect_timeout(Duration::from_secs(30))
                 .build()?,
-            auth,
-            base_url: std::env::var("ANTHROPIC_BASE_URL")
-                .unwrap_or_else(|_| "https://api.anthropic.com".into()),
             model: std::env::var("BITTY_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.into()),
             compaction: AtomicBool::new(
                 !matches!(std::env::var("BITTY_COMPACTION").as_deref(), Ok("off")),
             ),
-            caps: std::sync::Mutex::new(HashMap::new()),
-            threads: std::sync::Mutex::new(HashMap::new()),
+            billable: AtomicU64::new(0),
         })
     }
 
-    /// Whether this provider will compact for us. Anthropic rewrites the
-    /// context server-side and hands back blocks that round-trip; Codex refuses
-    /// stored responses and has no equivalent, so the harness has to summarise
-    /// the conversation itself before it outgrows the window.
-    pub fn compacts_for_us(&self) -> bool {
-        !matches!(self.provider, Provider::Codex(_)) && self.compaction_enabled()
+    pub(crate) fn http(&self) -> &reqwest::Client {
+        &self.http
+    }
+
+    /// Billable tokens spent so far this run, for `--max-tokens`.
+    pub fn billable_spent(&self) -> u64 {
+        self.billable.load(Ordering::Relaxed)
     }
 
     pub fn compaction_enabled(&self) -> bool {
         self.compaction.load(Ordering::Relaxed)
     }
 
-    /// Callers pass whatever they have — a tier alias ("small") or a concrete
-    /// id — but `Caps::guess` only recognizes concrete ids, so every lookup
-    /// resolves through the tier first. Keying the cache on the alias would
-    /// make every tier fall through to `Caps::guess`'s modern default and
-    /// relearn the same rejections on the model's first turn, every run.
-    fn caps(&self, model: &str) -> Caps {
-        let model = Tier::parse(model).map(Tier::anthropic).unwrap_or(model);
-        *self
-            .caps
-            .lock()
-            .unwrap()
-            .entry(model.to_string())
-            .or_insert_with(|| Caps::guess(model))
+    /// Whether the provider will compact *this model's* context for us.
+    /// Anthropic rewrites the context server-side and hands back blocks that
+    /// round-trip — but only for models whose caps accept the beta; Codex has
+    /// no equivalent. When this is false the harness summarises the
+    /// conversation itself before it outgrows the window.
+    pub fn compacts_for_us(&self, model: &str) -> bool {
+        match &self.backend {
+            Backends::Anthropic(b) => self.compaction_enabled() && b.caps(model).compaction,
+            Backends::Codex(_) => false,
+        }
     }
 
-    /// Read a rejection and turn off whatever the server named. Returns true
-    /// when something changed, meaning the caller should retry.
-    fn learn_from(&self, model: &str, text: &str, tag: &Tag) -> bool {
-        let model = Tier::parse(model).map(Tier::anthropic).unwrap_or(model);
-        let mut caps = self.caps.lock().unwrap();
-        let entry = caps.entry(model.to_string()).or_insert_with(|| Caps::guess(model));
-        let before = (entry.adaptive, entry.effort, entry.fallbacks, entry.compaction);
-        if text.contains("thinking") {
-            entry.adaptive = false;
+    /// Roughly how many prompt tokens this model accepts. The client-side
+    /// compaction trigger works in real tokens against this, minus a reserve
+    /// for output and the compaction turn itself.
+    pub fn context_window(&self, model: &str) -> u64 {
+        if let Ok(v) = std::env::var("BITTY_CONTEXT_WINDOW") {
+            if let Ok(n) = v.parse() {
+                return n;
+            }
         }
-        if text.contains("fallbacks") {
-            entry.fallbacks = false;
+        let tier = Tier::parse(model).unwrap_or(Tier::Large);
+        match &self.backend {
+            Backends::Anthropic(b) => b.context_window(tier),
+            Backends::Codex(b) => b.context_window(tier),
         }
-        if text.contains("effort") || text.contains("output_config") {
-            entry.effort = false;
-        }
-        if text.contains("anthropic-beta") {
-            entry.fallbacks = false;
-            entry.compaction = false;
-        }
-        if text.contains("context_management")
-            || text.contains("compact_20260112")
-            || text.contains(BETA_COMPACT)
-        {
-            entry.compaction = false;
-        }
-        let changed = before != (entry.adaptive, entry.effort, entry.fallbacks, entry.compaction);
-        if changed {
-            ui::warn(
-                tag,
-                &format!("{model} rejected a request parameter ({text}); retrying without it"),
-            );
-        }
-        changed
     }
 
     /// One model turn: send the conversation, stream the response (printing
     /// text live under `tag`), return the accumulated message.
     pub async fn message(&self, turn: Turn<'_>, tag: &Tag) -> Result<FinalMessage> {
-        if let Provider::Codex(auth) = &self.provider {
-            return self.codex_message(auth, turn, tag).await;
+        match &self.backend {
+            Backends::Anthropic(b) => self.drive(b, turn, tag).await,
+            Backends::Codex(b) => self.drive(b, turn, tag).await,
         }
+    }
+
+    /// The retry driver every backend runs under.
+    async fn drive<B: Backend>(&self, backend: &B, turn: Turn<'_>, tag: &Tag) -> Result<FinalMessage> {
         for attempt in 1..=MAX_ATTEMPTS {
-            // Rebuilt per attempt so it reflects a latched-off compaction flag.
-            let body = self.build_body(&turn);
-            match self.attempt(turn.model, &body, tag).await {
-                Ok(msg) => return Ok(msg),
-                Err(e)
-                    if e.to_string().contains("HTTP 400")
-                        && self.learn_from(turn.model, &e.to_string(), tag) =>
-                {
-                    continue;
+            let failure = match backend.attempt(self, &turn, tag).await {
+                Ok(msg) => {
+                    self.billable.fetch_add(msg.billable, Ordering::Relaxed);
+                    return Ok(msg);
                 }
-                Err(e) if attempt < MAX_ATTEMPTS && is_retryable(&e) => {
-                    let delay = backoff(attempt, None);
-                    ui::warn(tag, &format!("API error ({e}); retrying in {delay:?}"));
-                    tokio::time::sleep(delay).await;
-                }
-                Err(e) => return Err(e),
+                Err(failure) => failure,
+            };
+            if attempt == MAX_ATTEMPTS {
+                return Err(failure.error);
             }
+            // Provider-specific repair first: a dropped parameter or a fresh
+            // token makes an immediate retry worthwhile, no backoff needed.
+            if backend.recover(self, &failure, &turn, tag).await {
+                continue;
+            }
+            if classify(&failure.error).retryable() {
+                let delay = backoff(attempt, failure.retry_after.as_deref());
+                ui::warn(tag, &format!("API error ({:#}); retrying in {delay:?}", failure.error));
+                tokio::time::sleep(delay).await;
+                continue;
+            }
+            return Err(failure.error);
         }
         unreachable!()
     }
+}
 
-    /// One turn against the Responses API. A 401 means the stored access token
-    /// has aged out, so refresh once and retry rather than failing a turn for
-    /// something the harness can fix itself.
-    async fn codex_message(
-        &self,
-        auth: &tokio::sync::Mutex<crate::codex::Auth>,
-        turn: Turn<'_>,
-        tag: &Tag,
-    ) -> Result<FinalMessage> {
-        let tier = Tier::parse(turn.model).unwrap_or(Tier::Large);
-        // Resume this process's thread if the server still has it, sending only
-        // what it has not seen. A thread that is unknown or stale is rebuilt
-        // from the full history, which the journal always has.
-        let previous: Option<String> = None;
-        let body = crate::codex::body(
-            tier,
-            turn.effort,
-            turn.system,
-            turn.messages,
-            turn.tools,
-            None,
-        );
-        const CODEX_ATTEMPTS: u32 = 5;
-        let mut refreshed = false;
-        for attempt in 1..=CODEX_ATTEMPTS {
-            let (token, account) = {
-                let auth = auth.lock().await;
-                (auth.access_token.clone(), auth.account_id.clone())
-            };
-            let resp = self
-                .http
-                .post(crate::codex::endpoint())
-                .bearer_auth(&token)
-                .header("ChatGPT-Account-Id", &account)
-                .header("OpenAI-Beta", "responses=experimental")
-                .header("originator", "codex_cli_rs")
-                .header("accept", "text/event-stream")
-                .json(&body)
-                .send()
-                .await
-                .context("request failed")?;
-            let status = resp.status();
-            if status == reqwest::StatusCode::UNAUTHORIZED && !refreshed {
-                refreshed = true;
-                ui::trace(tag, "  … Codex token expired; refreshing");
-                auth.lock().await.refresh(&self.http).await?;
-                continue;
-            }
-            if status == reqwest::StatusCode::TOO_MANY_REQUESTS && attempt < CODEX_ATTEMPTS {
-                let wait = backoff(
-                    attempt,
-                    resp.headers().get("retry-after").and_then(|v| v.to_str().ok()),
-                );
-                ui::warn(tag, &format!("rate limited; retrying in {wait:?}"));
-                tokio::time::sleep(wait).await;
-                continue;
-            }
-            if !status.is_success() {
-                let text = resp.text().await.unwrap_or_default();
-                // The server forgot this thread: drop it and let the next
-                // attempt send the conversation in full.
-                if previous.is_some() && (status == reqwest::StatusCode::NOT_FOUND
-                    || text.contains("previous_response_id"))
-                {
-                    ui::trace(tag, "  … thread expired; resending the conversation");
-                    self.threads.lock().unwrap().remove(turn.process);
-                    return Box::pin(self.codex_message(auth, turn, tag)).await;
-                }
-                bail!("HTTP {status}: {text}");
-            }
-            let done = self.consume_codex_stream(resp, tag).await?;
-            if let Some(id) = &done.thread {
-                self.threads
-                    .lock()
-                    .unwrap()
-                    .insert(turn.process.to_string(), (id.clone(), turn.messages.len()));
-            }
-            return Ok(done);
-        }
-        bail!("gave up after {CODEX_ATTEMPTS} attempts (rate limited or unauthenticated)")
-    }
+/// What kind of failure a turn died of. Decisions — retry, compact, give up —
+/// are made on the kind, not by string-matching at each call site.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FailureKind {
+    /// 429 — back off and retry.
+    RateLimit,
+    /// The provider is melting; same treatment as a 5xx.
+    Overloaded,
+    /// 5xx — transient server error.
+    Server,
+    /// The request never completed: connect failure, dropped stream.
+    Network,
+    /// The prompt no longer fits the model's context window. Not retryable
+    /// as-is — the recovery is to compact and try again.
+    Overflow,
+    /// Credentials rejected. Retrying cannot help (though a backend may be
+    /// able to refresh a token in `recover`).
+    Auth,
+    /// The request itself was malformed or refused for shape. Not retryable.
+    Invalid,
+    Unknown,
+}
 
-    async fn consume_codex_stream(
-        &self,
-        resp: reqwest::Response,
-        tag: &Tag,
-    ) -> Result<FinalMessage> {
-        let mut acc = crate::codex::Stream::default();
-        let mut line_buf = String::new();
-        let mut buf = String::new();
-        let mut stream = resp.bytes_stream();
-        while let Some(chunk) = stream.next().await {
-            buf.push_str(&String::from_utf8_lossy(&chunk.context("stream interrupted")?));
-            while let Some(cut) = buf.find('\n') {
-                let line = buf[..cut].trim().to_string();
-                buf.drain(..=cut);
-                let Some(payload) = line.strip_prefix("data:") else {
-                    continue;
-                };
-                let payload = payload.trim();
-                if payload.is_empty() || payload == "[DONE]" {
-                    continue;
-                }
-                let Ok(event) = serde_json::from_str::<Value>(payload) else {
-                    continue;
-                };
-                if let Some(text) = acc.apply(&event) {
-                    line_buf.push_str(&text);
-                    while let Some(cut) = line_buf.find('\n') {
-                        ui::say(tag, &line_buf[..cut]);
-                        line_buf.drain(..=cut);
-                    }
-                }
-            }
-        }
-        if !line_buf.is_empty() {
-            ui::say(tag, &line_buf);
-        }
-        let done = acc.finish()?;
-        Ok(FinalMessage {
-            thread: done.id,
-            content: done.content,
-            stop_reason: done.stop_reason,
-            input_tokens: done.input_tokens,
-        })
-    }
-
-    fn build_body(&self, turn: &Turn<'_>) -> Value {
-        let caps = self.caps(turn.model);
-        let tier = Tier::parse(turn.model).unwrap_or(Tier::Large);
-        let mut body = json!({
-            "model": tier.anthropic(),
-            "max_tokens": MAX_TOKENS,
-            "stream": true,
-            // Second breakpoint, auto-placed on the last cacheable block, so
-            // this process's growing conversation gets incremental hits turn
-            // to turn. The first breakpoint is inside `system` and covers the
-            // tools + shared-preamble prefix that every process has in common.
-            "cache_control": {"type": "ephemeral"},
-            "system": turn.system,
-            "tools": turn.tools,
-            "messages": turn.messages,
-        });
-        if caps.adaptive {
-            body["thinking"] = json!({"type": "adaptive"});
-        }
-        if caps.fallbacks {
-            // If safety classifiers decline a request, re-serve it on the
-            // recommended fallback model inside the same call.
-            body["fallbacks"] = json!("default");
-        }
-        if let Some(effort) = turn.effort.filter(|_| caps.effort) {
-            body["output_config"] = json!({"effort": effort});
-        }
-        if self.compaction_enabled() && caps.compaction {
-            // Server-side compaction. The API watches the prompt size and,
-            // as it approaches the trigger threshold, summarizes the earlier
-            // part of the conversation into a `compaction` block that replaces
-            // it on subsequent requests. We echo the block back verbatim as
-            // part of the assistant turn, which is what keeps the state alive.
-            body["context_management"] = json!({"edits": [{"type": "compact_20260112"}]});
-        }
-        body
-    }
-
-    /// `None` when this model needs no betas at all. An empty `anthropic-beta`
-    /// header is not the same as no header — the API rejects it — and a model
-    /// that supports neither fallbacks nor compaction needs none.
-    fn beta_header(&self, model: &str) -> Option<String> {
-        let caps = self.caps(model);
-        let mut betas = Vec::new();
-        if caps.fallbacks {
-            betas.push(BETA_FALLBACK);
-        }
-        if self.compaction_enabled() && caps.compaction {
-            betas.push(BETA_COMPACT);
-        }
-        if matches!(self.auth, Auth::Bearer(_)) {
-            betas.push(BETA_OAUTH);
-        }
-        (!betas.is_empty()).then(|| betas.join(","))
-    }
-
-    async fn attempt(&self, model: &str, body: &Value, tag: &Tag) -> Result<FinalMessage> {
-        let mut req = self
-            .http
-            .post(format!("{}/v1/messages", self.base_url))
-            .header("anthropic-version", API_VERSION)
-            .header("content-type", "application/json");
-        if let Some(betas) = self.beta_header(model) {
-            req = req.header("anthropic-beta", betas);
-        }
-        req = match &self.auth {
-            Auth::ApiKey(key) => req.header("x-api-key", key),
-            Auth::Bearer(token) => req.bearer_auth(token),
-        };
-
-        let resp = req.json(body).send().await.context("request failed")?;
-        let status = resp.status();
-        if !status.is_success() {
-            let text = resp.text().await.unwrap_or_default();
-            let msg = serde_json::from_str::<Value>(&text)
-                .ok()
-                .and_then(|v| v["error"]["message"].as_str().map(String::from))
-                .unwrap_or(text);
-            bail!("HTTP {status}: {msg}");
-        }
-
-        self.consume_stream(resp, tag).await
-    }
-
-    async fn consume_stream(&self, resp: reqwest::Response, tag: &Tag) -> Result<FinalMessage> {
-        let mut content: Vec<Value> = Vec::new();
-        let mut tool_json: HashMap<usize, String> = HashMap::new();
-        let mut stop_reason = String::new();
-        let mut input_tokens: u64 = 0;
-        // Buffer streamed text so we only print whole lines.
-        let mut line_buf = String::new();
-
-        let mut buf = String::new();
-        let mut stream = resp.bytes_stream();
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.context("stream interrupted")?;
-            buf.push_str(&String::from_utf8_lossy(&chunk));
-
-            while let Some(pos) = buf.find("\n\n") {
-                let frame: String = buf.drain(..pos + 2).collect();
-                for line in frame.lines() {
-                    let Some(data) = line.strip_prefix("data:") else {
-                        continue;
-                    };
-                    let event: Value =
-                        serde_json::from_str(data.trim()).context("bad SSE payload")?;
-                    self.apply_event(
-                        &event,
-                        &mut content,
-                        &mut tool_json,
-                        &mut stop_reason,
-                        &mut input_tokens,
-                        &mut line_buf,
-                        tag,
-                    )?;
-                }
-            }
-        }
-        if !line_buf.is_empty() {
-            ui::say(tag, &line_buf);
-        }
-
-        Ok(FinalMessage {
-            // Anthropic has no server-side thread; the conversation is resent.
-            thread: None,
-            content,
-            stop_reason,
-            input_tokens,
-        })
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn apply_event(
-        &self,
-        event: &Value,
-        content: &mut Vec<Value>,
-        tool_json: &mut HashMap<usize, String>,
-        stop_reason: &mut String,
-        input_tokens: &mut u64,
-        line_buf: &mut String,
-        tag: &Tag,
-    ) -> Result<()> {
-        match event["type"].as_str().unwrap_or("") {
-            "message_start" => {
-                let usage = &event["message"]["usage"];
-                // The prompt total is split across three counters depending on
-                // cache state; compaction cares about their sum.
-                *input_tokens = ["input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"]
-                    .iter()
-                    .filter_map(|k| usage[k].as_u64())
-                    .sum();
-            }
-            "content_block_start" => {
-                let index = event["index"].as_u64().unwrap_or(0) as usize;
-                let block = event["content_block"].clone();
-                match block["type"].as_str().unwrap_or("") {
-                    "tool_use" => {
-                        tool_json.insert(index, String::new());
-                    }
-                    "compaction" => ui::trace(tag, "⟳ server compacted earlier context"),
-                    _ => {}
-                }
-                while content.len() <= index {
-                    content.push(Value::Null);
-                }
-                content[index] = block;
-            }
-            "content_block_delta" => {
-                let index = event["index"].as_u64().unwrap_or(0) as usize;
-                let delta = &event["delta"];
-                match delta["type"].as_str().unwrap_or("") {
-                    "text_delta" => {
-                        let text = delta["text"].as_str().unwrap_or("");
-                        append_str(&mut content[index], "text", text);
-                        line_buf.push_str(text);
-                        while let Some(nl) = line_buf.find('\n') {
-                            let line: String = line_buf.drain(..=nl).collect();
-                            ui::say(tag, line.trim_end_matches('\n'));
-                        }
-                    }
-                    "input_json_delta" => {
-                        if let Some(partial) = tool_json.get_mut(&index) {
-                            partial.push_str(delta["partial_json"].as_str().unwrap_or(""));
-                        }
-                    }
-                    // Every other delta follows the same shape: each string
-                    // field names the block field it extends (thinking_delta →
-                    // thinking, signature_delta → signature, and whatever a
-                    // compaction summary streams as). Handling it structurally
-                    // rather than by name means an unrecognized block type is
-                    // still accumulated correctly and can be echoed back intact.
-                    _ => {
-                        if let Some(fields) = delta.as_object() {
-                            for (key, value) in fields {
-                                if key == "type" {
-                                    continue;
-                                }
-                                if let Some(text) = value.as_str() {
-                                    append_str(&mut content[index], key, text);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            "content_block_stop" => {
-                let index = event["index"].as_u64().unwrap_or(0) as usize;
-                if let Some(partial) = tool_json.remove(&index) {
-                    let input: Value = if partial.trim().is_empty() {
-                        json!({})
-                    } else {
-                        serde_json::from_str(&partial).context("bad tool input JSON")?
-                    };
-                    content[index]["input"] = input;
-                }
-            }
-            "message_delta" => {
-                if let Some(reason) = event["delta"]["stop_reason"].as_str() {
-                    *stop_reason = reason.to_string();
-                }
-            }
-            "error" => {
-                let kind = event["error"]["type"].as_str().unwrap_or("unknown");
-                let msg = event["error"]["message"].as_str().unwrap_or("");
-                return Err(anyhow!("stream error ({kind}): {msg}"));
-            }
-            // message_stop / ping need no handling.
-            _ => {}
-        }
-        Ok(())
+impl FailureKind {
+    pub fn retryable(self) -> bool {
+        matches!(
+            self,
+            FailureKind::RateLimit | FailureKind::Overloaded | FailureKind::Server | FailureKind::Network
+        )
     }
 }
 
-fn append_str(block: &mut Value, key: &str, add: &str) {
-    if add.is_empty() {
-        return;
-    }
-    let mut current = block[key].as_str().unwrap_or("").to_string();
-    current.push_str(add);
-    block[key] = Value::String(current);
-}
-
-fn is_retryable(e: &anyhow::Error) -> bool {
+/// Classify an error by its text. The overflow patterns cover both providers'
+/// phrasings — the cost of missing one is a process that stalls instead of
+/// compacting, so the match is deliberately loose.
+pub fn classify(e: &anyhow::Error) -> FailureKind {
     let text = e.to_string();
-    text.contains("HTTP 429")
-        || text.contains("HTTP 5")
-        || text.contains("overloaded_error")
-        || text.contains("request failed")
-        || text.contains("stream interrupted")
+    let lower = text.to_lowercase();
+    const OVERFLOW: [&str; 6] = [
+        "prompt is too long",
+        "context_length_exceeded",
+        "maximum context length",
+        "exceeds the context window",
+        "input length and `max_tokens` exceed",
+        "context window exceed",
+    ];
+    if OVERFLOW.iter().any(|p| lower.contains(p)) {
+        return FailureKind::Overflow;
+    }
+    if text.contains("HTTP 429") {
+        return FailureKind::RateLimit;
+    }
+    if lower.contains("overloaded_error") || text.contains("HTTP 529") {
+        return FailureKind::Overloaded;
+    }
+    if text.contains("HTTP 5") {
+        return FailureKind::Server;
+    }
+    if text.contains("request failed") || text.contains("stream interrupted") {
+        return FailureKind::Network;
+    }
+    if text.contains("HTTP 401") || text.contains("HTTP 403") || lower.contains("authentication") {
+        return FailureKind::Auth;
+    }
+    if text.contains("HTTP 4") {
+        return FailureKind::Invalid;
+    }
+    FailureKind::Unknown
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::anyhow;
+
+    /// The kinds that drive control flow: overflow compacts, 429/5xx retry,
+    /// auth and shape errors give up.
+    #[test]
+    fn failures_classify() {
+        let cases = [
+            ("HTTP 400: prompt is too long: 1053000 tokens > 1000000 maximum", FailureKind::Overflow),
+            ("HTTP 400: This model's maximum context length is 400000 tokens", FailureKind::Overflow),
+            ("HTTP 400: context_length_exceeded", FailureKind::Overflow),
+            ("HTTP 429: rate limited", FailureKind::RateLimit),
+            ("HTTP 529: overloaded", FailureKind::Overloaded),
+            ("stream error (overloaded_error): busy", FailureKind::Overloaded),
+            ("HTTP 500: internal", FailureKind::Server),
+            ("request failed", FailureKind::Network),
+            ("stream interrupted", FailureKind::Network),
+            ("HTTP 401: bad key", FailureKind::Auth),
+            ("HTTP 400: tools.3: unknown field", FailureKind::Invalid),
+        ];
+        for (text, want) in cases {
+            let got = classify(&anyhow!("{text}"));
+            assert_eq!(got, want, "{text}");
+        }
+    }
+
+    /// Overflow must not be retried verbatim — the caller compacts instead.
+    #[test]
+    fn overflow_is_not_retryable() {
+        assert!(!FailureKind::Overflow.retryable());
+        assert!(FailureKind::RateLimit.retryable());
+        assert!(!FailureKind::Invalid.retryable());
+    }
 
     /// Each attempt must wait longer than the last, or it is not backoff.
     #[test]

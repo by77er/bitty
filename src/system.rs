@@ -32,6 +32,13 @@ pub const MAX_TOMBSTONES: usize = 64;
 /// than as a 400 on the process's first turn.
 pub const EFFORT_LEVELS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
 
+/// What a spawned process runs at when the spawn names no effort. Deliberately
+/// NOT inherited from the spawner: a worker is assumed mechanical until stated
+/// otherwise, and higher intelligence is an explicit request — the opposite
+/// default quietly runs every leaf at the coordinator's effort, which is the
+/// most expensive possible mistake to make silently.
+pub const DEFAULT_SPAWN_EFFORT: &str = "low";
+
 /// How urgently a message needs to be read.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Priority {
@@ -358,8 +365,62 @@ pub struct System {
     /// In-flight synchronous calls, keyed by correlation id.
     pending: Mutex<HashMap<String, PendingCall>>,
     calls: AtomicU64,
+    /// Recent send times per (sender, recipient), for the flood limit.
+    flood: Mutex<Flood>,
     /// Where each process's life is recorded, so it can be brought back.
     pub journal: Arc<dyn Journal>,
+}
+
+/// The longest message one process may put in another's mailbox. Everything
+/// past the cap is truncated with a note: a mailbox is for coordination, and
+/// a payload this size belongs in a file or a session value, delivered by
+/// reference. The cap also bounds what lands verbatim in the recipient's
+/// context — an unbounded body is an unbounded context bill the *recipient*
+/// pays.
+pub const MAX_MAIL_CHARS: usize = 32_000;
+
+/// Per-pair flood limit: this many messages in the window, then sends fail
+/// until the window drains. Prime-agent uses a comparable token bucket for
+/// the same reason — a looping sender must hit a wall, not an inbox.
+const FLOOD_LIMIT: usize = 30;
+const FLOOD_WINDOW: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Sliding-window send counter per (sender, recipient) pair. Pure so it can
+/// be tested without a running system.
+#[derive(Default)]
+struct Flood {
+    recent: HashMap<(String, String), std::collections::VecDeque<std::time::Instant>>,
+}
+
+impl Flood {
+    /// Record an attempt at `now`; false when the pair is over its budget.
+    fn allow(&mut self, from: &str, to: &str, now: std::time::Instant) -> bool {
+        let key = (from.to_string(), to.to_string());
+        let window = self.recent.entry(key).or_default();
+        while window.front().is_some_and(|t| now.duration_since(*t) > FLOOD_WINDOW) {
+            window.pop_front();
+        }
+        if window.len() >= FLOOD_LIMIT {
+            return false;
+        }
+        window.push_back(now);
+        true
+    }
+}
+
+/// Enforce the mail body cap: text past the limit is dropped, with a note
+/// saying so and naming the better channel.
+fn cap_body(body: String) -> String {
+    if body.chars().count() <= MAX_MAIL_CHARS {
+        return body;
+    }
+    let total = body.chars().count();
+    let kept: String = body.chars().take(MAX_MAIL_CHARS).collect();
+    format!(
+        "{kept}\n[truncated by the harness: this message was {total} characters and the mailbox \
+         cap is {MAX_MAIL_CHARS}. A payload this size should be written to a file (or kept in a \
+         session value) and sent by reference.]"
+    )
 }
 
 impl System {
@@ -370,6 +431,7 @@ impl System {
             counter: AtomicU64::new(0),
             api,
             quiesce_announced: AtomicBool::new(false),
+            flood: Mutex::new(Flood::default()),
             spawning: Mutex::new(()),
             switched: Mutex::new(HashSet::new()),
             pending: Mutex::new(HashMap::new()),
@@ -692,9 +754,10 @@ impl System {
             .map(|(node, id)| (node.name.as_deref(), id.as_str()))
             .collect();
 
-        // The spawner's grants are the ceiling, and its model/effort the
-        // defaults, for everything below it.
-        let (ceiling, inherited_model, inherited_effort, existing) = {
+        // The spawner's grants are the ceiling, and its model the default,
+        // for everything below it. Effort is deliberately not inherited —
+        // see DEFAULT_SPAWN_EFFORT.
+        let (ceiling, inherited_model, existing) = {
             let procs = self.procs.lock().unwrap();
             let me = procs.iter().find(|p| p.id == parent);
             let ceiling = me
@@ -703,12 +766,11 @@ impl System {
             let model = me
                 .map(|p| p.model.lock().unwrap().clone())
                 .unwrap_or_else(|| self.api.model.clone());
-            let effort = me.and_then(|p| p.effort.lock().unwrap().clone());
             let existing: Vec<(String, Option<String>)> = procs
                 .iter()
                 .map(|p| (p.id.clone(), p.name.clone()))
                 .collect();
-            (ceiling, model, effort, existing)
+            (ceiling, model, existing)
         };
         if !ceiling.spawn.is_permissive() {
             return Err(format!(
@@ -958,9 +1020,12 @@ impl System {
             let spawn_model = Arc::new(Mutex::new(
                 node.model.clone().unwrap_or_else(|| inherited_model.clone()),
             ));
-            let spawn_effort = Arc::new(Mutex::new(
-                node.effort.clone().or_else(|| inherited_effort.clone()),
-            ));
+            let effort = Some(
+                node.effort
+                    .clone()
+                    .unwrap_or_else(|| DEFAULT_SPAWN_EFFORT.to_string()),
+            );
+            let spawn_effort = Arc::new(Mutex::new(effort.clone()));
 
             self.procs.lock().unwrap().push(Entry {
                 id: id.clone(),
@@ -981,7 +1046,7 @@ impl System {
                 seq: AtomicU64::new(0),
                 runs: node.kind.label(
                     node.model.as_deref().unwrap_or(&inherited_model),
-                    &node.effort.clone().or_else(|| inherited_effort.clone()),
+                    &effort,
                 ),
             });
 
@@ -998,7 +1063,7 @@ impl System {
                         grants: grants.clone(),
                         aliases: aliases.clone(),
                         model: node.model.clone().unwrap_or_else(|| inherited_model.clone()),
-                        effort: node.effort.clone().or_else(|| inherited_effort.clone()),
+                        effort: effort.clone(),
                         linked: node.link,
                         kind: node.kind.clone(),
                         ordinal: n,
@@ -1056,6 +1121,23 @@ impl System {
             };
             ui::mail_to_user(&label, &mail.body);
             return Ok("Delivered to the user's console.".into());
+        }
+        // The harness and the human are exempt from both limits: exit signals
+        // and console input are never the flood, and truncating them would
+        // hide the very information they exist to deliver.
+        if mail.from != "system" && mail.from != "user" {
+            if !self
+                .flood
+                .lock()
+                .unwrap()
+                .allow(&mail.from, to, std::time::Instant::now())
+            {
+                return Err(format!(
+                    "Rate limited: you have sent {to} more than {FLOOD_LIMIT} messages in \
+                     {FLOOD_WINDOW:?}. Batch your updates into fewer, denser messages."
+                ));
+            }
+            mail.body = cap_body(mail.body);
         }
         let procs = self.procs.lock().unwrap();
         match procs.iter().find(|p| p.id == to) {
@@ -1709,6 +1791,33 @@ fn format_tokens(n: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The flood limit is per pair and slides: a burst hits the wall, other
+    /// pairs are unaffected, and time drains the window.
+    #[test]
+    fn flood_limit_is_per_pair_and_slides() {
+        let mut flood = Flood::default();
+        let start = std::time::Instant::now();
+        for _ in 0..FLOOD_LIMIT {
+            assert!(flood.allow("proc-2", "proc-3", start));
+        }
+        assert!(!flood.allow("proc-2", "proc-3", start), "over budget");
+        // A different pair has its own budget.
+        assert!(flood.allow("proc-2", "proc-4", start));
+        assert!(flood.allow("proc-4", "proc-3", start));
+        // And the window drains with time.
+        assert!(flood.allow("proc-2", "proc-3", start + FLOOD_WINDOW + std::time::Duration::from_secs(1)));
+    }
+
+    /// A capped body keeps its head and says what happened; a small one is
+    /// untouched.
+    #[test]
+    fn mail_bodies_are_capped() {
+        assert_eq!(cap_body("hello".into()), "hello");
+        let capped = cap_body("x".repeat(MAX_MAIL_CHARS + 5_000));
+        assert!(capped.contains("truncated by the harness"));
+        assert!(capped.chars().count() < MAX_MAIL_CHARS + 300);
+    }
 
     #[test]
     fn keeps_everything_under_the_cap() {

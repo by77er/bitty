@@ -726,6 +726,40 @@ fn op_bitty_sys(
     Ok(value)
 }
 
+/// A parent-created tool, invoked from this process's JS as an async
+/// function. The alias was resolved and authority-checked at spawn; here the
+/// arguments are validated against its schema and the call is delivered to
+/// the target, exactly as the old schema-tool path did — the interface moved
+/// into the session, the policy did not.
+#[op2(async(deferred), nofast)]
+#[string]
+async fn op_bitty_call(
+    state: Rc<RefCell<OpState>>,
+    #[string] name: String,
+    #[string] args: String,
+) -> Result<String, deno_error::JsErrorBox> {
+    let (sys, me) = {
+        let state = state.borrow();
+        let host = state.borrow::<Host>();
+        (host.sys.clone(), host.me.clone())
+    };
+    let Some(alias) = me.aliases.iter().find(|a| a.name == name).cloned() else {
+        return Err(fs_error(format!("no tool named '{name}'")));
+    };
+    let parsed: Value = serde_json::from_str(&args).unwrap_or_else(|_| json!({}));
+    if let Err(e) = crate::agent::validate(&alias.input_schema, &parsed) {
+        return Err(fs_error(format!("invalid arguments for '{name}': {e}")));
+    }
+    let body = serde_json::to_string(&parsed).unwrap_or_else(|_| "{}".into());
+    let (reply, is_error) =
+        crate::agent::call(&sys, &me, &alias.target, &body, crate::agent::DEFAULT_CALL_TIMEOUT)
+            .await;
+    if is_error {
+        return Err(fs_error(reply));
+    }
+    Ok(reply)
+}
+
 /// Fail a blocked caller. Distinct from `op_bitty_reply` so a thrown script
 /// surfaces as an error rather than as a successful result whose text happens
 /// to begin with "error".
@@ -1155,7 +1189,7 @@ async fn actor_loop(
     // Held as an Option so the old isolate can be dropped *before* the
     // replacement is built. Two isolates alive at once on the same thread
     // leaves V8 without a current handle scope and aborts the process.
-    let mut runtime = match boot(&sys, &me, &instructions, &source, resumed).await {
+    let mut runtime = match boot(&sys, &me, &instructions, &source, resumed, false).await {
         Some(runtime) => Some(runtime),
         None => return,
     };
@@ -1221,7 +1255,7 @@ async fn actor_loop(
                 run_cleanup(runtime.as_mut().expect("runtime is present while the loop runs"), &me.tag)
                     .await;
                 drop(runtime.take());
-                match boot(&sys, &me, &instructions, &source, true).await {
+                match boot(&sys, &me, &instructions, &source, true, false).await {
                     Some(fresh) => runtime = Some(fresh),
                     None => return,
                 }
@@ -1280,73 +1314,243 @@ async fn actor_loop(
     }
 }
 
-/// Run TypeScript once, inline, with the calling process's own capabilities —
-/// no id, no mailbox, no journal entry, no actor. Spawning a whole process to
-/// evaluate an expression or reshape some JSON is a lot of machinery for a
-/// computation that ends immediately.
+/// What a session eval leaves behind for the next one: `g` (an alias for
+/// `globalThis`) persists for the process's whole life, and oversized results
+/// are parked in `g.results` instead of being pasted into the caller's
+/// context — the model slices them programmatically instead of paying tokens
+/// to read them.
+const SESSION_PRELUDE: &str = r#"
+globalThis.g = globalThis;
+g.results = {};
+globalThis.__bitty_result_seq = 0;
+globalThis.__bitty_render = (v) => {
+  if (v === undefined || v === null) return "";
+  let s;
+  if (typeof v === "string") s = v;
+  else { try { s = JSON.stringify(v); } catch { s = String(v); } }
+  const cap = 8000;
+  if (s.length <= cap) return s;
+  const key = "r" + (++globalThis.__bitty_result_seq);
+  g.results[key] = v;
+  return "[large result stored as g.results." + key + " — " + s.length +
+    " chars serialized. Preview:]\n" + s.slice(0, 2000) +
+    "\n…[slice g.results." + key + " in a later run_script call to see more]";
+};
+globalThis.__bitty_session_names = () => {
+  const skip = new Set(globalThis.__bitty_skip || []);
+  const names = Object.getOwnPropertyNames(globalThis)
+    .filter((n) => !skip.has(n) && n !== "__bitty_skip");
+  return JSON.stringify({ names, results: Object.keys(g.results) });
+};
+"#;
+
+/// A process's persistent evaluation session: one long-lived isolate on its
+/// own thread, holding state across `run_script` calls for the process's
+/// whole life. This is what makes `run_script` a REPL rather than a
+/// calculator — variables written to `g.*` survive from turn to turn, so an
+/// agent can park data outside its context window and page it in selectively.
 ///
-/// It runs as the caller rather than as an attenuated child: this is the
-/// caller acting, not delegating, so it can reach exactly what the caller can
-/// and nothing more.
-pub async fn run_inline(sys: Arc<System>, me: Meta, source: String, seconds: u64) -> (String, bool) {
-    if let Err(e) = precheck_as("inline", &source, true) {
-        return (e, true);
-    }
-    let (id, rx) = sys.register_call(&me.id, &me.id);
-    let wrapped = format!(
-        // The result is handed back through the same reply channel a script
-        // process uses, so there is no second mechanism for getting a value
-        // out of V8.
-        "(async () => {{\n  const __value = await (async () => {{\n{source}\n}})();\n           Deno.core.ops.op_bitty_reply({id:?}, __value === undefined || __value === null ? \"\"          : String(__value));\n}})().catch((e) => Deno.core.ops.op_bitty_reply_error({id:?}, String(e && e.message ? e.message : e)));",
-        id = id
-    );
+/// It runs as the owner rather than as an attenuated child: this is the
+/// process acting, not delegating, so it reaches exactly what the process can
+/// and nothing more. Session state is deliberately ephemeral across harness
+/// restarts, like a script process's heap: anything that must survive belongs
+/// in a file.
+pub struct Session {
+    tx: tokio::sync::mpsc::UnboundedSender<EvalRequest>,
+    /// The isolate's thread-safe handle, for cancelling an eval that never
+    /// finishes without losing the session.
+    isolate: Arc<std::sync::Mutex<Option<deno_core::v8::IsolateHandle>>>,
+}
 
-    let (sys_t, me_t, tag) = (sys.clone(), me.clone(), me.tag.clone());
-    let started = std::thread::Builder::new().name(format!("{}-inline", me.id)).spawn(move || {
-        let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
-            return;
-        };
-        rt.block_on(async move {
-            let Some(mut runtime) = boot(&sys_t, &me_t, "", "", false).await else {
-                return;
-            };
-            // Strip the types before V8 sees it. The precheck transpiles too,
-            // but only to validate — running the original source means every
-            // type annotation reaches V8 as a syntax error, which reads as
-            // "Missing initializer in const declaration" and sends the author
-            // hunting for a bug that is not in their code.
-            let js = match transpile("inline", &wrapped) {
-                Ok(js) => js,
-                Err(e) => {
-                    sys_t.resolve_call(&id, Err(format!("script error: {e}")));
-                    return;
+struct EvalRequest {
+    source: String,
+    call_id: String,
+}
+
+impl Session {
+    /// Start the session thread. Evals fail individually if the runtime
+    /// cannot start; the owning process is unaffected.
+    pub fn open(sys: Arc<System>, me: Meta) -> Session {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<EvalRequest>();
+        let isolate = Arc::new(std::sync::Mutex::new(None));
+        let slot = isolate.clone();
+        let started = std::thread::Builder::new()
+            .name(format!("{}-session", me.id))
+            .spawn(move || session_thread(sys, me, rx, slot));
+        if let Err(e) = started {
+            // tx's receiver lives on the failed thread; evals will report.
+            eprintln!("could not start a session thread: {e}");
+        }
+        Session { tx, isolate }
+    }
+
+    /// Evaluate one script in the session. The result comes back through the
+    /// same reply channel a script process uses, so there is no second
+    /// mechanism for getting a value out of V8.
+    pub async fn eval(
+        &self,
+        sys: &Arc<System>,
+        me: &Meta,
+        source: &str,
+        seconds: u64,
+    ) -> (String, bool) {
+        if let Err(e) = precheck_as("inline", source, true) {
+            return (e, true);
+        }
+        let (id, rx) = sys.register_call(&me.id, &me.id);
+        if self
+            .tx
+            .send(EvalRequest { source: source.to_string(), call_id: id.clone() })
+            .is_err()
+        {
+            sys.resolve_call(&id, Err(String::new()));
+            return ("the session runtime is not available".into(), true);
+        }
+        match tokio::time::timeout(std::time::Duration::from_secs(seconds), rx).await {
+            Ok(Ok(Ok(value))) => (value, false),
+            Ok(Ok(Err(e))) => (e, true),
+            Ok(Err(_)) => ("the script ended without producing a value".into(), true),
+            Err(_) => {
+                // Cancel the runaway execution but keep the session: state
+                // already written to g.* survives, only this eval dies.
+                if let Some(handle) = self.isolate.lock().unwrap().as_ref() {
+                    handle.terminate_execution();
                 }
-            };
-            if let Err(e) = runtime.execute_script("[inline]", js) {
-                sys_t.resolve_call(&id, Err(format!("script error: {e}")));
-                return;
+                sys.resolve_call(&id, Err("timed out".into()));
+                ui::warn(&me.tag, "session eval timed out; the running code was terminated");
+                (
+                    "the script did not finish in time and was terminated. The session and its \
+                     g.* state survive. If the work is genuinely long-running, do it in a script \
+                     process instead."
+                        .into(),
+                    true,
+                )
             }
-            let _ = runtime.run_event_loop(PollEventLoopOptions::default()).await;
-        });
-    });
-    if started.is_err() {
-        return ("could not start a runtime for the script".into(), true);
-    }
-
-    match tokio::time::timeout(std::time::Duration::from_secs(seconds), rx).await {
-        Ok(Ok(Ok(value))) => (value, false),
-        Ok(Ok(Err(e))) => (e, true),
-        Ok(Err(_)) => ("the script ended without producing a value".into(), true),
-        Err(_) => {
-            ui::warn(&tag, "inline script timed out");
-            ("the script did not finish in time".into(), true)
         }
     }
+
+    /// What the session is holding: (global names created by evals, keys of
+    /// g.results). For the post-compaction notice.
+    pub async fn state(&self, sys: &Arc<System>, me: &Meta) -> Option<(Vec<String>, Vec<String>)> {
+        let (report, is_err) = self
+            .eval(sys, me, "return globalThis.__bitty_session_names()", 5)
+            .await;
+        if is_err {
+            return None;
+        }
+        let parsed: Value = serde_json::from_str(&report).ok()?;
+        let list = |key: &str| -> Vec<String> {
+            parsed[key]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        };
+        Some((list("names"), list("results")))
+    }
+}
+
+/// The session thread: boot once, then serve eval requests forever, racing
+/// the isolate's event loop so async work keeps settling between requests —
+/// the same structure as a script process's actor loop, with evals in place
+/// of mail.
+fn session_thread(
+    sys: Arc<System>,
+    me: Meta,
+    mut rx: UnboundedReceiver<EvalRequest>,
+    slot: Arc<std::sync::Mutex<Option<deno_core::v8::IsolateHandle>>>,
+) {
+    let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
+        return;
+    };
+    rt.block_on(async move {
+        let Some(mut runtime) = boot(&sys, &me, "", "", false, true).await else {
+            while let Some(req) = rx.recv().await {
+                sys.resolve_call(&req.call_id, Err("the session runtime failed to start".into()));
+            }
+            return;
+        };
+        if let Err(e) = runtime.execute_script("[bitty:session]", SESSION_PRELUDE) {
+            ui::warn(&me.tag, &format!("session prelude failed: {e}"));
+        }
+        // Baseline the namespace after the prelude, so the state probe
+        // reports only names evals created.
+        let _ = runtime.execute_script(
+            "[bitty:baseline]",
+            "globalThis.__bitty_skip = Object.getOwnPropertyNames(globalThis);",
+        );
+        *slot.lock().unwrap() = Some(runtime.v8_isolate().thread_safe_handle());
+
+        let mut settled = false;
+        loop {
+            enum Wake {
+                Req(Option<EvalRequest>),
+                Quiet(Result<(), String>),
+            }
+            let wake = tokio::select! {
+                req = rx.recv() => Wake::Req(req),
+                result = runtime.run_event_loop(PollEventLoopOptions::default()), if !settled => {
+                    Wake::Quiet(result.map_err(|e| e.to_string()))
+                }
+            };
+            match wake {
+                Wake::Quiet(result) => {
+                    settled = true;
+                    if let Err(e) = result {
+                        ui::warn(&me.tag, &format!("session async work failed: {e}"));
+                    }
+                }
+                // The Session was dropped: its owner stopped.
+                Wake::Req(None) => return,
+                Wake::Req(Some(req)) => {
+                    // A previous eval may have been terminated on timeout;
+                    // clear the flag or this one dies with it.
+                    runtime.v8_isolate().cancel_terminate_execution();
+                    let wrapped = format!(
+                        "(async () => {{\n  const __value = await (async () => {{\n{}\n}})();\n  \
+                         Deno.core.ops.op_bitty_reply({id:?}, globalThis.__bitty_render(__value));\n\
+                         }})().catch((e) => Deno.core.ops.op_bitty_reply_error({id:?}, \
+                         String(e && e.message ? e.message : e)));",
+                        req.source,
+                        id = req.call_id
+                    );
+                    // Strip the types before V8 sees them. The precheck
+                    // transpiled too, but only to validate — running the
+                    // original source would hand V8 every annotation as a
+                    // syntax error.
+                    match transpile("inline", &wrapped) {
+                        Ok(js) => {
+                            if let Err(e) = runtime.execute_script("[inline]", js) {
+                                sys.resolve_call(&req.call_id, Err(format!("script error: {e}")));
+                            }
+                        }
+                        Err(e) => {
+                            sys.resolve_call(&req.call_id, Err(format!("script error: {e}")));
+                        }
+                    }
+                    settled = false;
+                }
+            }
+        }
+    });
 }
 
 /// Build a fresh isolate for `source`. Returns None if the code cannot start,
 /// having already reported why.
-async fn boot(sys: &Arc<System>, me: &Meta, instructions: &str, source: &str, resumed: bool) -> Option<JsRuntime> {
+///
+/// `for_session` marks an isolate that belongs to an *agent's* session rather
+/// than to a script process: a boot failure is then reported to the caller
+/// and nothing else — marking the process stopped would tombstone a live
+/// agent over a scripting hiccup.
+async fn boot(
+    sys: &Arc<System>,
+    me: &Meta,
+    instructions: &str,
+    source: &str,
+    resumed: bool,
+    for_session: bool,
+) -> Option<JsRuntime> {
     const OPS: &[OpDecl] = &[
         op_bitty_send(),
         op_bitty_stop(),
@@ -1371,6 +1575,7 @@ async fn boot(sys: &Arc<System>, me: &Meta, instructions: &str, source: &str, re
         op_bitty_env(),
         op_bitty_env_list(),
         op_bitty_sys(),
+        op_bitty_call(),
     ];
 
     let host = Host {
@@ -1409,7 +1614,9 @@ async fn boot(sys: &Arc<System>, me: &Meta, instructions: &str, source: &str, re
         Ok(js) => js,
         Err(e) => {
             ui::warn(&me.tag, &format!("TypeScript error: {e}"));
-            finish(sys, me, "failed to compile");
+            if !for_session {
+                finish(sys, me, "failed to compile");
+            }
             return None;
         }
     };
@@ -1420,7 +1627,9 @@ async fn boot(sys: &Arc<System>, me: &Meta, instructions: &str, source: &str, re
 
     if let Err(e) = runtime.execute_script("[bitty:prelude]", PRELUDE) {
         ui::warn(&me.tag, &format!("prelude failed: {e}"));
-        finish(sys, me, "runtime failed to start");
+        if !for_session {
+            finish(sys, me, "runtime failed to start");
+        }
         return None;
     }
     let info = json!({
@@ -1437,9 +1646,32 @@ async fn boot(sys: &Arc<System>, me: &Meta, instructions: &str, source: &str, re
     let init = format!("globalThis.__bitty_init({info});");
     let _ = runtime.execute_script("[bitty:init]", init);
 
+    // Parent-created tools become async functions in this namespace — a
+    // script and an agent's session see them identically. The holder never
+    // needs to know which process answers; the resolved target lives on the
+    // Rust side of the op.
+    if !me.aliases.is_empty() {
+        let wrappers: String = me
+            .aliases
+            .iter()
+            .map(|alias| {
+                let name = serde_json::to_string(&alias.name).unwrap_or_default();
+                format!(
+                    "globalThis[{name}] = async (args = {{}}) => \
+                     Deno.core.ops.op_bitty_call({name}, JSON.stringify(args));\n"
+                )
+            })
+            .collect();
+        if let Err(e) = runtime.execute_script("[bitty:tools]", wrappers) {
+            ui::warn(&me.tag, &format!("tool injection failed: {e}"));
+        }
+    }
+
     if let Err(e) = runtime.execute_script("[script]", js) {
         ui::warn(&me.tag, &format!("script error: {e}"));
-        finish(sys, me, "script raised at load");
+        if !for_session {
+            finish(sys, me, "script raised at load");
+        }
         return None;
     }
     // Give startup a moment to settle, but no more: a script whose top level
@@ -1601,7 +1833,7 @@ mod tests {
             "#
         );
 
-        let mut runtime = boot(&sys, &me, "test", &source, false).await.expect("boot should succeed");
+        let mut runtime = boot(&sys, &me, "test", &source, false, false).await.expect("boot should succeed");
         run_cleanup(&mut runtime, &me.tag).await;
 
         let contents =

@@ -1,11 +1,16 @@
 #!/usr/bin/env bash
 # Regression suite: each mock asserts server-side, so any violation comes back
 # as an ASSERTION 400 that the harness prints.
+#
+# Resolved before the cd below, or a relative $BASH_SOURCE (running as
+# `bash run_suite.sh` from inside test/) points SCRATCH at the repo root and
+# every mock dies at launch — which used to read as a wall of vacuous passes
+# before the mock-liveness check existed.
+SCRATCH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd /home/bit/Code/Bitty || exit 1
 # Bash otherwise announces "Terminated" for every leftover process reaped
 # below, which buries the actual results.
 set +m
-SCRATCH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Bracketed so the pattern cannot match the shell that is running this suite.
 # Pids of harnesses this suite started, so cleanup never reaches beyond them.
 STARTED=()
@@ -36,6 +41,14 @@ run() {
     (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null && exec 3<&- && break
     sleep 0.1
   done
+  # A dead mock makes every turn fail with connection refused, which settles
+  # and looks like a pass. Refuse to run the scenario instead.
+  if ! (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null; then
+    printf 'FAIL  %s (mock never came up on :%s)\n' "$name" "$port"
+    fail=$((fail+1))
+    return
+  fi
+  exec 3<&-
   local out
   # Generous: spawning a script runs `deno check`, which costs real seconds.
   local start=$SECONDS
@@ -90,10 +103,27 @@ run "myopic worker (tools, no graph)"           8756 mock_myopic.py    --once "d
 run "deno.serve in a script process"        8757 mock_serve.py     --once --allow-net 127.0.0.1:8899 "stand up a server"
 run "reactive scripts (sleep + socket)"       8758 mock_reactive.py  --once --allow-net 127.0.0.1:8901 "be reactive"
 
-# Two runs against one journal, so this cannot use the single-run helper above.
-BITTY_COMPACT_ABOVE=120000 BITTY_COMPACTION=off \
+# BITTY_COMPACT_ABOVE is in tokens; the harness estimates chars/4 when the
+# mock reports tiny real usage, so 50000 tokens trips a couple of turns after
+# the mock's ~180K chars of ballast, once the marker turns exist.
+BITTY_COMPACT_ABOVE=50000 BITTY_COMPACTION=off \
   run "local compaction (summarise + restart)" 8760 mock_summarize.py --once "the original briefing"
 unset BITTY_COMPACT_ABOVE BITTY_COMPACTION
+
+run "overflow compacts and retries"          8761 mock_overflow.py  --once "grow then overflow"
+
+# The Codex provider needs the CLI's stored credentials just to start, so the
+# scenario only runs where they exist.
+if [ -f "$HOME/.codex/auth.json" ]; then
+  BITTY_PROVIDER=codex BITTY_CODEX_URL=http://127.0.0.1:8770 \
+    run "codex stream retry (mid-body EOF)"  8770 mock_codex_eof.py --once "say hi"
+else
+  echo "skip  codex stream retry (no ~/.codex/auth.json)"
+fi
+
+GATED=$(mktemp -d)
+export BITTY_TEST_GATE_DIR="$GATED"
+run "verification gate (fail, fix, pass)"    8762 mock_gate.py      --once --allow-read "$GATED" --allow-write "$GATED" --gate "test -f $GATED/marker" "do the work"
 
 restart_arm() {
   local name="script survives a harness restart" port=8759 start=$SECONDS
