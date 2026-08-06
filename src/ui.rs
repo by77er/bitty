@@ -1,10 +1,39 @@
 //! Serialized, color-coded console output. Every process prints through here
 //! so concurrent actors never interleave mid-line.
+//!
+//! The same lines feed the dashboard: once `tap()` has been opened, every
+//! print also broadcasts a structured event. The console remains the source
+//! of truth; the dashboard is a mirror, so nothing renders in one place and
+//! not the other.
 
 use std::io::Write;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 static OUT: Mutex<()> = Mutex::new(());
+
+/// One console line, structured, for the dashboard feed.
+#[derive(Clone)]
+pub struct Event {
+    /// "say" | "trace" | "mail" | "warn" | "system"
+    pub kind: &'static str,
+    pub who: String,
+    pub text: String,
+}
+
+static TAP: OnceLock<tokio::sync::broadcast::Sender<Event>> = OnceLock::new();
+
+/// Open (or fetch) the dashboard tap. Subscribers receive every console line
+/// from then on; a slow subscriber lags and skips rather than blocking the
+/// console.
+pub fn tap() -> tokio::sync::broadcast::Sender<Event> {
+    TAP.get_or_init(|| tokio::sync::broadcast::channel(512).0).clone()
+}
+
+fn feed(kind: &'static str, who: &str, text: &str) {
+    if let Some(tx) = TAP.get() {
+        let _ = tx.send(Event { kind, who: who.into(), text: text.into() });
+    }
+}
 
 // One color per process, assigned round-robin at spawn time.
 const PALETTE: &[u8] = &[36, 32, 35, 34, 33, 31, 96, 92, 95, 94];

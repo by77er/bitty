@@ -80,6 +80,52 @@ interface, not the enforcement.
     cache reads (or long verifier loops exhaust budgets re-reading their own
     context).
 
+## Next up: the TUI (planned, plumbing started)
+
+`bitty --tui` takes over the terminal with a live view of the system — a
+cat mascot for state at a glance, curated panels so you see what's going on
+without being overwhelmed. Built on **ratatui + crossterm** (the standard
+stack — the hand-rolling in this repo is reserved for places where an
+abstraction would sit on a load-bearing invariant, like the provider
+layer's raw-Value message shape; terminal rendering is commodity and gets a
+commodity crate).
+
+- **Opt-in flag, plain console stays the default.** The mock suite and
+  `--once` scripts grep stdout lines; the TUI must not replace that. `--tui`
+  enters the alternate screen; everything else is unchanged.
+- **The console line stream is the source of truth.** `ui.rs`'s broadcast
+  tap (already in the working tree: `ui::Event { kind, who, text }` +
+  `ui::tap()`; wire `feed(kind, label, text)` into
+  `say/trace/mail_to_user/warn/system` next) feeds the TUI the same lines
+  the plain console prints, structured and un-ANSI'd. A lagging subscriber
+  skips rather than blocking printing. In TUI mode, `emit` to stdout is
+  suppressed (the tap is the display).
+- **`System::snapshot()`** (new, in system.rs): per-process
+  `{id, name, parent, status, runs, tokens}` plus `billable` and a settled
+  flag, computed under one procs lock (don't call `all_settled()` inside —
+  double lock).
+- **Layout.**
+  - Header: ASCII cat + `bitty` + session name + one-word system state +
+    billable tokens + peak context.
+  - Left: process tree from the snapshot (status glyph ●/○/■, id, name,
+    model/effort, ctx tokens), arrow-key selectable.
+  - Main: activity feed from the tap, colored by kind. `trace` lines hidden
+    by default behind the `t` toggle — that's the not-overwhelming part.
+    Selecting a process filters the feed to it; Esc clears.
+  - Bottom: an input line wired to the same console dispatch as plain mode
+    (plain text → root, `@proc-N msg`, `/ps` `/graph` `/model` `/stop`
+    `/quit`). Refactor main.rs's console match into a function both modes
+    call, so the two consoles cannot drift.
+- **The cat** (2–3 ASCII frames, mood from snapshot + recent events):
+  working → `(^･ω･^)` with a tail-wag frame alternation; all idle →
+  `(-ω-)ᶻᶻ`; a warn in the last 5s → `(⊙ω⊙)!`. A status indicator that
+  happens to be a cat, not a toy.
+- **Redraw** on a 250ms tick + on every tap event (debounced); snapshot
+  refetched on the tick.
+- **Testing:** the TUI itself is exercised manually (alternate-screen UIs
+  don't suite-test well); what must not regress is plain mode — the full
+  mock suite runs unchanged, and `ui::tap` stays inert unless subscribed.
+
 ## C. Later (not in this pass)
 
 14. **Skills store** — mechanism behind "promote a recurring script": a
