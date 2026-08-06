@@ -120,7 +120,7 @@ commodity crate).
     name, model/effort, ctx tokens), arrow-key selectable.
   - Dominant main transcript: activity from the tap, colored by kind and
     presented as chat rather than a monitoring panel. `trace` lines are hidden
-    by default behind the `t` toggle — that's the not-overwhelming part.
+    by default behind the `Ctrl-T` toggle — that's the not-overwhelming part.
     Selecting a process filters the feed to it; Esc clears. Mouse-wheel and
     Page Up/Down input scroll the transcript buffer rather than moving the
     process selection; End returns to the latest activity.
