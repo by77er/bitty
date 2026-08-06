@@ -1,0 +1,31 @@
+# Pinned toolchain for Bitty.
+#
+# WHY this pin exists: deno_core 0.409 requires TypeId::of::<T>() usable as
+# a const fn (see deno_core-0.409.0/cppgc.rs). This needs a nightly recent
+# enough to have const_type_id support. Confirmed FAILING on an older
+# nightly: nightly-2025-06-02 (rustc 1.89.0-nightly, 2025-06-01 build) errors
+# with "TypeId::of is not yet stable as a const fn" compiling deno_core.
+#
+# PINNED TO: nightly-2026-08-06, which resolves to
+# rustc 1.99.0-nightly (7608eb7b0 2026-08-05). That exact compiler is
+# confirmed (via a from-disk-verified cargo build: exit code 0, cached-dep
+# fingerprint match -- rustc version is part of cargo's fingerprint, so a
+# from-cache reuse of the deno_core 0.409 artifact proves this compiler built
+# it successfully) to build deno_core 0.409 and the full crate.
+#
+# NOTE ON EARLIER CONFUSION: earlier local testing in this environment
+# produced apparently-contradictory PASS/FAIL results for this exact pin.
+# That was traced to a bug in the harness's subprocess-output decoding (not
+# the toolchain) -- see .bitty/ci.md for the full account and resolution.
+# The pin below is evidence-backed, not a guess.
+#
+# nightly-2026-08-05 is a DIFFERENT, older commit (1ed2df61a) -- do not use
+# that date, use nightly-2026-08-06.
+#
+# If this dated nightly is ever not fetchable, or a from-scratch build under
+# it fails, bump the date FORWARD to the nearest fetchable dated nightly that
+# builds deno_core 0.409 (confirm via a from-disk-verified build, not piped
+# stdout, before committing) -- do not fall back to bare "nightly".
+[toolchain]
+channel = "nightly-2026-08-06"
+components = ["rustfmt", "clippy"]

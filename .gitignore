@@ -5,3 +5,7 @@
 
 # Process journals written by --journal / --resume.
 .bitty/
+
+# Test-suite scratch: python bytecode and per-mock launcher stderr.
+test/__pycache__/
+test/mock-*.err

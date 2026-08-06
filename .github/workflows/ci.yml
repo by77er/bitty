@@ -1,0 +1,62 @@
+# CI for Bitty.
+#
+# Toolchain: pinned via rust-toolchain.toml (channel = "nightly-2026-08-06",
+# which resolves to rustc 1.99.0-nightly (7608eb7b0 2026-08-05) -- confirmed
+# to build deno_core 0.409 and the full crate. See rust-toolchain.toml and
+# .bitty/ci.md for the full evidence and the earlier decoding-bug confusion
+# that has since been resolved. We rely on rustup auto-detecting
+# rust-toolchain.toml rather than duplicating the pin here, so the two
+# never drift apart.
+#
+# Gating notes (read before tightening):
+#   - cargo fmt --check is a HARD gate. The tree is expected to be fmt-clean
+#     by the time this lands (a repo-wide `cargo fmt` is scheduled after the
+#     in-flight edits to src/actions.rs, src/anthropic.rs, src/api.rs,
+#     src/codex.rs, src/grants.rs, src/script.rs land).
+#   - cargo clippy is a HARD gate (`-D warnings`). The tree was driven to
+#     zero clippy warnings workspace-wide as of today and must stay that
+#     way -- do not reintroduce `continue-on-error` without discussion.
+#   - The test suite needs no secrets: verified locally that
+#     `cargo test --locked` passes with ANTHROPIC_API_KEY unset and no
+#     network access. If that ever changes, add secrets here explicitly
+#     rather than assuming CI has ambient credentials.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install pinned Rust toolchain (from rust-toolchain.toml)
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-08-06
+          components: rustfmt, clippy
+
+      - name: Cache cargo/target
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting (hard gate)
+        run: cargo fmt --check
+
+      - name: Clippy (hard gate — tree is warning-free, keep it that way)
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Build
+        run: cargo build --locked
+
+      - name: Test
+        run: cargo test --locked
