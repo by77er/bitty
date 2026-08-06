@@ -12,7 +12,9 @@
 //! rather than blocks inside a user message, and the streaming events have
 //! their own names.
 
-use crate::api::{Backend, Client, Failure, FailureKind, FinalMessage, Tier, Turn, classify};
+use crate::api::{
+    Backend, Client, Failure, FailureKind, FinalMessage, Tier, Turn, Usage, classify,
+};
 use crate::ui::{self, Tag};
 use anyhow::{Context, Result, anyhow, bail};
 use futures_util::StreamExt;
@@ -80,7 +82,10 @@ impl Auth {
             .send()
             .await?;
         if !response.status().is_success() {
-            bail!("refreshing the Codex token failed: HTTP {}", response.status());
+            bail!(
+                "refreshing the Codex token failed: HTTP {}",
+                response.status()
+            );
         }
         let body: Value = response.json().await?;
         let Some(access) = body["access_token"].as_str() else {
@@ -93,13 +98,13 @@ impl Auth {
 
         // Merge into the file rather than rewriting it: it holds fields this
         // harness does not own, and clobbering them would break the CLI.
-        if let Ok(text) = std::fs::read_to_string(&self.path) {
-            if let Ok(mut stored) = serde_json::from_str::<Value>(&text) {
-                stored["tokens"]["access_token"] = json!(self.access_token);
-                stored["tokens"]["refresh_token"] = json!(self.refresh_token);
-                if let Ok(serialized) = serde_json::to_string_pretty(&stored) {
-                    let _ = std::fs::write(&self.path, serialized);
-                }
+        if let Ok(text) = std::fs::read_to_string(&self.path)
+            && let Ok(mut stored) = serde_json::from_str::<Value>(&text)
+        {
+            stored["tokens"]["access_token"] = json!(self.access_token);
+            stored["tokens"]["refresh_token"] = json!(self.refresh_token);
+            if let Ok(serialized) = serde_json::to_string_pretty(&stored) {
+                let _ = std::fs::write(&self.path, serialized);
             }
         }
         Ok(())
@@ -157,7 +162,9 @@ fn trim(items: Vec<Value>) -> Vec<Value> {
         .collect();
     kept.retain(|item| {
         item["type"] != "function_call_output"
-            || item["call_id"].as_str().is_some_and(|id| calls.contains(id))
+            || item["call_id"]
+                .as_str()
+                .is_some_and(|id| calls.contains(id))
     });
 
     let mut out = Vec::new();
@@ -181,7 +188,9 @@ pub fn to_input(messages: &[Value]) -> Vec<Value> {
         let blocks = match message["content"].as_array() {
             Some(blocks) => blocks.clone(),
             // A bare string body is legal in Anthropic shape.
-            None => vec![json!({"type": "text", "text": message["content"].as_str().unwrap_or("")})],
+            None => {
+                vec![json!({"type": "text", "text": message["content"].as_str().unwrap_or("")})]
+            }
         };
 
         let mut text_parts = Vec::new();
@@ -221,7 +230,11 @@ pub fn to_input(messages: &[Value]) -> Vec<Value> {
 
         if !text_parts.is_empty() {
             let joined = text_parts.join("\n");
-            let kind = if role == "assistant" { "output_text" } else { "input_text" };
+            let kind = if role == "assistant" {
+                "output_text"
+            } else {
+                "input_text"
+            };
             input.push(json!({
                 "type": "message",
                 "role": role,
@@ -256,11 +269,9 @@ pub fn to_tools(tools: &Value) -> Vec<Value> {
 pub struct Accumulated {
     pub content: Vec<Value>,
     pub stop_reason: String,
-    pub input_tokens: u64,
-    /// What this turn actually cost: uncached input plus output. Cache reads
-    /// are excluded, or a long conversation's budget is exhausted by
-    /// re-reading its own context.
-    pub billable: u64,
+    /// The token split this turn was billed on. `input_tokens` and
+    /// `billable` are derived from it where the harness wants them.
+    pub usage: Usage,
     /// This response's id, to thread the next turn onto.
     pub id: Option<String>,
 }
@@ -269,8 +280,7 @@ pub struct Accumulated {
 pub struct Stream {
     text: String,
     calls: Vec<Value>,
-    input_tokens: u64,
-    billable: u64,
+    usage: Usage,
     id: Option<String>,
     failed: Option<String>,
 }
@@ -303,11 +313,19 @@ impl Stream {
                 }
             }
             "response.completed" => {
-                let usage = &event["response"]["usage"];
-                self.input_tokens = usage["input_tokens"].as_u64().unwrap_or(0);
-                let cached = usage["input_tokens_details"]["cached_tokens"].as_u64().unwrap_or(0);
-                let output = usage["output_tokens"].as_u64().unwrap_or(0);
-                self.billable = self.input_tokens.saturating_sub(cached) + output;
+                let reported = &event["response"]["usage"];
+                // The Responses API reports the prompt total with the cached
+                // part called out inside it, so the uncached remainder is the
+                // difference. It reports no cache-write count and charges no
+                // surcharge for one, so that counter stays zero here — the
+                // cached part is priced at the cache-read rate, not dropped.
+                let total = reported["input_tokens"].as_u64().unwrap_or(0);
+                let cached = reported["input_tokens_details"]["cached_tokens"]
+                    .as_u64()
+                    .unwrap_or(0);
+                self.usage.uncached_input = total.saturating_sub(cached);
+                self.usage.cache_read = cached;
+                self.usage.output = reported["output_tokens"].as_u64().unwrap_or(0);
                 self.id = event["response"]["id"].as_str().map(String::from);
             }
             "response.failed" | "error" => {
@@ -332,13 +350,16 @@ impl Stream {
         if !self.text.is_empty() {
             content.push(json!({"type": "text", "text": self.text}));
         }
-        let stop_reason = if self.calls.is_empty() { "end_turn" } else { "tool_use" };
+        let stop_reason = if self.calls.is_empty() {
+            "end_turn"
+        } else {
+            "tool_use"
+        };
         content.extend(self.calls);
         Ok(Accumulated {
             content,
             stop_reason: stop_reason.to_string(),
-            input_tokens: self.input_tokens,
-            billable: self.billable,
+            usage: self.usage,
             id: self.id,
         })
     }
@@ -430,7 +451,14 @@ impl Backend for Codex {
         tag: &Tag,
     ) -> Result<FinalMessage, Failure> {
         let tier = Tier::parse(turn.model).unwrap_or(Tier::Large);
-        let request = body(tier, turn.effort, turn.system, turn.messages, turn.tools, None);
+        let request = body(
+            tier,
+            turn.effort,
+            turn.system,
+            turn.messages,
+            turn.tools,
+            None,
+        );
         let (token, account) = {
             let auth = self.auth.lock().await;
             (auth.access_token.clone(), auth.account_id.clone())
@@ -515,7 +543,9 @@ async fn consume_stream(resp: reqwest::Response, tag: &Tag) -> Result<FinalMessa
     let mut buf = String::new();
     let mut stream = resp.bytes_stream();
     while let Some(chunk) = stream.next().await {
-        buf.push_str(&String::from_utf8_lossy(&chunk.context("stream interrupted")?));
+        buf.push_str(&String::from_utf8_lossy(
+            &chunk.context("stream interrupted")?,
+        ));
         while let Some(cut) = buf.find('\n') {
             let line = buf[..cut].trim().to_string();
             buf.drain(..=cut);
@@ -546,7 +576,8 @@ async fn consume_stream(resp: reqwest::Response, tag: &Tag) -> Result<FinalMessa
         thread: done.id,
         content: done.content,
         stop_reason: done.stop_reason,
-        input_tokens: done.input_tokens,
-        billable: done.billable,
+        input_tokens: done.usage.prompt(),
+        billable: done.usage.billable(),
+        usage: done.usage,
     })
 }

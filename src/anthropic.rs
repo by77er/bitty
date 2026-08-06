@@ -8,7 +8,7 @@
 //! shape — the journal is written in it — so this backend does no
 //! translation, only transport.
 
-use crate::api::{Backend, Client, Failure, FinalMessage, Tier, Turn};
+use crate::api::{Backend, Client, Failure, FinalMessage, Tier, Turn, Usage};
 use crate::ui::{self, Tag};
 use anyhow::{Context, Result, anyhow, bail};
 use futures_util::StreamExt;
@@ -43,18 +43,31 @@ impl Caps {
     /// surface and are corrected by the first rejection rather than being
     /// permanently downgraded on a name we failed to recognize.
     fn guess(model: &str) -> Caps {
-        let modern = Caps { adaptive: true, effort: true, fallbacks: false, compaction: true };
+        let modern = Caps {
+            adaptive: true,
+            effort: true,
+            fallbacks: false,
+            compaction: true,
+        };
         match model {
-            m if m.starts_with("claude-fable-") || m.starts_with("claude-mythos-") => {
-                Caps { fallbacks: true, ..modern }
-            }
-            m if m.starts_with("claude-opus-5") => Caps { fallbacks: true, ..modern },
-            m if m.starts_with("claude-haiku-") => {
-                Caps { adaptive: false, effort: false, fallbacks: false, compaction: false }
-            }
-            m if m.starts_with("claude-opus-4-5") || m.starts_with("claude-sonnet-4-5") => {
-                Caps { adaptive: false, ..modern }
-            }
+            m if m.starts_with("claude-fable-") || m.starts_with("claude-mythos-") => Caps {
+                fallbacks: true,
+                ..modern
+            },
+            m if m.starts_with("claude-opus-5") => Caps {
+                fallbacks: true,
+                ..modern
+            },
+            m if m.starts_with("claude-haiku-") => Caps {
+                adaptive: false,
+                effort: false,
+                fallbacks: false,
+                compaction: false,
+            },
+            m if m.starts_with("claude-opus-4-5") || m.starts_with("claude-sonnet-4-5") => Caps {
+                adaptive: false,
+                ..modern
+            },
             _ => modern,
         }
     }
@@ -110,8 +123,15 @@ impl Anthropic {
     fn learn_from(&self, model: &str, text: &str, tag: &Tag) -> bool {
         let model = Tier::parse(model).map(Tier::anthropic).unwrap_or(model);
         let mut caps = self.caps.lock().unwrap();
-        let entry = caps.entry(model.to_string()).or_insert_with(|| Caps::guess(model));
-        let before = (entry.adaptive, entry.effort, entry.fallbacks, entry.compaction);
+        let entry = caps
+            .entry(model.to_string())
+            .or_insert_with(|| Caps::guess(model));
+        let before = (
+            entry.adaptive,
+            entry.effort,
+            entry.fallbacks,
+            entry.compaction,
+        );
         if text.contains("thinking") {
             entry.adaptive = false;
         }
@@ -131,7 +151,13 @@ impl Anthropic {
         {
             entry.compaction = false;
         }
-        let changed = before != (entry.adaptive, entry.effort, entry.fallbacks, entry.compaction);
+        let changed = before
+            != (
+                entry.adaptive,
+                entry.effort,
+                entry.fallbacks,
+                entry.compaction,
+            );
         if changed {
             ui::warn(
                 tag,
@@ -270,13 +296,12 @@ async fn consume_stream(resp: reqwest::Response, tag: &Tag) -> Result<FinalMessa
     let mut content: Vec<Value> = Vec::new();
     let mut tool_json: HashMap<usize, String> = HashMap::new();
     let mut stop_reason = String::new();
-    let mut input_tokens: u64 = 0;
-    // Billable pieces: uncached input + cache writes at message_start,
-    // output at message_delta (overwritten, not summed — the server
-    // reports it cumulatively). Handed back on the message, added to the
-    // run's counter once by the driver, so a request can never double-count.
-    let mut billable_in: u64 = 0;
-    let mut output_tokens: u64 = 0;
+    // The four-way split, straight from the server: prompt counters at
+    // message_start, output at message_delta (overwritten, not summed — the
+    // server reports it cumulatively). Handed back on the message and folded
+    // into the run's counters once by the driver, so a request can never
+    // double-count.
+    let mut usage = Usage::default();
     // Buffer streamed text so we only print whole lines.
     let mut line_buf = String::new();
 
@@ -298,9 +323,7 @@ async fn consume_stream(resp: reqwest::Response, tag: &Tag) -> Result<FinalMessa
                     &mut content,
                     &mut tool_json,
                     &mut stop_reason,
-                    &mut input_tokens,
-                    &mut billable_in,
-                    &mut output_tokens,
+                    &mut usage,
                     &mut line_buf,
                     tag,
                 )?;
@@ -316,8 +339,9 @@ async fn consume_stream(resp: reqwest::Response, tag: &Tag) -> Result<FinalMessa
         thread: None,
         content,
         stop_reason,
-        input_tokens,
-        billable: billable_in + output_tokens,
+        input_tokens: usage.prompt(),
+        billable: usage.billable(),
+        usage,
     })
 }
 
@@ -327,27 +351,23 @@ fn apply_event(
     content: &mut Vec<Value>,
     tool_json: &mut HashMap<usize, String>,
     stop_reason: &mut String,
-    input_tokens: &mut u64,
-    billable_in: &mut u64,
-    output_tokens: &mut u64,
+    usage: &mut Usage,
     line_buf: &mut String,
     tag: &Tag,
 ) -> Result<()> {
     match event["type"].as_str().unwrap_or("") {
         "message_start" => {
-            let usage = &event["message"]["usage"];
-            // The prompt total is split across three counters depending on
-            // cache state; compaction cares about their sum.
-            *input_tokens = ["input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"]
-                .iter()
-                .filter_map(|k| usage[k].as_u64())
-                .sum();
-            // The budget cares about what is actually paid for: uncached
-            // input and cache writes, never cache reads.
-            *billable_in = ["input_tokens", "cache_creation_input_tokens"]
-                .iter()
-                .filter_map(|k| usage[k].as_u64())
-                .sum();
+            let reported = &event["message"]["usage"];
+            // The prompt arrives as three disjoint counters, each billed at a
+            // different rate: `input_tokens` is the uncached remainder, not the
+            // total. They are kept apart here and summed only where a total is
+            // what's wanted, because collapsing them is how a cost figure
+            // becomes fiction.
+            usage.uncached_input = reported["input_tokens"].as_u64().unwrap_or(0);
+            usage.cache_write = reported["cache_creation_input_tokens"]
+                .as_u64()
+                .unwrap_or(0);
+            usage.cache_read = reported["cache_read_input_tokens"].as_u64().unwrap_or(0);
         }
         "content_block_start" => {
             let index = event["index"].as_u64().unwrap_or(0) as usize;
@@ -419,7 +439,7 @@ fn apply_event(
             }
             // Cumulative, so overwrite rather than add.
             if let Some(out) = event["usage"]["output_tokens"].as_u64() {
-                *output_tokens = out;
+                usage.output = out;
             }
         }
         "error" => {
