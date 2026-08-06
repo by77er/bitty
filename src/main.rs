@@ -48,8 +48,6 @@ mod ui;
 use std::io::IsTerminal;
 use std::sync::Arc;
 
-/// Where processes are recorded unless told otherwise.
-const DEFAULT_JOURNAL: &str = ".bitty/journal";
 /// Each run gets its own directory under here, so sessions accumulate side by
 /// side and can be resumed by name rather than by remembering a path.
 const SESSION_ROOT: &str = ".bitty/sessions";
@@ -97,7 +95,8 @@ Interactive commands:
 TUI keys:
   Up/Down select a process and filter its output and incoming mail; Esc clears.
   Mouse wheel or PgUp/PgDn scrolls the transcript; End jumps to the latest.
-  t toggles trace lines when input is empty (Ctrl-T always toggles); Enter sends.
+  Ctrl-T shows traces and long message bodies in full; Enter sends.
+  Ctrl-O releases the mouse so the terminal can select and copy text again.
   Ctrl-C exits.
 "#;
 
@@ -773,29 +772,29 @@ async fn run_until_idle(
         // workspace can only fail the same way. The skipped run still burns
         // an attempt, so an agent that keeps stopping without editing
         // anything runs out of road rather than looping.
-        if let Some((prev_cmd, Some(prev_digest))) = &last_failure {
-            if snapshot(snapshot_roots) == Some(*prev_digest) {
-                attempts += 1;
-                if attempts >= max_attempts {
-                    ui::system(&format!(
-                        "gate `{prev_cmd}` still failing and the workspace is unchanged after \
-                         {attempts} attempt(s) — giving up (--once)"
-                    ));
-                    return false;
-                }
-                let _ = sys.send(
-                    root,
-                    Mail::system(
-                        "system",
-                        format!(
-                            "<gate>\nThe gate `{prev_cmd}` was not rerun: the workspace is \
-                             unchanged since it last failed. Edit source files or tests before \
-                             finishing again — attempt {attempts} of {max_attempts}.\n</gate>"
-                        ),
-                    ),
-                );
-                continue;
+        if let Some((prev_cmd, Some(prev_digest))) = &last_failure
+            && snapshot(snapshot_roots) == Some(*prev_digest)
+        {
+            attempts += 1;
+            if attempts >= max_attempts {
+                ui::system(&format!(
+                    "gate `{prev_cmd}` still failing and the workspace is unchanged after \
+                     {attempts} attempt(s) — giving up (--once)"
+                ));
+                return false;
             }
+            let _ = sys.send(
+                root,
+                Mail::system(
+                    "system",
+                    format!(
+                        "<gate>\nThe gate `{prev_cmd}` was not rerun: the workspace is \
+                         unchanged since it last failed. Edit source files or tests before \
+                         finishing again — attempt {attempts} of {max_attempts}.\n</gate>"
+                    ),
+                ),
+            );
+            continue;
         }
         match run_gates(gates).await {
             None => {
@@ -923,10 +922,10 @@ fn snapshot(roots: &[String]) -> Option<u64> {
                 };
                 path.hash(&mut hasher);
                 meta.len().hash(&mut hasher);
-                if let Ok(modified) = meta.modified() {
-                    if let Ok(d) = modified.duration_since(std::time::UNIX_EPOCH) {
-                        d.as_nanos().hash(&mut hasher);
-                    }
+                if let Ok(modified) = meta.modified()
+                    && let Ok(d) = modified.duration_since(std::time::UNIX_EPOCH)
+                {
+                    d.as_nanos().hash(&mut hasher);
                 }
             }
         }
