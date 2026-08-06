@@ -91,8 +91,9 @@ pub fn send(
 pub fn stop(sys: &Arc<System>, me: &Meta, targets: Vec<String>, cascade: bool) -> (String, bool) {
     let (visible, unseen): (Vec<String>, Vec<String>) =
         targets.into_iter().partition(|t| sys.is_visible(me, t));
-    let (allowed, denied): (Vec<String>, Vec<String>) =
-        visible.into_iter().partition(|t| sys.may(me, Capability::Stop, t));
+    let (allowed, denied): (Vec<String>, Vec<String>) = visible
+        .into_iter()
+        .partition(|t| sys.may(me, Capability::Stop, t));
 
     if allowed.is_empty() {
         let mut why = Vec::new();

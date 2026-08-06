@@ -463,6 +463,21 @@ impl Journal for FileJournal {
     }
 }
 
+/// What folding a journal yields: the process definition, its conversation,
+/// whether it was stopped, mail still owed to it, tool calls dropped from an
+/// interrupted turn, and the mailbox cursor to carry forward.
+///
+/// Note what is *not* here: token and dollar totals. Nothing journals them, so
+/// `--resume` restarts both at zero — see `.bitty/cost-accounting.md`.
+pub type Restored = (
+    ProcessRecord,
+    Vec<Value>,
+    bool,
+    Vec<MailRecord>,
+    Vec<Value>,
+    u64,
+);
+
 /// Fold a journal back into a process definition and its conversation.
 ///
 /// An assistant turn whose tool calls have no matching results is dropped: the
@@ -472,16 +487,7 @@ impl Journal for FileJournal {
 /// have executed before the crash (mail, for one, is durable at the recipient
 /// the moment it is sent), and silently re-running them means duplicate
 /// messages and duplicate workers.
-pub fn restore(
-    events: Vec<Event>,
-) -> Option<(
-    ProcessRecord,
-    Vec<Value>,
-    bool,
-    Vec<MailRecord>,
-    Vec<Value>,
-    u64,
-)> {
+pub fn restore(events: Vec<Event>) -> Option<Restored> {
     let mut record = None;
     let mut history: Vec<Value> = Vec::new();
     let mut stopped = false;
@@ -542,19 +548,17 @@ pub fn restore(
             && last["content"]
                 .as_array()
                 .is_some_and(|blocks| blocks.iter().any(|b| b["type"] == "tool_use"));
-        if unanswered {
-            if let Some(turn) = history.pop() {
-                dropped = turn["content"]
-                    .as_array()
-                    .map(|blocks| {
-                        blocks
-                            .iter()
-                            .filter(|b| b["type"] == "tool_use")
-                            .cloned()
-                            .collect()
-                    })
-                    .unwrap_or_default();
-            }
+        if unanswered && let Some(turn) = history.pop() {
+            dropped = turn["content"]
+                .as_array()
+                .map(|blocks| {
+                    blocks
+                        .iter()
+                        .filter(|b| b["type"] == "tool_use")
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default();
         }
     }
     // Whatever was never consumed is still owed to this process.
@@ -611,13 +615,12 @@ pub fn restart_notice(dropped: &[Value]) -> Option<String> {
 /// its own.
 pub fn attach_restart_notice(history: &mut Vec<Value>, notice: &str) {
     let block = serde_json::json!({"type": "text", "text": notice});
-    if let Some(last) = history.last_mut() {
-        if last["role"] == "user" {
-            if let Some(blocks) = last["content"].as_array_mut() {
-                blocks.push(block);
-                return;
-            }
-        }
+    if let Some(last) = history.last_mut()
+        && last["role"] == "user"
+        && let Some(blocks) = last["content"].as_array_mut()
+    {
+        blocks.push(block);
+        return;
     }
     history.push(serde_json::json!({"role": "user", "content": [block]}));
 }

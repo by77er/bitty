@@ -68,6 +68,12 @@ pub async fn run(
             content: json!(first_turn),
         },
     );
+    // Once per process lifetime: this is what makes the briefing survivable
+    // at all. Spawned is already flushed (durable.rs), and resume ignores
+    // `_instructions` — so without this, a process killed before its first
+    // model response comes back alive with an empty history, idle and
+    // permanently deaf to the job it was spawned for.
+    sys.journal.flush(&me.id);
     drive(sys, me, mailbox, vec![opening]).await;
 }
 
@@ -222,6 +228,14 @@ async fn drive(
                 content: json!(content),
             },
         );
+        // Durable before any tool executes. Without this the Output sits in the
+        // BufWriter until the next flush, so a turn that ends without tool calls
+        // never reaches disk at all — `restore` then sees a history ending in a
+        // user turn and re-drives a turn that already ran, at full price and with
+        // its side effects. Flushed here, an interrupted turn is instead visible
+        // as an unanswered assistant turn, which is exactly what `restore`'s
+        // dropped-turn guard and `restart_notice` are built to handle.
+        sys.journal.flush(&me.id);
         history.push(json!({"role": "assistant", "content": content}));
 
         match resp.stop_reason.as_str() {
@@ -268,7 +282,6 @@ async fn drive(
                     consumed = consumed.max(mail.seq);
                     blocks.push(text_block(&envelope(&mail)));
                 }
-                sys.note_consumed(&me.id, consumed);
                 // Recorded after the results, so a crash mid-turn resumes from
                 // a point where the completed tool calls are already known and
                 // are not run a second time.
@@ -278,7 +291,7 @@ async fn drive(
                         content: json!(blocks),
                     },
                 );
-                sys.journal.flush(&me.id);
+                sys.note_consumed(&me.id, consumed);
                 // A turn has just ended, so the log is consistent and nothing is
                 // mid-write. Checked here rather than on a timer for that reason.
                 if sys.journal.should_compact(&me.id) {
@@ -352,13 +365,19 @@ async fn wait_for_mail(
         consumed = consumed.max(mail.seq);
         blocks.push(text_block(&envelope(&mail)));
     }
-    sys.note_consumed(&me.id, consumed);
+    // Body first, cursor second. `note_consumed` flushes, so advancing the
+    // cursor ahead of the message it accounts for would make "already
+    // consumed" durable while the message itself was still in the buffer —
+    // `restore` would then neither redeliver it nor find it in the history.
+    // This order costs a duplicate delivery instead of a lost message, which
+    // is the at-least-once semantic `send` already claims.
     sys.journal.record(
         &me.id,
         &Event::Input {
             content: json!(blocks),
         },
     );
+    sys.note_consumed(&me.id, consumed);
     history.push(json!({"role": "user", "content": blocks}));
     true
 }
@@ -952,13 +971,13 @@ pub(crate) fn validate(schema: &Value, input: &Value) -> Result<(), String> {
                 return Err(format!("field '{field}' should be a {expected}"));
             }
         }
-        if let Some(allowed) = spec["enum"].as_array() {
-            if !allowed.contains(value) {
-                return Err(format!(
-                    "field '{field}' must be one of {}",
-                    Value::Array(allowed.clone())
-                ));
-            }
+        if let Some(allowed) = spec["enum"].as_array()
+            && !allowed.contains(value)
+        {
+            return Err(format!(
+                "field '{field}' must be one of {}",
+                Value::Array(allowed.clone())
+            ));
         }
     }
     Ok(())
@@ -1417,7 +1436,13 @@ and factor them into what you do next.
 and their body is only a preview; use the mailbox tool to list or page the stored original.
 - When you end a turn without calling a tool, you go idle until the next mailbox message wakes \
 you. Going idle is normal — end your turn when you have nothing left to do.
-- Message text is free-form. Be concise and information-dense.";
+- Message text is free-form. Be concise and exact: state the conclusion first, then only the \
+evidence needed to act on it. Prefer precise references — file:line, process ids, exact error \
+strings, counts you actually measured — over description and narration. Do not restate the \
+recipient's brief back to them, do not recap what you are about to say before saying it, and do \
+not pad with status you were not asked for. Every message you send costs the recipient a turn of \
+thinking and costs you the tokens to write it, so length is not free politeness — it is a charge \
+you levy on someone else.";
 
 /// The half of the preamble that only means anything to a process that can
 /// reach or create other processes. A process holding nothing but tools is not
@@ -1623,12 +1648,11 @@ fn process_identity(me: &Meta) -> String {
             .aliases
             .iter()
             .map(|alias| {
-                let answered_by = me
-                    .grants
-                    .send
-                    .permits(&alias.target)
-                    .then(|| format!(" Answered by {}.", alias.target))
-                    .unwrap_or_default();
+                let answered_by = if me.grants.send.permits(&alias.target) {
+                    format!(" Answered by {}.", alias.target)
+                } else {
+                    String::new()
+                };
                 format!(
                     "- await {}(args) — {}{} Arguments schema: {}",
                     alias.name, alias.description, answered_by, alias.input_schema

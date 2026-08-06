@@ -195,14 +195,20 @@ impl PathGrant {
     /// it's re-verified to sit under a granted root.
     pub fn resolve(&self, path: &str, creating: bool) -> Result<PathBuf, String> {
         let PathGrant::Under(roots) = self else {
-            return Err(format!("no filesystem access is granted (refused '{path}')"));
+            return Err(format!(
+                "no filesystem access is granted (refused '{path}')"
+            ));
         };
         let raw = Path::new(path);
         let canonical = if creating {
             let mut base = raw;
             let mut tail: Vec<std::ffi::OsString> = Vec::new();
             let existing = loop {
-                let probe = if base.as_os_str().is_empty() { Path::new(".") } else { base };
+                let probe = if base.as_os_str().is_empty() {
+                    Path::new(".")
+                } else {
+                    base
+                };
                 match probe.canonicalize() {
                     Ok(canon) => break canon,
                     Err(e) => match base.file_name() {
@@ -214,7 +220,9 @@ impl PathGrant {
                     },
                 }
             };
-            tail.into_iter().rev().fold(existing, |acc, name| acc.join(name))
+            tail.into_iter()
+                .rev()
+                .fold(existing, |acc, name| acc.join(name))
         } else {
             raw.canonicalize()
                 .map_err(|e| format!("cannot resolve '{path}': {e}"))?
@@ -373,7 +381,13 @@ impl Grants {
                 Grant::Ids(ids) => {
                     let mut named: Vec<String> = ids
                         .iter()
-                        .map(|id| if cap.targets_processes() { label(id) } else { id.clone() })
+                        .map(|id| {
+                            if cap.targets_processes() {
+                                label(id)
+                            } else {
+                                id.clone()
+                            }
+                        })
                         .collect();
                     named.sort();
                     format!("only {}", named.join(", "))
@@ -432,7 +446,11 @@ mod tests {
         assert!(widened.permits("proc-1"));
         assert_eq!(
             widened.ids().cloned(),
-            Some(HashSet::from(["proc-1".to_string(), "user".to_string(), "proc-12".to_string()]))
+            Some(HashSet::from([
+                "proc-1".to_string(),
+                "user".to_string(),
+                "proc-12".to_string()
+            ]))
         );
     }
 
@@ -479,7 +497,9 @@ mod tests {
         let grant = PathGrant::Under(vec![root.0.clone()]);
         // Neither "rlm-lab" nor "rlm-lab/notes" exists yet — the whole point
         // of Deno.mkdir(path, {recursive: true}).
-        let resolved = grant.resolve(root.0.join("rlm-lab/notes").to_str().unwrap(), true).unwrap();
+        let resolved = grant
+            .resolve(root.0.join("rlm-lab/notes").to_str().unwrap(), true)
+            .unwrap();
         assert_eq!(resolved, root.0.join("rlm-lab/notes"));
     }
 
@@ -494,6 +514,9 @@ mod tests {
         // canonicalizes it — the final containment check must still catch it.
         let target = allowed.join("../escaped/new-dir");
         let err = grant.resolve(target.to_str().unwrap(), true).unwrap_err();
-        assert!(err.contains("outside the directories"), "unexpected error: {err}");
+        assert!(
+            err.contains("outside the directories"),
+            "unexpected error: {err}"
+        );
     }
 }

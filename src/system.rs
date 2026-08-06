@@ -6,7 +6,7 @@
 //! allowlist of peers it may message. Permissions are resolved from symbolic
 //! names to process ids once the whole group's ids are known.
 
-use crate::api;
+use crate::api::{self, Confidence, Spend, Usage};
 use crate::durable::{Event, Journal, MailArtifactRecord, MailRecord, NoJournal, ProcessRecord};
 use crate::grants::{Capability, Grant, Grants, PathGrant};
 use crate::ui::{self, Tag};
@@ -240,8 +240,12 @@ pub struct ProcessSnapshot {
     pub status: Status,
     /// "script", or the resolved model/effort pair for an agent.
     pub runs: String,
-    /// Prompt tokens in this process's most recent turn.
+    /// Prompt tokens in this process's most recent turn — this process's
+    /// CURRENT context size, not any kind of peak.
     pub tokens: u64,
+    /// What this process has cost so far, with the token split behind it and
+    /// how much the price table can be trusted.
+    pub spend: crate::api::Spend,
 }
 
 /// Coherent system state for one dashboard frame.
@@ -249,7 +253,11 @@ pub struct ProcessSnapshot {
 pub struct SystemSnapshot {
     pub processes: Vec<ProcessSnapshot>,
     pub billable: u64,
+    /// Largest live context in the system. A whole-system maximum, so it says
+    /// nothing about any one process — for that, read `ProcessSnapshot::tokens`.
     pub peak_context: u64,
+    /// The run's total cost, including processes that have since stopped.
+    pub spend: crate::api::Spend,
     pub settled: bool,
 }
 
@@ -763,9 +771,13 @@ impl System {
         }
     }
 
-    /// Record that a process has folded everything up to `seq` into a turn.
-    /// Written alongside the turn itself, so the window in which a message
-    /// could be seen twice is one append rather than a whole turn.
+    /// Record that a process has folded everything up to `seq` into a turn, and
+    /// push the log to disk. Call it *after* recording that turn's `Input`,
+    /// never before: this flushes, so a cursor advance made durable ahead of the
+    /// message body it accounts for loses the message outright — `restore` reads
+    /// it as already consumed and never redelivers it. In this order a crash in
+    /// the window costs a duplicate delivery, which is the at-least-once
+    /// semantic `send` promises.
     pub fn note_consumed(&self, process: &str, seq: u64) {
         if seq > 0 {
             self.journal
@@ -967,22 +979,22 @@ impl System {
             }
         }
         for node in &nodes {
-            if let Some(model) = &node.model {
-                if crate::api::Tier::parse(model).is_none() {
-                    return Err(format!(
-                        "'{model}' is not a model tier. Processes are sized, not named — use \
-                         {}, or omit the field to inherit yours.",
-                        crate::api::Tier::NAMES.join(", ")
-                    ));
-                }
+            if let Some(model) = &node.model
+                && crate::api::Tier::parse(model).is_none()
+            {
+                return Err(format!(
+                    "'{model}' is not a model tier. Processes are sized, not named — use \
+                     {}, or omit the field to inherit yours.",
+                    crate::api::Tier::NAMES.join(", ")
+                ));
             }
-            if let Some(effort) = &node.effort {
-                if !EFFORT_LEVELS.contains(&effort.as_str()) {
-                    return Err(format!(
-                        "Unknown effort '{effort}'. Use one of: {}.",
-                        EFFORT_LEVELS.join(", ")
-                    ));
-                }
+            if let Some(effort) = &node.effort
+                && !EFFORT_LEVELS.contains(&effort.as_str())
+            {
+                return Err(format!(
+                    "Unknown effort '{effort}'. Use one of: {}.",
+                    EFFORT_LEVELS.join(", ")
+                ));
             }
         }
 
@@ -1150,7 +1162,7 @@ impl System {
             let stop = checked(
                 stop_req.or(stop_default),
                 &ceiling.stop,
-                &[self_id.clone()],
+                std::slice::from_ref(self_id),
                 "stopping",
                 "stop",
             )?;
@@ -1473,6 +1485,13 @@ impl System {
                 reply_to: mail.reply_to.clone(),
             }),
         );
+        // One write per message, which is exactly what the "recorded before
+        // delivery... at-least-once" comment above already assumes is
+        // happening. Without this, low-priority mail in particular can sit
+        // unflushed indefinitely: agent.rs moves it into the in-RAM
+        // `deferred` list without waking the process, so both the sender's
+        // and recipient's copies stay volatile for as long as it idles.
+        self.journal.flush(to);
 
         let from = match &mail.from_name {
             Some(name) => format!("{} {name}", mail.from),
@@ -1512,13 +1531,13 @@ impl System {
             ));
         };
         let model = tier.as_str();
-        if let Some(effort) = effort {
-            if !EFFORT_LEVELS.contains(&effort) {
-                return Err(format!(
-                    "'{effort}' is not an effort level; use one of {}.",
-                    EFFORT_LEVELS.join(", ")
-                ));
-            }
+        if let Some(effort) = effort
+            && !EFFORT_LEVELS.contains(&effort)
+        {
+            return Err(format!(
+                "'{effort}' is not an effort level; use one of {}.",
+                EFFORT_LEVELS.join(", ")
+            ));
         }
         let mut procs = self.procs.lock().unwrap();
         let Some(entry) = procs.iter_mut().find(|p| p.id == id) else {
@@ -1921,20 +1940,38 @@ impl System {
     }
 
     fn list_filtered(&self, view: Option<&HashSet<String>>) -> String {
-        let procs = self.procs.lock().unwrap();
-        let mut out = String::from("id       name           status   context  parent\n");
-        for p in procs
+        // Built from the same snapshot the dashboard renders, so /ps and the
+        // TUI can never disagree about what a process cost.
+        let snapshot = self.snapshot();
+        let mut out =
+            String::from("id       name           status   context  cache  cost      parent\n");
+        let mut caveat = false;
+        for p in snapshot
+            .processes
             .iter()
             .filter(|p| view.is_none_or(|v| v.contains(&p.id)))
         {
+            caveat |= p.spend.confidence != Confidence::Measured;
             out.push_str(&format!(
-                "{:<8} {:<14} {:<8} {:<8} {}\n",
+                "{:<8} {:<14} {:<8} {:<8} {:<6} {:<9} {}\n",
                 p.id,
                 p.name.as_deref().unwrap_or("-"),
-                p.status.lock().unwrap().as_str(),
-                format_tokens(p.context_tokens.load(Ordering::Relaxed)),
+                p.status.as_str(),
+                format_tokens(p.tokens),
+                cache_share(&p.spend.usage),
+                format_cost(&p.spend),
                 p.parent,
             ));
+        }
+        out.push_str(&format!(
+            "total {} ({} prices)\n",
+            format_cost(&snapshot.spend),
+            snapshot.spend.confidence.as_str()
+        ));
+        if caveat {
+            out.push_str(
+                "(~ priced from the baked-in table, ? no price for that model — see api.rs)\n",
+            );
         }
         if !self.api.compaction_enabled() {
             out.push_str("(compaction is off — contexts grow unbounded)\n");
@@ -2002,12 +2039,14 @@ impl System {
                 status,
                 runs: process.runs.clone(),
                 tokens,
+                spend: self.api.spend_for(&process.id),
             });
         }
         SystemSnapshot {
             processes,
             billable: self.api.billable_spent(),
             peak_context,
+            spend: self.api.spend_total(),
             settled,
         }
     }
@@ -2157,6 +2196,26 @@ fn format_tokens(n: u64) -> String {
     }
 }
 
+/// A cost for a text row, carrying its own caveat: `~` when the rates behind
+/// it came from the baked-in table, `?` when some model had no price at all
+/// and the figure is therefore incomplete. A bare figure means measured.
+fn format_cost(spend: &Spend) -> String {
+    let mark = match spend.confidence {
+        Confidence::Measured => "",
+        Confidence::Estimated => "~",
+        Confidence::Unknown => "?",
+    };
+    format!("{mark}${:.4}", spend.usd)
+}
+
+/// How much of a process's prompt tokens were cheap cache hits.
+fn cache_share(usage: &Usage) -> String {
+    match usage.prompt() {
+        0 => "-".into(),
+        prompt => format!("{}%", usage.cache_read * 100 / prompt),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2237,6 +2296,47 @@ mod tests {
 
         *sys.procs.lock().unwrap()[0].status.lock().unwrap() = Status::Stopped;
         assert!(sys.snapshot().settled);
+    }
+
+    /// The context figure is per process — the status line's old `peak_context`
+    /// is a whole-system maximum and says nothing about any one of them. Cost
+    /// lands on the process that spent it, and on the run total, and nowhere
+    /// else.
+    #[tokio::test]
+    async fn snapshot_context_and_cost_are_per_process() {
+        let sys = System::new(dummy_client());
+        let small = test_entry("proc-1", "user", Grant::Nobody);
+        small.context_tokens.store(1_000, Ordering::Relaxed);
+        let big = test_entry("proc-2", "proc-1", Grant::Nobody);
+        big.context_tokens.store(90_000, Ordering::Relaxed);
+        *sys.procs.lock().unwrap() = vec![small, big];
+
+        let snapshot = sys.snapshot();
+        assert_eq!(snapshot.processes[0].tokens, 1_000);
+        assert_eq!(snapshot.processes[1].tokens, 90_000);
+        assert_eq!(snapshot.peak_context, 90_000);
+        // Nothing has called a model yet, so every figure is a measured zero.
+        assert_eq!(snapshot.spend.usd, 0.0);
+        assert_eq!(snapshot.spend.confidence, Confidence::Measured);
+
+        sys.api.charge(
+            "proc-2",
+            "large",
+            &Usage {
+                uncached_input: 1_000,
+                cache_read: 20_000,
+                output: 100,
+                ..Usage::default()
+            },
+        );
+        let snapshot = sys.snapshot();
+        assert_eq!(snapshot.processes[0].spend.usd, 0.0);
+        assert!(snapshot.processes[1].spend.usd > 0.0);
+        assert_eq!(snapshot.spend.usd, snapshot.processes[1].spend.usd);
+        assert_eq!(snapshot.processes[1].spend.usage.cache_read, 20_000);
+        // Contexts are untouched by charging: the gauge is the last request's
+        // prompt, not a running total.
+        assert_eq!(snapshot.processes[1].tokens, 90_000);
     }
 
     fn test_entry(id: &str, parent: &str, stop: Grant) -> Entry {
@@ -2420,6 +2520,116 @@ mod tests {
         *sys.procs.lock().unwrap() = vec![coordinator, child, grandchild];
 
         assert!(sys.may(&coordinator_meta, Capability::Stop, "proc-3"));
+    }
+
+    fn journal_record(id: &str) -> ProcessRecord {
+        ProcessRecord {
+            id: id.into(),
+            name: None,
+            parent: "proc-1".into(),
+            persona: None,
+            instructions: "do the thing".into(),
+            inherited: None,
+            grants: crate::grants::Grants::unrestricted(),
+            aliases: Vec::new(),
+            model: "claude-opus-5".into(),
+            effort: None,
+            linked: true,
+            kind: Kind::Agent,
+            ordinal: 1,
+        }
+    }
+
+    fn temp_journal_root(name: &str) -> std::path::PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "bitty-system-{name}-{}-{nonce}",
+            std::process::id()
+        ))
+    }
+
+    /// The invariant edit (1) in agent.rs depends on: `flush` alone must push
+    /// a buffered Output to disk, with no trailing Spawned/Stopped event to
+    /// trigger `record`'s own auto-flush. Fails if that auto-flush special
+    /// case is ever relied on instead of an explicit flush after Output.
+    #[test]
+    fn an_output_is_durable_once_flushed_with_no_trailing_spawned_or_stopped() {
+        let root = temp_journal_root("output-durability");
+        let journal = crate::durable::FileJournal::new(&root).unwrap();
+        let id = "proc-2";
+        journal.record(id, &Event::Spawned(journal_record(id)));
+        journal.record(
+            id,
+            &Event::Output {
+                content: serde_json::json!([{"type": "text", "text": "hi"}]),
+            },
+        );
+        let path = root.join(format!("{id}.jsonl"));
+        let before = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !before.contains("\"Output\""),
+            "buffered Output must not already be on disk before an explicit flush"
+        );
+
+        journal.flush(id); // exactly the call agent.rs now makes right after recording Output
+        let after = std::fs::read_to_string(&path).unwrap();
+        let events: Vec<Event> = after
+            .lines()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect();
+        assert!(events.iter().any(|e| matches!(e, Event::Output { .. })));
+        assert!(!events.iter().any(|e| matches!(e, Event::Stopped { .. })));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, Event::Spawned(_)))
+                .count(),
+            1,
+            "durable with exactly the one Spawned already on disk, no Stopped at all"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// The invariant edits (2a)/(2b)/(3) depend on: recording a turn's Input
+    /// before calling `note_consumed` means its flush can never durably
+    /// advance the cursor without the message body it accounts for already
+    /// being in the same, about-to-be-flushed buffer. Fails if `note_consumed`
+    /// is ever called before the Input it accounts for is recorded.
+    #[tokio::test]
+    async fn consumed_is_never_durable_without_its_input_already_on_disk() {
+        let root = temp_journal_root("consumed-ordering");
+        let sys = System::new(dummy_client())
+            .with_journal(Arc::new(crate::durable::FileJournal::new(&root).unwrap()));
+        let id = "proc-2";
+        sys.journal.record(id, &Event::Spawned(journal_record(id)));
+
+        // Body first...
+        sys.journal.record(
+            id,
+            &Event::Input {
+                content: serde_json::json!([{"type": "text", "text": "mail body"}]),
+            },
+        );
+        let path = root.join(format!("{id}.jsonl"));
+        let before = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !before.contains("\"Input\""),
+            "the Input is still buffered, exactly like a crash landing right here"
+        );
+
+        // ...cursor second: note_consumed's flush now carries both, or neither.
+        sys.note_consumed(id, 1);
+        let after = std::fs::read_to_string(&path).unwrap();
+        let input_at = after.find("\"Input\"").expect("Input reached disk");
+        let consumed_at = after.find("\"Consumed\"").expect("Consumed reached disk");
+        assert!(
+            input_at < consumed_at,
+            "Input must precede Consumed in the log"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[tokio::test]
