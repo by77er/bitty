@@ -24,7 +24,7 @@ That turns out to enable systems that run indefinitely, not just tasks that fini
 - **Links:** a dying process signals its spawner (as mail, never a kill), OTP-style, so coordinators can re-plan or respawn.
 - **Topologies:** `spawn_topology` wires a whole group at once, with per-node roles, models, and `can_send_to` allowlists.
 - **Tool aliases:** spawns can define typed tools that route to another actor; arguments are schema-validated before delivery, and an alias may only target a process the holder could already message — a tool is never a way around the capability model.
-- **Cost controls:** per-process model and effort — including mixing providers, so a Claude coordinator can run ChatGPT workers or vice versa — plus low-priority mail that never wakes anyone, a shared prompt-cache prefix across the whole system, and server-side compaction per process.
+- **Cost controls:** per-process model and effort — including mixing providers, so a Claude coordinator can run ChatGPT workers or vice versa — plus low-priority mail that never wakes anyone, artifact-backed long mail that is paged instead of injected wholesale, a shared prompt-cache prefix across the whole system, and server-side compaction per process.
 
 See the source for the full details — `src/agent.rs` (the loop), `src/grants.rs` (capabilities), `src/actions.rs` (the shared policy layer).
 
@@ -36,6 +36,7 @@ export ANTHROPIC_API_KEY=sk-ant-...
 
 cargo run -- "Research X with two parallel workers and summarize."
 cargo run -- --role "You coordinate a writing pipeline." "Draft a page on actor systems."
+cargo run -- --tui "Refactor the parser and keep the tests green."
 ```
 
 The console is wired into the actor system while it runs:
@@ -47,6 +48,25 @@ The console is wired into the actor system while it runs:
 | `/ps`, `/graph` | process list / supervision tree |
 | `/stop proc-2 [--cascade]` | stop processes |
 | `/quit` | exit |
+
+Pass `--tui` for a Codex-style interactive view: a chat-first transcript and
+rounded composer, a compact model/context status line, and a slim selectable
+process tree. Up/Down selects a process and filters its activity, Esc clears
+the filter, the mouse wheel (or Page Up/Down) scrolls the transcript, End jumps
+back to the latest line, and `t` toggles low-level trace lines when the composer
+is empty (`Ctrl-T` works at any time). The cat in the header reflects working,
+idle, and recent-warning state. Incoming worker and user messages are shown in
+the recipient's process view, and adjacent streamed lines are grouped into a
+single speaker turn. Plain mode remains the default, including for automation
+that consumes stdout. In TUI mode, embedded `console.log` calls and stray
+process stdout/stderr are routed into the transcript instead of writing over
+the screen. Run `bitty --help` for the complete option and key list.
+
+Agent-bound messages over roughly 8,000 characters are stored outside the
+recipient's model context. The agent sees a short preview plus a private
+`artifact_id` and can use its `mailbox` tool to list, page, or discard the full
+body. Script processes continue to receive complete bodies directly, since
+their mail does not consume model context.
 
 Filesystem access starts empty and is granted from the CLI (`--allow-read ./repo --allow-write ./repo`); the root process can narrow grants per child. Network and subprocess execution are not implemented.
 

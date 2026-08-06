@@ -72,7 +72,12 @@ interface, not the enforcement.
     recipient at send time, so silent re-execution means duplicate messages and
     workers. Prime-agent's `<worker_interrupted>` doctrine.
 12. **Mail hardening.** Body cap with truncation notice; per-(sender, recipient)
-    flood limit (prime-agent: token bucket + queue caps).
+    flood limit (prime-agent: token bucket + queue caps). Agent-bound bodies
+    above the inline threshold are durable recipient-scoped artifacts: the
+    conversation gets a preview and handle, and the always-available `mailbox`
+    tool lists, pages, or discards the original. Call replies use the same
+    mechanism, and the prompt explicitly warns that `in_reply_to` and ordinary
+    mail are independent channels so an answer should only use one.
 13. **Gates and budgets for `--once`.** `--gate CMD` runs at quiesce; failure
     mails root bounded output and the run continues, up to a max-attempt cap,
     with skip-if-unchanged (write-root snapshot taken after the failing run).
@@ -80,7 +85,7 @@ interface, not the enforcement.
     cache reads (or long verifier loops exhaust budgets re-reading their own
     context).
 
-## Next up: the TUI (planned, plumbing started)
+## TUI (implemented)
 
 `bitty --tui` takes over the terminal with a live view of the system — a
 cat mascot for state at a glance, curated panels so you see what's going on
@@ -93,38 +98,45 @@ commodity crate).
 - **Opt-in flag, plain console stays the default.** The mock suite and
   `--once` scripts grep stdout lines; the TUI must not replace that. `--tui`
   enters the alternate screen; everything else is unchanged.
-- **The console line stream is the source of truth.** `ui.rs`'s broadcast
-  tap (already in the working tree: `ui::Event { kind, who, text }` +
-  `ui::tap()`; wire `feed(kind, label, text)` into
-  `say/trace/mail_to_user/warn/system` next) feeds the TUI the same lines
-  the plain console prints, structured and un-ANSI'd. A lagging subscriber
+- **The structured event stream is the source of truth.** `ui.rs`'s broadcast
+  tap (`ui::Event { kind, who, process, text }` + `ui::tap()`) is wired into
+  `say/trace/mail_to_user/warn/system` and feeds the TUI the same lines
+  the plain console prints, structured and un-ANSI'd. Successful deliveries
+  additionally emit a feed-only `incoming` event owned by the recipient, so
+  user and worker mail appears in that process's view without duplicating
+  plain-mode output. Adjacent streamed `say` lines from one process coalesce
+  into one visual turn instead of repeating its label. A lagging subscriber
   skips rather than blocking printing. In TUI mode, `emit` to stdout is
-  suppressed (the tap is the display).
-- **`System::snapshot()`** (new, in system.rs): per-process
+  suppressed (the tap is the display); direct stdout/stderr is quarantined
+  into the transcript, and terminal control bytes are rendered inert.
+- **`System::snapshot()`** provides per-process
   `{id, name, parent, status, runs, tokens}` plus `billable` and a settled
   flag, computed under one procs lock (don't call `all_settled()` inside —
   double lock).
 - **Layout.**
-  - Header: ASCII cat + `bitty` + session name + one-word system state +
-    billable tokens + peak context.
-  - Left: process tree from the snapshot (status glyph ●/○/■, id, name,
-    model/effort, ctx tokens), arrow-key selectable.
-  - Main: activity feed from the tap, colored by kind. `trace` lines hidden
+  - Compact header: animated ASCII cat + `bitty` + session name + one-word
+    system state.
+  - Slim left rail: process tree from the snapshot (status glyph ●/○/■, id,
+    name, model/effort, ctx tokens), arrow-key selectable.
+  - Dominant main transcript: activity from the tap, colored by kind and
+    presented as chat rather than a monitoring panel. `trace` lines are hidden
     by default behind the `t` toggle — that's the not-overwhelming part.
-    Selecting a process filters the feed to it; Esc clears.
-  - Bottom: an input line wired to the same console dispatch as plain mode
-    (plain text → root, `@proc-N msg`, `/ps` `/graph` `/model` `/stop`
-    `/quit`). Refactor main.rs's console match into a function both modes
-    call, so the two consoles cannot drift.
+    Selecting a process filters the feed to it; Esc clears. Mouse-wheel and
+    Page Up/Down input scroll the transcript buffer rather than moving the
+    process selection; End returns to the latest activity.
+  - Bottom: a rounded composer and compact model/context/billable status line,
+    wired to the same console dispatch as plain mode (plain text → root,
+    `@proc-N msg`, `/ps` `/graph` `/model` `/stop` `/quit`). The shared
+    dispatcher keeps the two consoles from drifting.
 - **The cat** (2–3 ASCII frames, mood from snapshot + recent events):
   working → `(^･ω･^)` with a tail-wag frame alternation; all idle →
   `(-ω-)ᶻᶻ`; a warn in the last 5s → `(⊙ω⊙)!`. A status indicator that
   happens to be a cat, not a toy.
 - **Redraw** on a 250ms tick + on every tap event (debounced); snapshot
   refetched on the tick.
-- **Testing:** the TUI itself is exercised manually (alternate-screen UIs
-  don't suite-test well); what must not regress is plain mode — the full
-  mock suite runs unchanged, and `ui::tap` stays inert unless subscribed.
+- **Testing:** pure layout/filter/wrapping behavior uses a ratatui test backend,
+  alternate-screen entry/restore has a pseudo-terminal smoke test, and the
+  plain-mode mock suite runs unchanged. `ui::tap` stays inert unless subscribed.
 
 ## C. Later (not in this pass)
 
