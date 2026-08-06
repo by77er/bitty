@@ -52,6 +52,8 @@ pub fn send(
                 from_name: me.name.clone(),
                 body: body.to_string(),
                 priority,
+                artifact_id: None,
+                artifact_chars: None,
                 reply_to: None,
                 seq: 0,
             },

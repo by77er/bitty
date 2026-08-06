@@ -7,7 +7,7 @@
 //! names to process ids once the whole group's ids are known.
 
 use crate::api;
-use crate::durable::{Event, Journal, MailRecord, NoJournal, ProcessRecord};
+use crate::durable::{Event, Journal, MailArtifactRecord, MailRecord, NoJournal, ProcessRecord};
 use crate::grants::{Capability, Grant, Grants, PathGrant};
 use crate::ui::{self, Tag};
 use std::collections::{HashMap, HashSet};
@@ -58,6 +58,10 @@ pub struct Mail {
     pub from_name: Option<String>,
     pub body: String,
     pub priority: Priority,
+    /// Long bodies are stored out of context; this identifies the recipient's
+    /// durable copy and states its original character count.
+    pub artifact_id: Option<String>,
+    pub artifact_chars: Option<usize>,
     /// Set when the sender is blocked waiting for an answer. Whatever the
     /// recipient produces is routed back to that specific waiting caller.
     pub reply_to: Option<String>,
@@ -71,6 +75,8 @@ impl Mail {
             from_name: None,
             body,
             priority: Priority::High,
+            artifact_id: None,
+            artifact_chars: None,
             reply_to: None,
             seq: 0,
         }
@@ -82,7 +88,13 @@ impl Mail {
             from: record.from,
             from_name: record.from_name,
             body: record.body,
-            priority: if record.low_priority { Priority::Low } else { Priority::High },
+            priority: if record.low_priority {
+                Priority::Low
+            } else {
+                Priority::High
+            },
+            artifact_id: record.artifact_id,
+            artifact_chars: record.artifact_chars,
             reply_to: record.reply_to,
         }
     }
@@ -210,11 +222,35 @@ impl Default for NodeSpec {
     }
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Status {
     Running,
     Idle,
     Stopped,
+}
+
+/// One process as seen by the human dashboard. This is deliberately a value
+/// snapshot rather than a set of shared cells: rendering never holds registry
+/// or process locks.
+#[derive(Clone, Debug)]
+pub struct ProcessSnapshot {
+    pub id: String,
+    pub name: Option<String>,
+    pub parent: String,
+    pub status: Status,
+    /// "script", or the resolved model/effort pair for an agent.
+    pub runs: String,
+    /// Prompt tokens in this process's most recent turn.
+    pub tokens: u64,
+}
+
+/// Coherent system state for one dashboard frame.
+#[derive(Clone, Debug)]
+pub struct SystemSnapshot {
+    pub processes: Vec<ProcessSnapshot>,
+    pub billable: u64,
+    pub peak_context: u64,
+    pub settled: bool,
 }
 
 impl Status {
@@ -252,6 +288,9 @@ struct Entry {
     control: Mutex<Option<UnboundedSender<Control>>>,
     /// Next position in this process's mailbox log.
     seq: AtomicU64,
+    /// Agent mail may be paged to avoid context blow-ups. Scripts consume
+    /// bytes directly and therefore keep receiving complete bodies.
+    artifact_mail: bool,
 }
 
 /// Everything a process knows about itself.
@@ -365,6 +404,9 @@ pub struct System {
     /// In-flight synchronous calls, keyed by correlation id.
     pending: Mutex<HashMap<String, PendingCall>>,
     calls: AtomicU64,
+    /// Live cache of long mail. Durable journals mirror these records; the
+    /// cache keeps no-journal and current-session reads equally cheap.
+    mail_artifacts: Mutex<HashMap<String, MailArtifactRecord>>,
     /// Recent send times per (sender, recipient), for the flood limit.
     flood: Mutex<Flood>,
     /// Where each process's life is recorded, so it can be brought back.
@@ -374,10 +416,15 @@ pub struct System {
 /// The longest message one process may put in another's mailbox. Everything
 /// past the cap is truncated with a note: a mailbox is for coordination, and
 /// a payload this size belongs in a file or a session value, delivered by
-/// reference. The cap also bounds what lands verbatim in the recipient's
-/// context — an unbounded body is an unbounded context bill the *recipient*
-/// pays.
+/// reference. Agent recipients additionally page bodies above
+/// `INLINE_MAIL_CHARS`, so the bounded complete copy does not land verbatim in
+/// their context.
 pub const MAX_MAIL_CHARS: usize = 32_000;
+/// Bodies above this size are replaced in an agent's prompt by a preview and
+/// a recipient-scoped handle. This mirrors `run_script`'s large-result limit.
+pub const INLINE_MAIL_CHARS: usize = 8_000;
+const MAIL_PREVIEW_CHARS: usize = 2_000;
+const MAIL_PAGE_CHARS: usize = 8_000;
 
 /// Per-pair flood limit: this many messages in the window, then sends fail
 /// until the window drains. Prime-agent uses a comparable token bucket for
@@ -397,7 +444,10 @@ impl Flood {
     fn allow(&mut self, from: &str, to: &str, now: std::time::Instant) -> bool {
         let key = (from.to_string(), to.to_string());
         let window = self.recent.entry(key).or_default();
-        while window.front().is_some_and(|t| now.duration_since(*t) > FLOOD_WINDOW) {
+        while window
+            .front()
+            .is_some_and(|t| now.duration_since(*t) > FLOOD_WINDOW)
+        {
             window.pop_front();
         }
         if window.len() >= FLOOD_LIMIT {
@@ -423,6 +473,15 @@ fn cap_body(body: String) -> String {
     )
 }
 
+fn artifact_preview(body: &str, id: &str, chars: usize) -> String {
+    let preview: String = body.chars().take(MAIL_PREVIEW_CHARS).collect();
+    format!(
+        "{preview}\n\n[long message stored as mailbox artifact {id}: {chars} characters. Use the \
+         mailbox tool with action=read and id={id:?} to page it without loading all of it into \
+         context.]"
+    )
+}
+
 impl System {
     pub fn new(api: api::Client) -> Self {
         System {
@@ -436,6 +495,7 @@ impl System {
             switched: Mutex::new(HashSet::new()),
             pending: Mutex::new(HashMap::new()),
             calls: AtomicU64::new(0),
+            mail_artifacts: Mutex::new(HashMap::new()),
             journal: Arc::new(NoJournal),
         }
     }
@@ -443,6 +503,169 @@ impl System {
     pub fn with_journal(mut self, journal: Arc<dyn Journal>) -> Self {
         self.journal = journal;
         self
+    }
+
+    fn remember_mail_artifact(&self, artifact: MailArtifactRecord) {
+        self.journal.store_mail_artifact(&artifact);
+        self.mail_artifacts
+            .lock()
+            .unwrap()
+            .insert(artifact.id.clone(), artifact);
+    }
+
+    fn store_long_mail(
+        &self,
+        recipient: &str,
+        from: &str,
+        id: String,
+        body: &str,
+    ) -> Option<(String, usize, String)> {
+        let chars = body.chars().count();
+        if chars <= INLINE_MAIL_CHARS {
+            return None;
+        }
+        self.remember_mail_artifact(MailArtifactRecord {
+            id: id.clone(),
+            recipient: recipient.to_string(),
+            from: from.to_string(),
+            chars,
+            body: body.to_string(),
+        });
+        Some((id.clone(), chars, artifact_preview(body, &id, chars)))
+    }
+
+    /// Call ids restart with the harness, while their artifacts outlive it.
+    /// Preserve an older handle rather than silently changing what it points
+    /// at when a post-resume call reuses the same correlation id.
+    fn unused_mail_artifact_id(&self, recipient: &str, base: String) -> String {
+        if self.mail_artifact(recipient, &base).is_none() {
+            return base;
+        }
+        for suffix in 2u64.. {
+            let candidate = format!("{base}-{suffix}");
+            if self.mail_artifact(recipient, &candidate).is_none() {
+                return candidate;
+            }
+        }
+        unreachable!("an unbounded artifact suffix search must find a free id")
+    }
+
+    fn uses_artifact_mail(&self, process: &str) -> bool {
+        self.procs
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|entry| entry.id == process)
+            .is_some_and(|entry| entry.artifact_mail)
+    }
+
+    fn restore_mail(&self, recipient: &str, record: MailRecord, artifact_mail: bool) -> Mail {
+        let mut mail = Mail::from_record(record);
+        if artifact_mail {
+            let id = mail
+                .artifact_id
+                .clone()
+                .unwrap_or_else(|| format!("mail-{recipient}-{}", mail.seq));
+            if let Some((id, chars, preview)) =
+                self.store_long_mail(recipient, &mail.from, id, &mail.body)
+            {
+                mail.body = preview;
+                mail.artifact_id = Some(id);
+                mail.artifact_chars = Some(chars);
+            } else {
+                mail.artifact_id = None;
+                mail.artifact_chars = None;
+            }
+        }
+        mail
+    }
+
+    fn mail_artifact(&self, recipient: &str, id: &str) -> Option<MailArtifactRecord> {
+        if let Some(artifact) = self.mail_artifacts.lock().unwrap().get(id).cloned() {
+            return (artifact.recipient == recipient).then_some(artifact);
+        }
+        let artifact = self.journal.read_mail_artifact(recipient, id)?;
+        self.mail_artifacts
+            .lock()
+            .unwrap()
+            .insert(id.to_string(), artifact.clone());
+        Some(artifact)
+    }
+
+    /// Metadata only: listing a mailbox must not itself pull every long body
+    /// into the model's context.
+    pub fn list_mail_artifacts(&self, recipient: &str) -> String {
+        let mut artifacts: HashMap<String, MailArtifactRecord> = self
+            .journal
+            .list_mail_artifacts(recipient)
+            .into_iter()
+            .map(|artifact| (artifact.id.clone(), artifact))
+            .collect();
+        for artifact in self.mail_artifacts.lock().unwrap().values() {
+            if artifact.recipient == recipient {
+                artifacts.insert(artifact.id.clone(), artifact.clone());
+            }
+        }
+        let mut artifacts: Vec<MailArtifactRecord> = artifacts.into_values().collect();
+        artifacts.sort_by(|left, right| left.id.cmp(&right.id));
+        if artifacts.is_empty() {
+            return "No stored mailbox artifacts.".into();
+        }
+        artifacts
+            .into_iter()
+            .map(|artifact| {
+                format!(
+                    "{} · {} chars · from {}",
+                    artifact.id, artifact.chars, artifact.from
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    pub fn read_mail_artifact(
+        &self,
+        recipient: &str,
+        id: &str,
+        offset: usize,
+        limit: usize,
+    ) -> Result<String, String> {
+        let Some(artifact) = self.mail_artifact(recipient, id) else {
+            return Err(format!(
+                "No mailbox artifact '{id}' belongs to {recipient}."
+            ));
+        };
+        let offset = offset.min(artifact.chars);
+        let limit = limit.clamp(1, MAIL_PAGE_CHARS);
+        let page: String = artifact.body.chars().skip(offset).take(limit).collect();
+        let end = offset + page.chars().count();
+        Ok(format!(
+            "mailbox artifact {id} · from {} · characters {offset}..{end} of {}\n{page}",
+            artifact.from, artifact.chars
+        ))
+    }
+
+    pub fn discard_mail_artifact(&self, recipient: &str, id: &str) -> Result<String, String> {
+        let removed_memory = {
+            let mut artifacts = self.mail_artifacts.lock().unwrap();
+            if artifacts
+                .get(id)
+                .is_some_and(|artifact| artifact.recipient == recipient)
+            {
+                artifacts.remove(id);
+                true
+            } else {
+                false
+            }
+        };
+        let removed_disk = self.journal.discard_mail_artifact(recipient, id);
+        if removed_memory || removed_disk {
+            Ok(format!("Discarded mailbox artifact {id}."))
+        } else {
+            Err(format!(
+                "No mailbox artifact '{id}' belongs to {recipient}."
+            ))
+        }
     }
 
     /// Resume ids above everything already used, so a restored process never
@@ -460,16 +683,17 @@ impl System {
         record: ProcessRecord,
         history: Vec<serde_json::Value>,
         pending: Vec<MailRecord>,
+        mail_cursor: u64,
     ) {
         let (sender, receiver) = mpsc::unbounded_channel::<Mail>();
         let (control_tx, control_rx) = mpsc::unbounded_channel::<Control>();
         let status = Arc::new(Mutex::new(Status::Running));
         let context_tokens = Arc::new(AtomicU64::new(0));
+        let artifact_mail = matches!(&record.kind, Kind::Agent);
         // Everything the log says was never consumed is owed to this process,
         // in the order it originally arrived.
-        let highest_seq = pending.last().map(|m| m.seq).unwrap_or(0);
         for mail in pending {
-            let _ = sender.send(Mail::from_record(mail));
+            let _ = sender.send(self.restore_mail(&record.id, mail, artifact_mail));
         }
         let label = match &record.name {
             Some(name) => format!("{} {name}", record.id),
@@ -495,7 +719,8 @@ impl System {
                 Kind::Script(_) => Some(control_tx),
                 Kind::Agent => None,
             }),
-            seq: AtomicU64::new(highest_seq),
+            seq: AtomicU64::new(mail_cursor),
+            artifact_mail,
         });
 
         let meta = Meta {
@@ -543,7 +768,8 @@ impl System {
     /// could be seen twice is one append rather than a whole turn.
     pub fn note_consumed(&self, process: &str, seq: u64) {
         if seq > 0 {
-            self.journal.record(process, &Event::Consumed { through: seq });
+            self.journal
+                .record(process, &Event::Consumed { through: seq });
         }
         // The turn is the durability boundary: everything buffered since the
         // last one lands in a single write before the process acts on it.
@@ -560,7 +786,10 @@ impl System {
         &self,
         caller: &str,
         target: &str,
-    ) -> (String, tokio::sync::oneshot::Receiver<Result<String, String>>) {
+    ) -> (
+        String,
+        tokio::sync::oneshot::Receiver<Result<String, String>>,
+    ) {
         let id = format!("call-{}", self.calls.fetch_add(1, Ordering::Relaxed) + 1);
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.pending.lock().unwrap().insert(
@@ -579,6 +808,29 @@ impl System {
     /// dropped rather than treated as an error.
     pub fn resolve_call(&self, id: &str, value: Result<String, String>) {
         if let Some(pending) = self.pending.lock().unwrap().remove(id) {
+            let value = match value {
+                Ok(body) if self.uses_artifact_mail(&pending.caller) => {
+                    let artifact_id = self.unused_mail_artifact_id(
+                        &pending.caller,
+                        format!("mail-{}-{id}", pending.caller),
+                    );
+                    let shown = self
+                        .store_long_mail(&pending.caller, &pending.target, artifact_id, &body)
+                        .map(|(_, _, preview)| preview)
+                        .unwrap_or(body);
+                    if pending.caller != pending.target {
+                        ui::arrival(&pending.caller, &pending.target, &shown);
+                    }
+                    Ok(shown)
+                }
+                Ok(body) => {
+                    if pending.caller != pending.target {
+                        ui::arrival(&pending.caller, &pending.target, &body);
+                    }
+                    Ok(body)
+                }
+                Err(error) => Err(error),
+            };
             let _ = pending.tx.send(value);
         }
     }
@@ -734,8 +986,6 @@ impl System {
             }
         }
 
-
-
         // Phase 1 — reserve ids so nodes can reference each other by name.
         // Reserved, not consumed: later phases can still reject the spawn, and
         // a refused spawn must not leave a hole in the sequence. The lock makes
@@ -801,7 +1051,8 @@ impl System {
                         Ok(self_id.clone())
                     }
                     peer => {
-                        if let Some((_, id)) = by_name.iter().find(|(name, _)| *name == Some(peer)) {
+                        if let Some((_, id)) = by_name.iter().find(|(name, _)| *name == Some(peer))
+                        {
                             labels.insert(id.to_string(), peer.to_string());
                             return Ok(id.to_string());
                         }
@@ -955,20 +1206,46 @@ impl System {
             let mut verbatim = |name: &String| Ok(name.clone());
             let run = checked(
                 as_grant(&node.wants.run, &mut verbatim)?,
-                &ceiling.run, &[], "running", "run")?;
+                &ceiling.run,
+                &[],
+                "running",
+                "run",
+            )?;
             let net = checked(
                 as_grant(&node.wants.net, &mut verbatim)?,
-                &ceiling.net, &[], "network access to", "reach")?;
+                &ceiling.net,
+                &[],
+                "network access to",
+                "reach",
+            )?;
             let env = checked(
                 as_grant(&node.wants.env, &mut verbatim)?,
-                &ceiling.env, &[], "environment access to", "read")?;
+                &ceiling.env,
+                &[],
+                "environment access to",
+                "read",
+            )?;
             let sys = checked(
                 as_grant(&node.wants.sys, &mut verbatim)?,
-                &ceiling.sys, &[], "system info", "query")?;
+                &ceiling.sys,
+                &[],
+                "system info",
+                "query",
+            )?;
             let read = paths(&node.wants.read, &ceiling.read, "read access")?;
             let write = paths(&node.wants.write, &ceiling.write, "write access")?;
 
-            let grants = Grants { send, stop, spawn, run, net, env, sys, read, write };
+            let grants = Grants {
+                send,
+                stop,
+                spawn,
+                run,
+                net,
+                env,
+                sys,
+                read,
+                write,
+            };
 
             // An alias *is* a grant: authority to reach exactly one process
             // with exactly one shape of argument, and nothing else. So it is
@@ -996,14 +1273,19 @@ impl System {
                     ..alias.clone()
                 });
             }
-            labels.entry(parent.to_string()).or_insert_with(|| "your spawner".into());
-            labels.entry(self_id.clone()).or_insert_with(|| "yourself".into());
+            labels
+                .entry(parent.to_string())
+                .or_insert_with(|| "your spawner".into());
+            labels
+                .entry(self_id.clone())
+                .or_insert_with(|| "yourself".into());
             resolved.push((grants, labels, aliases));
         }
 
         // Phase 3 — nothing can refuse the spawn from here, so the ids are
         // finally consumed.
-        self.counter.store(base + nodes.len() as u64, Ordering::Relaxed);
+        self.counter
+            .store(base + nodes.len() as u64, Ordering::Relaxed);
         let mut launched = Vec::with_capacity(nodes.len());
         for (((node, id), n), (grants, labels, aliases)) in
             nodes.into_iter().zip(ids).zip(ordinals).zip(resolved)
@@ -1018,7 +1300,9 @@ impl System {
             let context_tokens = Arc::new(AtomicU64::new(0));
             // One cell, held by the registry and the running process alike.
             let spawn_model = Arc::new(Mutex::new(
-                node.model.clone().unwrap_or_else(|| inherited_model.clone()),
+                node.model
+                    .clone()
+                    .unwrap_or_else(|| inherited_model.clone()),
             ));
             let effort = Some(
                 node.effort
@@ -1044,10 +1328,10 @@ impl System {
                     Kind::Agent => None,
                 }),
                 seq: AtomicU64::new(0),
-                runs: node.kind.label(
-                    node.model.as_deref().unwrap_or(&inherited_model),
-                    &effort,
-                ),
+                runs: node
+                    .kind
+                    .label(node.model.as_deref().unwrap_or(&inherited_model), &effort),
+                artifact_mail: matches!(&node.kind, Kind::Agent),
             });
 
             if self.journal.enabled() {
@@ -1062,7 +1346,10 @@ impl System {
                         inherited: node.inherited.clone(),
                         grants: grants.clone(),
                         aliases: aliases.clone(),
-                        model: node.model.clone().unwrap_or_else(|| inherited_model.clone()),
+                        model: node
+                            .model
+                            .clone()
+                            .unwrap_or_else(|| inherited_model.clone()),
                         effort: effort.clone(),
                         linked: node.link,
                         kind: node.kind.clone(),
@@ -1084,6 +1371,13 @@ impl System {
                 model: spawn_model.clone(),
                 effort: spawn_effort.clone(),
             };
+
+            // Initial instructions are a process's first inbound message even
+            // though they are passed directly to its runner rather than
+            // queued. Put them on the same observable delivery stream.
+            if !node.instructions.trim().is_empty() {
+                ui::arrival(&id, parent, &node.instructions);
+            }
 
             let handle = match node.kind.clone() {
                 Kind::Agent => self.rt.spawn(crate::agent::run(
@@ -1140,37 +1434,60 @@ impl System {
             mail.body = cap_body(mail.body);
         }
         let procs = self.procs.lock().unwrap();
-        match procs.iter().find(|p| p.id == to) {
-            Some(entry) => {
-                if *entry.status.lock().unwrap() == Status::Stopped {
-                    return Err(format!("Process {to} has been stopped; it cannot receive mail."));
-                }
-                // Recorded before delivery, so a crash between the two costs a
-                // duplicate rather than a lost message — at-least-once, which
-                // is the semantic a cursor-based queue can actually honor.
-                mail.seq = entry.seq.fetch_add(1, Ordering::Relaxed) + 1;
-                self.journal.record(
-                    to,
-                    &Event::Enqueued(MailRecord {
-                        seq: mail.seq,
-                        from: mail.from.clone(),
-                        from_name: mail.from_name.clone(),
-                        body: mail.body.clone(),
-                        low_priority: mail.priority == Priority::Low,
-                        reply_to: mail.reply_to.clone(),
-                    }),
-                );
-                match entry.sender.lock().unwrap().as_ref() {
-                    Some(sender) => match sender.send(mail) {
-                        Ok(()) => Ok(format!("Delivered to {to}'s mailbox.")),
-                        Err(_) => Err(format!("Process {to} is no longer running.")),
-                    },
-                    None => Err(format!("Process {to} is no longer running.")),
-                }
-            }
-            None => Err(format!(
+        let Some(entry) = procs.iter().find(|process| process.id == to) else {
+            return Err(format!(
                 "No process with id '{to}'. Use list_processes to see valid ids."
-            )),
+            ));
+        };
+        if *entry.status.lock().unwrap() == Status::Stopped {
+            return Err(format!(
+                "Process {to} has been stopped; it cannot receive mail."
+            ));
+        }
+
+        // Recorded before delivery, so a crash between the two costs a
+        // duplicate rather than a lost message — at-least-once, which is the
+        // semantic a cursor-based queue can actually honor.
+        mail.seq = entry.seq.fetch_add(1, Ordering::Relaxed) + 1;
+        let complete_body = mail.body.clone();
+        if entry.artifact_mail {
+            let artifact_id = format!("mail-{to}-{}", mail.seq);
+            if let Some((id, chars, preview)) =
+                self.store_long_mail(to, &mail.from, artifact_id, &complete_body)
+            {
+                mail.body = preview;
+                mail.artifact_id = Some(id);
+                mail.artifact_chars = Some(chars);
+            }
+        }
+        self.journal.record(
+            to,
+            &Event::Enqueued(MailRecord {
+                seq: mail.seq,
+                from: mail.from.clone(),
+                from_name: mail.from_name.clone(),
+                artifact_id: mail.artifact_id.clone(),
+                artifact_chars: mail.artifact_chars,
+                body: complete_body,
+                low_priority: mail.priority == Priority::Low,
+                reply_to: mail.reply_to.clone(),
+            }),
+        );
+
+        let from = match &mail.from_name {
+            Some(name) => format!("{} {name}", mail.from),
+            None => mail.from.clone(),
+        };
+        let shown = mail.body.clone();
+        match entry.sender.lock().unwrap().as_ref() {
+            Some(sender) => match sender.send(mail) {
+                Ok(()) => {
+                    ui::arrival(to, &from, &shown);
+                    Ok(format!("Delivered to {to}'s mailbox."))
+                }
+                Err(_) => Err(format!("Process {to} is no longer running.")),
+            },
+            None => Err(format!("Process {to} is no longer running.")),
         }
     }
 
@@ -1185,12 +1502,7 @@ impl System {
     /// Switch a process's model and effort while it runs. Takes effect on its
     /// next turn, because the loop reads both per turn rather than caching
     /// them at spawn.
-    pub fn set_model(
-        &self,
-        id: &str,
-        model: &str,
-        effort: Option<&str>,
-    ) -> Result<String, String> {
+    pub fn set_model(&self, id: &str, model: &str, effort: Option<&str>) -> Result<String, String> {
         // Same validation as spawn, so a typo fails here rather than as a 400
         // on the process's next turn.
         let Some(tier) = crate::api::Tier::parse(model) else {
@@ -1249,7 +1561,9 @@ impl System {
             "{id}: {was} → {model}{}. Takes effect on its next turn; its prompt cache starts \
              cold, and prior thinking blocks are dropped because their signatures belong to the \
              old model.",
-            effort.map(|e| format!(" at {e} effort")).unwrap_or_default()
+            effort
+                .map(|e| format!(" at {e} effort"))
+                .unwrap_or_default()
         ))
     }
 
@@ -1326,7 +1640,10 @@ impl System {
                 ui::system(&format!(
                     "■ stopped {}{}",
                     p.id,
-                    p.name.as_ref().map(|n| format!(" ({n})")).unwrap_or_default()
+                    p.name
+                        .as_ref()
+                        .map(|n| format!(" ({n})"))
+                        .unwrap_or_default()
                 ));
                 self.journal.record(
                     &p.id,
@@ -1581,8 +1898,9 @@ impl System {
                 .iter()
                 .filter(|p| *p.status.lock().unwrap() == Status::Idle)
                 .count();
+            let noun = if waiting == 1 { "process" } else { "processes" };
             ui::system(&format!(
-                "— system idle · {waiting} process(es) waiting for a message"
+                "— system idle · {waiting} {noun} waiting for a message"
             ));
         }
     }
@@ -1605,7 +1923,10 @@ impl System {
     fn list_filtered(&self, view: Option<&HashSet<String>>) -> String {
         let procs = self.procs.lock().unwrap();
         let mut out = String::from("id       name           status   context  parent\n");
-        for p in procs.iter().filter(|p| view.is_none_or(|v| v.contains(&p.id))) {
+        for p in procs
+            .iter()
+            .filter(|p| view.is_none_or(|v| v.contains(&p.id)))
+        {
             out.push_str(&format!(
                 "{:<8} {:<14} {:<8} {:<8} {}\n",
                 p.id,
@@ -1643,7 +1964,11 @@ impl System {
             walk(&procs, root, "", i + 1 == roots.len(), true, &mut rows);
         }
 
-        let width = rows.iter().map(|r| r.tree.chars().count()).max().unwrap_or(0);
+        let width = rows
+            .iter()
+            .map(|r| r.tree.chars().count())
+            .max()
+            .unwrap_or(0);
         let mut out = String::from(
             "process graph — tree = who spawned whom, ⚯ = linked, sends→ = may message\n",
         );
@@ -1655,6 +1980,36 @@ impl System {
             ));
         }
         out
+    }
+
+    /// Take the dashboard's complete view under one registry lock. In
+    /// particular, do not call `all_settled` or `peak_context` here: both would
+    /// try to acquire `procs` a second time and deadlock this snapshot.
+    pub fn snapshot(&self) -> SystemSnapshot {
+        let procs = self.procs.lock().unwrap();
+        let mut settled = true;
+        let mut peak_context = 0;
+        let mut processes = Vec::with_capacity(procs.len());
+        for process in procs.iter() {
+            let status = *process.status.lock().unwrap();
+            let tokens = process.context_tokens.load(Ordering::Relaxed);
+            settled &= status != Status::Running;
+            peak_context = peak_context.max(tokens);
+            processes.push(ProcessSnapshot {
+                id: process.id.clone(),
+                name: process.name.clone(),
+                parent: process.parent.clone(),
+                status,
+                runs: process.runs.clone(),
+                tokens,
+            });
+        }
+        SystemSnapshot {
+            processes,
+            billable: self.api.billable_spent(),
+            peak_context,
+            settled,
+        }
     }
 
     /// Largest live context in the system, for the status line.
@@ -1704,7 +2059,11 @@ fn walk(procs: &[Entry], entry: &Entry, prefix: &str, last: bool, root: bool, ro
     let connector = if root {
         String::new()
     } else {
-        format!("{prefix}{}{} ", if last { "└" } else { "├" }, if entry.linked { "⚯" } else { "─" })
+        format!(
+            "{prefix}{}{} ",
+            if last { "└" } else { "├" },
+            if entry.linked { "⚯" } else { "─" }
+        )
     };
     let name = entry.name.as_deref().unwrap_or("-");
 
@@ -1736,15 +2095,18 @@ fn walk(procs: &[Entry], entry: &Entry, prefix: &str, last: bool, root: bool, ro
     // Filesystem reach is the authority that leaves the harness, so it is the
     // one most worth being able to audit at a glance.
     if entry.grants.run.is_permissive() {
-        notes.push(format!("runs→ {}", match &entry.grants.run {
-            Grant::All => "any".to_string(),
-            Grant::Ids(names) => {
-                let mut n: Vec<String> = names.iter().cloned().collect();
-                n.sort();
-                n.join(" ")
+        notes.push(format!(
+            "runs→ {}",
+            match &entry.grants.run {
+                Grant::All => "any".to_string(),
+                Grant::Ids(names) => {
+                    let mut n: Vec<String> = names.iter().cloned().collect();
+                    n.sort();
+                    n.join(" ")
+                }
+                Grant::Nobody => String::new(),
             }
-            Grant::Nobody => String::new(),
-        }));
+        ));
     }
     if entry.grants.read.is_permissive() {
         notes.push(format!("reads→ {}", entry.grants.read.describe()));
@@ -1768,7 +2130,14 @@ fn walk(procs: &[Entry], entry: &Entry, prefix: &str, last: bool, root: bool, ro
         format!("{prefix}{}  ", if last { " " } else { "│" })
     };
     for (i, child) in children.iter().enumerate() {
-        walk(procs, child, &child_prefix, i + 1 == children.len(), false, rows);
+        walk(
+            procs,
+            child,
+            &child_prefix,
+            i + 1 == children.len(),
+            false,
+            rows,
+        );
     }
 }
 
@@ -1806,7 +2175,11 @@ mod tests {
         assert!(flood.allow("proc-2", "proc-4", start));
         assert!(flood.allow("proc-4", "proc-3", start));
         // And the window drains with time.
-        assert!(flood.allow("proc-2", "proc-3", start + FLOOD_WINDOW + std::time::Duration::from_secs(1)));
+        assert!(flood.allow(
+            "proc-2",
+            "proc-3",
+            start + FLOOD_WINDOW + std::time::Duration::from_secs(1)
+        ));
     }
 
     /// A capped body keeps its head and says what happened; a small one is
@@ -1842,6 +2215,30 @@ mod tests {
         assert!(tombstones_to_drop(&[false, false], 0).is_empty());
     }
 
+    #[tokio::test]
+    async fn snapshot_is_coherent_and_carries_dashboard_fields() {
+        let sys = System::new(dummy_client());
+        let running = test_entry("proc-1", "user", Grant::Nobody);
+        let mut idle = test_entry("proc-2", "proc-1", Grant::Nobody);
+        idle.name = Some("worker".into());
+        *idle.status.lock().unwrap() = Status::Idle;
+        idle.context_tokens.store(12_345, Ordering::Relaxed);
+        *sys.procs.lock().unwrap() = vec![running, idle];
+
+        let snapshot = sys.snapshot();
+        assert_eq!(snapshot.processes.len(), 2);
+        assert_eq!(snapshot.processes[1].name.as_deref(), Some("worker"));
+        assert_eq!(snapshot.processes[1].parent, "proc-1");
+        assert_eq!(snapshot.processes[1].status, Status::Idle);
+        assert_eq!(snapshot.processes[1].runs, "small");
+        assert_eq!(snapshot.processes[1].tokens, 12_345);
+        assert_eq!(snapshot.peak_context, 12_345);
+        assert!(!snapshot.settled);
+
+        *sys.procs.lock().unwrap()[0].status.lock().unwrap() = Status::Stopped;
+        assert!(sys.snapshot().settled);
+    }
+
     fn test_entry(id: &str, parent: &str, stop: Grant) -> Entry {
         Entry {
             id: id.to_string(),
@@ -1868,6 +2265,7 @@ mod tests {
             runs: "small".to_string(),
             control: Mutex::new(None),
             seq: AtomicU64::new(0),
+            artifact_mail: true,
         }
     }
 
@@ -1896,13 +2294,102 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn long_agent_mail_is_paged_and_recipient_scoped() {
+        let sys = System::new(dummy_client());
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let mut agent = test_entry("proc-1", "user", Grant::Nobody);
+        agent.sender = Mutex::new(Some(sender));
+        agent.artifact_mail = true;
+        *sys.procs.lock().unwrap() = vec![agent];
+
+        let body = "α".repeat(INLINE_MAIL_CHARS + 20);
+        sys.send("proc-1", Mail::system("user", body.clone()))
+            .unwrap();
+        let delivered = receiver.recv().await.unwrap();
+        let id = delivered
+            .artifact_id
+            .clone()
+            .expect("long mail gets a handle");
+        assert_eq!(delivered.artifact_chars, Some(INLINE_MAIL_CHARS + 20));
+        assert!(delivered.body.contains(&id));
+        assert!(delivered.body.chars().count() < body.chars().count());
+        assert!(sys.list_mail_artifacts("proc-1").contains(&id));
+
+        let tail = sys
+            .read_mail_artifact("proc-1", &id, INLINE_MAIL_CHARS, 100)
+            .unwrap();
+        assert!(tail.ends_with(&"α".repeat(20)));
+        assert!(sys.read_mail_artifact("proc-2", &id, 0, 10).is_err());
+        assert!(sys.discard_mail_artifact("proc-2", &id).is_err());
+        assert!(sys.read_mail_artifact("proc-1", &id, 0, 10).is_ok());
+        sys.discard_mail_artifact("proc-1", &id).unwrap();
+        assert!(sys.read_mail_artifact("proc-1", &id, 0, 10).is_err());
+    }
+
+    #[tokio::test]
+    async fn script_mail_keeps_the_complete_body_inline() {
+        let sys = System::new(dummy_client());
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let mut script = test_entry("proc-1", "user", Grant::Nobody);
+        script.sender = Mutex::new(Some(sender));
+        script.artifact_mail = false;
+        *sys.procs.lock().unwrap() = vec![script];
+
+        let body = "x".repeat(INLINE_MAIL_CHARS + 20);
+        sys.send("proc-1", Mail::system("user", body.clone()))
+            .unwrap();
+        let delivered = receiver.recv().await.unwrap();
+        assert_eq!(delivered.body, body);
+        assert!(delivered.artifact_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn resumed_call_artifacts_do_not_overwrite_an_old_handle() {
+        let sys = System::new(dummy_client());
+        *sys.procs.lock().unwrap() = vec![test_entry("proc-1", "user", Grant::Nobody)];
+        sys.mail_artifacts.lock().unwrap().insert(
+            "mail-proc-1-call-1".into(),
+            MailArtifactRecord {
+                id: "mail-proc-1-call-1".into(),
+                recipient: "proc-1".into(),
+                from: "proc-2".into(),
+                chars: 3,
+                body: "old".into(),
+            },
+        );
+
+        let (call, response) = sys.register_call("proc-1", "proc-2");
+        assert_eq!(call, "call-1");
+        sys.resolve_call(&call, Ok("n".repeat(INLINE_MAIL_CHARS + 1)));
+        let shown = response.await.unwrap().unwrap();
+        assert!(shown.contains("mail-proc-1-call-1-2"));
+        assert!(
+            sys.read_mail_artifact("proc-1", "mail-proc-1-call-1", 0, 10)
+                .unwrap()
+                .ends_with("old")
+        );
+        assert!(
+            sys.read_mail_artifact("proc-1", "mail-proc-1-call-1-2", 0, 10)
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
     async fn a_process_may_always_stop_what_it_spawned_even_without_a_matching_grant() {
         let sys = System::new(dummy_client());
         // proc-1's own stop grant names only itself — resolved long before
         // proc-2 was ever spawned, so it could never have named it.
-        let coordinator = test_entry("proc-1", "user", Grant::Ids(HashSet::from(["proc-1".to_string()])));
+        let coordinator = test_entry(
+            "proc-1",
+            "user",
+            Grant::Ids(HashSet::from(["proc-1".to_string()])),
+        );
         let coordinator_meta = test_meta_for(&coordinator);
-        let worker = test_entry("proc-2", "proc-1", Grant::Ids(HashSet::from(["proc-2".to_string()])));
+        let worker = test_entry(
+            "proc-2",
+            "proc-1",
+            Grant::Ids(HashSet::from(["proc-2".to_string()])),
+        );
         let stranger = test_entry("proc-3", "user", Grant::Nobody);
         *sys.procs.lock().unwrap() = vec![coordinator, worker, stranger];
 
@@ -1914,10 +2401,22 @@ mod tests {
     #[tokio::test]
     async fn the_descendant_bypass_reaches_grandchildren_too() {
         let sys = System::new(dummy_client());
-        let coordinator = test_entry("proc-1", "user", Grant::Ids(HashSet::from(["proc-1".to_string()])));
+        let coordinator = test_entry(
+            "proc-1",
+            "user",
+            Grant::Ids(HashSet::from(["proc-1".to_string()])),
+        );
         let coordinator_meta = test_meta_for(&coordinator);
-        let child = test_entry("proc-2", "proc-1", Grant::Ids(HashSet::from(["proc-2".to_string()])));
-        let grandchild = test_entry("proc-3", "proc-2", Grant::Ids(HashSet::from(["proc-3".to_string()])));
+        let child = test_entry(
+            "proc-2",
+            "proc-1",
+            Grant::Ids(HashSet::from(["proc-2".to_string()])),
+        );
+        let grandchild = test_entry(
+            "proc-3",
+            "proc-2",
+            Grant::Ids(HashSet::from(["proc-3".to_string()])),
+        );
         *sys.procs.lock().unwrap() = vec![coordinator, child, grandchild];
 
         assert!(sys.may(&coordinator_meta, Capability::Stop, "proc-3"));

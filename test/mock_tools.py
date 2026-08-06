@@ -16,9 +16,9 @@ class H(BaseHTTPRequestHandler):
                 return self.fail(f"a process without the spawn capability must not be offered spawn_process: {names}")
             if "stop_process" not in names:
                 return self.fail(f"it may stop itself, so stop_process should remain: {names}")
-            if names[0]!="send_message" or names[1]!="list_processes":
+            if names[:3] != ["send_message", "mailbox", "list_processes"]:
                 return self.fail(f"always-tools must lead so the prefix stays shared: {names}")
-            if not b["tools"][1].get("cache_control"):
+            if not b["tools"][2].get("cache_control"):
                 return self.fail("the breakpoint must sit on the last always-tool")
             ev=[{"type":"message_start","message":{"id":"m","type":"message","role":"assistant","content":[],"model":"claude-opus-5","usage":{"input_tokens":1}}},
                 {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}},

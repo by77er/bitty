@@ -74,7 +74,7 @@ class H(BaseHTTPRequestHandler):
             # Self-stop survives every narrowing on purpose, and run_script is
             # where its functions are called. Everything that could name
             # another process must be gone.
-            leaked = [t for t in names if t not in ("run_script", "stop_process")]
+            leaked = [t for t in names if t not in ("mailbox", "run_script", "stop_process")]
             if leaked:
                 return self.fail(f"a myopic process should see only its own tools: {leaked}")
             if "await lookup(" not in system:

@@ -17,6 +17,7 @@ credentials.
 | `mock_script.py` | embedded-Deno script process: TS transpilation, mail delivery, computed reply, and that a script never calls the model API |
 | `mock_caps.py` | capability attenuation (a restricted process's child is not unrestricted), rejection of over-requests, `can_spawn: false` enforcement |
 | `mock_notices.py` | multicast partial success, `"*"` resolution, exit signals following links (and NOT reaching a merely-wired sibling), array stop targets |
+| `mock_mailbox.py` | oversized agent mail preview/handle metadata, recipient paging, and discard |
 
 Two lessons worth keeping in mind when extending these:
 

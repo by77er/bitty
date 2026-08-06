@@ -111,6 +111,7 @@ BITTY_COMPACT_ABOVE=50000 BITTY_COMPACTION=off \
 unset BITTY_COMPACT_ABOVE BITTY_COMPACTION
 
 run "overflow compacts and retries"          8761 mock_overflow.py  --once "grow then overflow"
+run "artifact-backed long mailbox messages" 8793 mock_mailbox.py   --once "send a long report"
 
 # The Codex provider needs the CLI's stored credentials just to start, so the
 # scenario only runs where they exist.

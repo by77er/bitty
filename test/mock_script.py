@@ -11,7 +11,8 @@ SCRIPT = """
 // TypeScript annotations must survive transpilation.
 bitty.onMail(async (mail: {from: string; body: string}, api): Promise<void> => {
   const n: number = mail.body.length;
-  api.log(`counted ${n} characters from ${mail.from}`);
+  // Console output is a structured process log, never a raw terminal write.
+  console.log(`counted ${n} characters from ${mail.from}`);
   await api.send(api.parent, `len=${n}`);
 });
 """

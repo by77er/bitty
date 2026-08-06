@@ -338,6 +338,8 @@ async fn serve_connection(
             from_name: Some("http".into()),
             body: payload.to_string(),
             priority: Priority::High,
+            artifact_id: None,
+            artifact_chars: None,
             reply_to: Some(call.clone()),
             seq: 0,
         },
@@ -866,6 +868,27 @@ globalThis.bitty = (() => {
     },
     log(text) { ops.op_bitty_log(String(text)); },
   };
+  // `deno_core` does not install Deno's console extension. Provide the common
+  // surface explicitly and route it through the same structured log op as
+  // `api.log`; a script must never acquire a raw terminal writer.
+  const consoleValue = (value) => {
+    if (typeof value === "string") return value;
+    if (value instanceof Error) return value.stack || value.message || String(value);
+    try {
+      const json = JSON.stringify(value);
+      return json === undefined ? String(value) : json;
+    } catch (_) {
+      return String(value);
+    }
+  };
+  const consoleLog = (...values) => api.log(values.map(consoleValue).join(" "));
+  globalThis.console = Object.freeze({
+    log: consoleLog,
+    info: consoleLog,
+    debug: consoleLog,
+    warn: consoleLog,
+    error: consoleLog,
+  });
   // deno_core supplies Deno.core (the ops bridge) but not the Deno namespace,
   // which lives in deno_runtime. Rather than expecting a model to unlearn the
   // API it knows, map the common surface onto our ops — every call still goes

@@ -41,9 +41,26 @@ pub struct MailRecord {
     pub seq: u64,
     pub from: String,
     pub from_name: Option<String>,
+    /// The durable record keeps the complete (bounded) body. When this is
+    /// present, the live mailbox receives only a preview and this handle.
+    #[serde(default)]
+    pub artifact_id: Option<String>,
+    #[serde(default)]
+    pub artifact_chars: Option<usize>,
     pub body: String,
     pub low_priority: bool,
     pub reply_to: Option<String>,
+}
+
+/// A long mailbox body stored outside model context and paged explicitly by
+/// its recipient. The recipient field is authorization data, not decoration.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct MailArtifactRecord {
+    pub id: String,
+    pub recipient: String,
+    pub from: String,
+    pub chars: usize,
+    pub body: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -55,26 +72,41 @@ pub enum Event {
     /// The recipient has folded everything up to `through` into a turn.
     /// Popping is a cursor advance, not a destructive read — which is what
     /// makes the queue reconstructible instead of merely recoverable.
-    Consumed { through: u64 },
+    Consumed {
+        through: u64,
+    },
     Spawned(ProcessRecord),
     /// A completed model turn: the assistant's content blocks.
-    Output { content: Value },
+    Output {
+        content: Value,
+    },
     /// A user turn — tool results, mail, or both.
-    Input { content: Value },
-    Stopped { reason: String },
+    Input {
+        content: Value,
+    },
+    Stopped {
+        reason: String,
+    },
     /// The conversation was replaced by a summary of itself. Recorded so a
     /// resume gets the compacted form rather than replaying the turns it was
     /// summarised from — otherwise compaction would be undone by the next
     /// restart.
-    Compacted { history: Vec<Value> },
+    Compacted {
+        history: Vec<Value>,
+    },
     /// A model or effort change made while the process was running. Without
     /// this the switch would live only in memory and quietly revert on the
     /// next restart.
-    Retuned { model: String, effort: Option<String> },
+    Retuned {
+        model: String,
+        effort: Option<String>,
+    },
     /// `patch_script` replaced a running script's code. Without this the
     /// replacement would live only in the isolate that was running it, and a
     /// restart would bring back the process's first draft instead.
-    Patched { source: String },
+    Patched {
+        source: String,
+    },
     /// A fold of everything before it, standing in for those events entirely.
     ///
     /// This is exactly what `restore` computes, written back out — which is
@@ -110,6 +142,16 @@ pub trait Journal: Send + Sync {
     }
     fn enabled(&self) -> bool {
         true
+    }
+    fn store_mail_artifact(&self, _artifact: &MailArtifactRecord) {}
+    fn read_mail_artifact(&self, _recipient: &str, _id: &str) -> Option<MailArtifactRecord> {
+        None
+    }
+    fn list_mail_artifacts(&self, _recipient: &str) -> Vec<MailArtifactRecord> {
+        Vec::new()
+    }
+    fn discard_mail_artifact(&self, _recipient: &str, _id: &str) -> bool {
+        false
     }
 }
 
@@ -157,12 +199,26 @@ impl FileJournal {
 
     fn path(&self, process: &str) -> std::path::PathBuf {
         // Ids are harness-generated ("proc-7"), but never trust one into a path.
-        let safe: String = process
-            .chars()
-            .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
-            .collect();
-        self.root.join(format!("{safe}.jsonl"))
+        self.root.join(format!("{}.jsonl", safe_component(process)))
     }
+
+    fn artifact_dir(&self, process: &str) -> std::path::PathBuf {
+        self.root.join("mail").join(safe_component(process))
+    }
+
+    fn artifact_path(&self, process: &str, id: &str) -> std::path::PathBuf {
+        self.artifact_dir(process)
+            .join(format!("{}.json", safe_component(id)))
+    }
+}
+
+fn safe_component(value: &str) -> String {
+    value
+        .chars()
+        .filter(|character| {
+            character.is_ascii_alphanumeric() || *character == '-' || *character == '_'
+        })
+        .collect()
 }
 
 impl Journal for FileJournal {
@@ -243,7 +299,7 @@ impl Journal for FileJournal {
             .filter_map(|line| serde_json::from_str(line).ok())
             .collect();
         let before = events.len();
-        let Some((record, history, stopped, pending, _)) = restore(events) else {
+        let Some((record, history, stopped, pending, _, mail_cursor)) = restore(events) else {
             // Nothing to fold onto — no spawn record means no process.
             return;
         };
@@ -251,7 +307,7 @@ impl Journal for FileJournal {
             .iter()
             .map(|mail| mail.seq)
             .min()
-            .unwrap_or(0)
+            .unwrap_or(mail_cursor.saturating_add(1))
             .saturating_sub(1);
         let checkpoint = Event::Checkpoint {
             record,
@@ -291,7 +347,11 @@ impl Journal for FileJournal {
 
         // The old handle points at the replaced inode; reopen onto the new file.
         files.remove(process);
-        if let Ok(file) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        if let Ok(file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
             files.insert(process.to_string(), std::io::BufWriter::new(file));
         }
         let now = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
@@ -315,7 +375,13 @@ impl Journal for FileJournal {
         if meta.len() < floor {
             return false;
         }
-        let mark = self.marks.lock().unwrap().get(process).copied().unwrap_or(0);
+        let mark = self
+            .marks
+            .lock()
+            .unwrap()
+            .get(process)
+            .copied()
+            .unwrap_or(0);
         meta.len() >= mark.max(floor).saturating_mul(2)
     }
 
@@ -337,6 +403,64 @@ impl Journal for FileJournal {
         found.sort();
         found.into_iter().map(|(_, id)| id).collect()
     }
+
+    fn store_mail_artifact(&self, artifact: &MailArtifactRecord) {
+        use std::io::Write;
+
+        let directory = self.artifact_dir(&artifact.recipient);
+        if std::fs::create_dir_all(&directory).is_err() {
+            return;
+        }
+        let path = self.artifact_path(&artifact.recipient, &artifact.id);
+        let staged = path.with_extension("json.new");
+        let Ok(serialized) = serde_json::to_vec(artifact) else {
+            return;
+        };
+        let wrote = (|| -> std::io::Result<()> {
+            let mut file = std::fs::File::create(&staged)?;
+            file.write_all(&serialized)?;
+            file.sync_all()
+        })();
+        if wrote.is_err() || std::fs::rename(&staged, &path).is_err() {
+            let _ = std::fs::remove_file(&staged);
+        }
+    }
+
+    fn read_mail_artifact(&self, recipient: &str, id: &str) -> Option<MailArtifactRecord> {
+        let bytes = std::fs::read(self.artifact_path(recipient, id)).ok()?;
+        let artifact: MailArtifactRecord = serde_json::from_slice(&bytes).ok()?;
+        (artifact.recipient == recipient && artifact.id == id).then_some(artifact)
+    }
+
+    fn list_mail_artifacts(&self, recipient: &str) -> Vec<MailArtifactRecord> {
+        let mut artifacts: Vec<MailArtifactRecord> =
+            std::fs::read_dir(self.artifact_dir(recipient))
+                .into_iter()
+                .flatten()
+                .flatten()
+                .filter(|entry| {
+                    entry
+                        .path()
+                        .extension()
+                        .is_some_and(|extension| extension == "json")
+                })
+                .filter_map(|entry| std::fs::read(entry.path()).ok())
+                .filter_map(|bytes| serde_json::from_slice(&bytes).ok())
+                .filter(|artifact: &MailArtifactRecord| artifact.recipient == recipient)
+                .collect();
+        artifacts.sort_by(|left, right| left.id.cmp(&right.id));
+        artifacts
+    }
+
+    fn discard_mail_artifact(&self, recipient: &str, id: &str) -> bool {
+        // Validate the record before deleting. Sanitizing a hostile id keeps
+        // it inside the directory, but two spellings can sanitize to the same
+        // filename; only the exact recorded id may remove that file.
+        if self.read_mail_artifact(recipient, id).is_none() {
+            return false;
+        }
+        std::fs::remove_file(self.artifact_path(recipient, id)).is_ok()
+    }
 }
 
 /// Fold a journal back into a process definition and its conversation.
@@ -350,19 +474,33 @@ impl Journal for FileJournal {
 /// messages and duplicate workers.
 pub fn restore(
     events: Vec<Event>,
-) -> Option<(ProcessRecord, Vec<Value>, bool, Vec<MailRecord>, Vec<Value>)> {
+) -> Option<(
+    ProcessRecord,
+    Vec<Value>,
+    bool,
+    Vec<MailRecord>,
+    Vec<Value>,
+    u64,
+)> {
     let mut record = None;
     let mut history: Vec<Value> = Vec::new();
     let mut stopped = false;
     let mut enqueued: Vec<MailRecord> = Vec::new();
     let mut consumed_through = 0u64;
+    let mut mail_cursor = 0u64;
     let mut retuned: Option<(String, Option<String>)> = None;
     let mut patched: Option<String> = None;
     for event in events {
         match event {
             Event::Spawned(spawned) => record = Some(spawned),
-            Event::Enqueued(mail) => enqueued.push(mail),
-            Event::Consumed { through } => consumed_through = consumed_through.max(through),
+            Event::Enqueued(mail) => {
+                mail_cursor = mail_cursor.max(mail.seq);
+                enqueued.push(mail);
+            }
+            Event::Consumed { through } => {
+                consumed_through = consumed_through.max(through);
+                mail_cursor = mail_cursor.max(through);
+            }
             Event::Output { content } => {
                 history.push(serde_json::json!({"role": "assistant", "content": content}))
             }
@@ -372,7 +510,9 @@ pub fn restore(
             Event::Stopped { .. } => stopped = true,
             Event::Retuned { model, effort } => retuned = Some((model, effort)),
             Event::Patched { source } => patched = Some(source),
-            Event::Compacted { history: summarised } => history = summarised,
+            Event::Compacted {
+                history: summarised,
+            } => history = summarised,
             // A checkpoint supersedes everything before it: reset, then keep
             // folding whatever was appended afterward.
             Event::Checkpoint {
@@ -387,6 +527,12 @@ pub fn restore(
                 consumed_through = through;
                 stopped = was_stopped;
                 enqueued = pending;
+                mail_cursor = enqueued
+                    .iter()
+                    .map(|mail| mail.seq)
+                    .max()
+                    .unwrap_or(through)
+                    .max(through);
             }
         }
     }
@@ -429,7 +575,7 @@ pub fn restore(
         if let Some(source) = patched {
             record.kind = crate::system::Kind::Script(source);
         }
-        (record, history, stopped, pending, dropped)
+        (record, history, stopped, pending, dropped, mail_cursor)
     })
 }
 
@@ -503,40 +649,112 @@ mod tests {
             seq,
             from: "proc-1".into(),
             from_name: None,
+            artifact_id: None,
+            artifact_chars: None,
             body: format!("message {seq}"),
             low_priority: false,
             reply_to: None,
         }
     }
 
+    fn temporary_journal(name: &str) -> std::path::PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("bitty-{name}-{}-{nonce}", std::process::id()))
+    }
+
+    #[test]
+    fn old_mail_records_default_to_inline() {
+        let record: MailRecord = serde_json::from_value(serde_json::json!({
+            "seq": 1,
+            "from": "proc-1",
+            "from_name": null,
+            "body": "hello",
+            "low_priority": false,
+            "reply_to": null
+        }))
+        .unwrap();
+        assert!(record.artifact_id.is_none());
+        assert!(record.artifact_chars.is_none());
+    }
+
+    #[test]
+    fn mailbox_artifacts_survive_reopen_and_are_recipient_scoped() {
+        let root = temporary_journal("mail-artifact");
+        let artifact = MailArtifactRecord {
+            id: "mail-proc-2-7".into(),
+            recipient: "proc-2".into(),
+            from: "proc-1".into(),
+            chars: 9,
+            body: "kept here".into(),
+        };
+        {
+            let journal = FileJournal::new(&root).unwrap();
+            journal.store_mail_artifact(&artifact);
+        }
+        let journal = FileJournal::new(&root).unwrap();
+        assert_eq!(
+            journal
+                .read_mail_artifact("proc-2", "mail-proc-2-7")
+                .unwrap()
+                .body,
+            "kept here"
+        );
+        assert!(
+            journal
+                .read_mail_artifact("proc-1", "mail-proc-2-7")
+                .is_none()
+        );
+        assert_eq!(journal.list_mail_artifacts("proc-2").len(), 1);
+        // A different spelling that sanitizes similarly must not delete it.
+        assert!(!journal.discard_mail_artifact("proc-2", "mail/-proc-2-7"));
+        assert!(journal.discard_mail_artifact("proc-2", "mail-proc-2-7"));
+        assert!(journal.list_mail_artifacts("proc-2").is_empty());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     /// Fold the way `compact` does, so the test exercises the same derivation
     /// the compactor uses rather than a parallel one.
     fn checkpoint_of(events: Vec<Event>) -> Event {
-        let (record, history, stopped, pending, _) = restore(events).expect("has a spawn record");
+        let (record, history, stopped, pending, _, mail_cursor) =
+            restore(events).expect("has a spawn record");
         let consumed_through = pending
             .iter()
             .map(|m| m.seq)
             .min()
-            .unwrap_or(0)
+            .unwrap_or(mail_cursor.saturating_add(1))
             .saturating_sub(1);
-        Event::Checkpoint { record, history, consumed_through, pending, stopped }
+        Event::Checkpoint {
+            record,
+            history,
+            consumed_through,
+            pending,
+            stopped,
+        }
     }
 
     fn same(a: Vec<Event>, b: Vec<Event>) -> bool {
-        let (ar, ah, as_, ap, _) = restore(a).unwrap();
-        let (br, bh, bs, bp, _) = restore(b).unwrap();
+        let (ar, ah, as_, ap, _, ac) = restore(a).unwrap();
+        let (br, bh, bs, bp, _, bc) = restore(b).unwrap();
         ar.id == br.id
             && ar.instructions == br.instructions
             && ah == bh
             && as_ == bs
             && ap.iter().map(|m| m.seq).eq(bp.iter().map(|m| m.seq))
+            && ac == bc
     }
 
     fn stream() -> Vec<Event> {
         vec![
             Event::Spawned(record("proc-2")),
-            Event::Input { content: serde_json::json!([{"type": "text", "text": "go"}]) },
-            Event::Output { content: serde_json::json!([{"type": "text", "text": "working"}]) },
+            Event::Input {
+                content: serde_json::json!([{"type": "text", "text": "go"}]),
+            },
+            Event::Output {
+                content: serde_json::json!([{"type": "text", "text": "working"}]),
+            },
             Event::Enqueued(mail(1)),
             Event::Enqueued(mail(2)),
             Event::Consumed { through: 1 },
@@ -580,21 +798,40 @@ mod tests {
     /// Unconsumed mail is the one thing a checkpoint must never lose.
     #[test]
     fn pending_mail_survives() {
-        let (_, _, _, pending, _) = restore(vec![checkpoint_of(stream())]).unwrap();
+        let (_, _, _, pending, _, _) = restore(vec![checkpoint_of(stream())]).unwrap();
         assert_eq!(pending.iter().map(|m| m.seq).collect::<Vec<_>>(), vec![3]);
+    }
+
+    #[test]
+    fn a_fully_consumed_mail_cursor_survives_compaction() {
+        let events = vec![
+            Event::Spawned(record("proc-2")),
+            Event::Enqueued(mail(1)),
+            Event::Enqueued(mail(2)),
+            Event::Consumed { through: 2 },
+        ];
+        let checkpoint = checkpoint_of(events);
+        let (_, _, _, pending, _, cursor) = restore(vec![checkpoint]).unwrap();
+        assert!(pending.is_empty());
+        assert_eq!(cursor, 2);
     }
 
     /// A stopped process stays stopped across a checkpoint.
     #[test]
     fn stopped_survives() {
         let mut events = stream();
-        events.push(Event::Stopped { reason: "done".into() });
-        let (_, _, stopped, _, _) = restore(vec![checkpoint_of(events)]).unwrap();
+        events.push(Event::Stopped {
+            reason: "done".into(),
+        });
+        let (_, _, stopped, _, _, _) = restore(vec![checkpoint_of(events)]).unwrap();
         assert!(stopped);
     }
 
     fn script_record(id: &str, source: &str) -> ProcessRecord {
-        ProcessRecord { kind: crate::system::Kind::Script(source.into()), ..record(id) }
+        ProcessRecord {
+            kind: crate::system::Kind::Script(source.into()),
+            ..record(id)
+        }
     }
 
     /// The bug this event exists to fix: patch_script's replacement has to
@@ -604,7 +841,9 @@ mod tests {
     fn a_patch_replaces_the_spawned_source_on_restore() {
         let events = vec![
             Event::Spawned(script_record("proc-2", "v1")),
-            Event::Patched { source: "v2".into() },
+            Event::Patched {
+                source: "v2".into(),
+            },
         ];
         let (record, ..) = restore(events).unwrap();
         assert!(matches!(record.kind, crate::system::Kind::Script(s) if s == "v2"));
@@ -616,7 +855,9 @@ mod tests {
     fn a_patch_survives_being_folded_into_a_checkpoint() {
         let events = vec![
             Event::Spawned(script_record("proc-2", "v1")),
-            Event::Patched { source: "v2".into() },
+            Event::Patched {
+                source: "v2".into(),
+            },
         ];
         let (record, ..) = restore(vec![checkpoint_of(events)]).unwrap();
         assert!(matches!(record.kind, crate::system::Kind::Script(s) if s == "v2"));
@@ -628,7 +869,9 @@ mod tests {
     fn mid_turn_events() -> Vec<Event> {
         vec![
             Event::Spawned(record("proc-2")),
-            Event::Input { content: serde_json::json!([{"type": "text", "text": "go"}]) },
+            Event::Input {
+                content: serde_json::json!([{"type": "text", "text": "go"}]),
+            },
             Event::Output {
                 content: serde_json::json!([
                     {"type": "text", "text": "spawning"},
@@ -641,7 +884,7 @@ mod tests {
 
     #[test]
     fn a_dropped_turn_reports_its_tool_calls() {
-        let (_, history, _, _, dropped) = restore(mid_turn_events()).unwrap();
+        let (_, history, _, _, dropped, _) = restore(mid_turn_events()).unwrap();
         assert_eq!(history.len(), 1, "the unanswered turn is gone");
         assert_eq!(dropped.len(), 1);
         assert_eq!(dropped[0]["name"], "spawn_process");
@@ -658,17 +901,22 @@ mod tests {
     #[test]
     fn the_resume_correction_converges() {
         let mut events = mid_turn_events();
-        let (_, mut history, _, _, dropped) = restore(mid_turn_events()).unwrap();
+        let (_, mut history, _, _, dropped, _) = restore(mid_turn_events()).unwrap();
         let notice = restart_notice(&dropped).unwrap();
         attach_restart_notice(&mut history, &notice);
-        events.push(Event::Compacted { history: history.clone() });
+        events.push(Event::Compacted {
+            history: history.clone(),
+        });
         // The resumed process then runs a full turn.
         events.push(Event::Output {
             content: serde_json::json!([{"type": "text", "text": "verified; continuing"}]),
         });
 
-        let (_, replayed, _, _, dropped_again) = restore(events).unwrap();
-        assert!(dropped_again.is_empty(), "the correction leaves nothing dangling");
+        let (_, replayed, _, _, dropped_again, _) = restore(events).unwrap();
+        assert!(
+            dropped_again.is_empty(),
+            "the correction leaves nothing dangling"
+        );
         let text = serde_json::to_string(&replayed).unwrap();
         assert!(text.contains("restart_notice"));
         let unanswered_mid_history = replayed.iter().any(|turn| {
@@ -677,16 +925,18 @@ mod tests {
                     .as_array()
                     .is_some_and(|blocks| blocks.iter().any(|b| b["type"] == "tool_use"))
         });
-        assert!(!unanswered_mid_history, "no orphaned tool_use survives the correction");
+        assert!(
+            !unanswered_mid_history,
+            "no orphaned tool_use survives the correction"
+        );
     }
 
     /// The notice lands inside the trailing user turn when there is one, so
     /// the conversation still alternates roles.
     #[test]
     fn the_notice_joins_the_trailing_user_turn() {
-        let mut history = vec![
-            serde_json::json!({"role": "user", "content": [{"type": "text", "text": "go"}]}),
-        ];
+        let mut history =
+            vec![serde_json::json!({"role": "user", "content": [{"type": "text", "text": "go"}]})];
         attach_restart_notice(&mut history, "<restart_notice>x</restart_notice>");
         assert_eq!(history.len(), 1);
         assert_eq!(history[0]["content"].as_array().unwrap().len(), 2);

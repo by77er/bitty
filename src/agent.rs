@@ -9,10 +9,10 @@
 //! (just the briefing) or seeded with a rendered snapshot of the spawner's
 //! conversation.
 
-use crate::grants::{Capability, Grant};
-use crate::api::Turn;
 use crate::actions;
+use crate::api::Turn;
 use crate::durable::Event;
+use crate::grants::{Capability, Grant};
 use crate::system::{
     GrantSpec, Kind, MAX_GROUP, Mail, Meta, NodeSpec, Priority, Status, System, ToolAlias,
 };
@@ -57,9 +57,17 @@ pub async fn run(
         drive(sys, me, mailbox, Vec::new()).await;
         return;
     }
-    first_turn.push(text_block(&envelope(&Mail::system(&me.parent, instructions))));
+    first_turn.push(text_block(&envelope(&Mail::system(
+        &me.parent,
+        instructions,
+    ))));
     let opening = json!({"role": "user", "content": first_turn});
-    sys.journal.record(&me.id, &Event::Input { content: json!(first_turn) });
+    sys.journal.record(
+        &me.id,
+        &Event::Input {
+            content: json!(first_turn),
+        },
+    );
     drive(sys, me, mailbox, vec![opening]).await;
 }
 
@@ -72,7 +80,10 @@ pub async fn resume(
     _inherited: Option<String>,
     history: Vec<Value>,
 ) {
-    ui::trace(&me.tag, &format!("↻ resumed with {} prior turns", history.len()));
+    ui::trace(
+        &me.tag,
+        &format!("↻ resumed with {} prior turns", history.len()),
+    );
     drive(sys, me, mailbox, history).await;
 }
 
@@ -106,7 +117,9 @@ async fn drive(
         // oversized one. `restore` already drops a trailing assistant turn
         // whose tool calls went unanswered, so an assistant turn here really
         // did finish.
-        let finished = history.last().is_some_and(|turn| turn["role"] == "assistant");
+        let finished = history
+            .last()
+            .is_some_and(|turn| turn["role"] == "assistant");
         if (history.is_empty() || finished)
             && !wait_for_mail(&sys, &me, &mut mailbox, &mut history, &mut deferred).await
         {
@@ -148,7 +161,8 @@ async fn drive(
             Ok(resp) => {
                 consecutive_failures = 0;
                 compacted_for_overflow = false;
-                me.context_tokens.store(resp.input_tokens, Ordering::Relaxed);
+                me.context_tokens
+                    .store(resp.input_tokens, Ordering::Relaxed);
                 if !warned_unmanaged
                     && resp.input_tokens > UNMANAGED_CONTEXT_WARN
                     && !sys.api.compaction_enabled()
@@ -178,13 +192,17 @@ async fn drive(
                         &me.tag,
                         "the prompt no longer fits the context window; compacting and retrying",
                     );
-                    compact_conversation(&sys, &me, &system_prompt, &mut history, session.as_ref()).await;
+                    compact_conversation(&sys, &me, &system_prompt, &mut history, session.as_ref())
+                        .await;
                     continue;
                 }
                 consecutive_failures += 1;
                 ui::warn(&me.tag, &format!("turn failed: {e:#}"));
                 if consecutive_failures >= 3 {
-                    ui::warn(&me.tag, "giving up on this turn; going idle until next message");
+                    ui::warn(
+                        &me.tag,
+                        "giving up on this turn; going idle until next message",
+                    );
                     // Not dead, but not working either — tell the neighbors so
                     // whoever delegated to this process can stop waiting.
                     sys.signal_stalled(&me.id, &me.label());
@@ -198,7 +216,12 @@ async fn drive(
         };
 
         let content = sanitize_for_history(resp.content);
-        sys.journal.record(&me.id, &Event::Output { content: json!(content) });
+        sys.journal.record(
+            &me.id,
+            &Event::Output {
+                content: json!(content),
+            },
+        );
         history.push(json!({"role": "assistant", "content": content}));
 
         match resp.stop_reason.as_str() {
@@ -207,7 +230,10 @@ async fn drive(
                 for block in content.iter().filter(|b| b["type"] == "tool_use") {
                     let name = block["name"].as_str().unwrap_or("");
                     let input = &block["input"];
-                    ui::trace(&me.tag, &format!("→ {name} {}", truncate(&input.to_string(), 200)));
+                    ui::trace(
+                        &me.tag,
+                        &format!("→ {name} {}", truncate(&input.to_string(), 200)),
+                    );
                     let (result, is_error) =
                         execute_tool(&sys, &me, name, input, &history, &mut session).await;
                     if is_error {
@@ -246,7 +272,12 @@ async fn drive(
                 // Recorded after the results, so a crash mid-turn resumes from
                 // a point where the completed tool calls are already known and
                 // are not run a second time.
-                sys.journal.record(&me.id, &Event::Input { content: json!(blocks) });
+                sys.journal.record(
+                    &me.id,
+                    &Event::Input {
+                        content: json!(blocks),
+                    },
+                );
                 sys.journal.flush(&me.id);
                 // A turn has just ended, so the log is consistent and nothing is
                 // mid-write. Checked here rather than on a timer for that reason.
@@ -259,7 +290,10 @@ async fn drive(
             "pause_turn" => continue,
             other => {
                 if other == "refusal" {
-                    ui::warn(&me.tag, "the model declined this request (stop_reason: refusal)");
+                    ui::warn(
+                        &me.tag,
+                        "the model declined this request (stop_reason: refusal)",
+                    );
                 } else if other == "max_tokens" {
                     ui::warn(&me.tag, "turn truncated at max_tokens");
                 }
@@ -292,7 +326,10 @@ async fn wait_for_mail(
             return false;
         };
         if mail.priority == Priority::Low {
-            ui::trace(&me.tag, &format!("· holding low-priority mail from {}", mail.from));
+            ui::trace(
+                &me.tag,
+                &format!("· holding low-priority mail from {}", mail.from),
+            );
             deferred.push(mail);
             continue;
         }
@@ -316,7 +353,12 @@ async fn wait_for_mail(
         blocks.push(text_block(&envelope(&mail)));
     }
     sys.note_consumed(&me.id, consumed);
-    sys.journal.record(&me.id, &Event::Input { content: json!(blocks) });
+    sys.journal.record(
+        &me.id,
+        &Event::Input {
+            content: json!(blocks),
+        },
+    );
     history.push(json!({"role": "user", "content": blocks}));
     true
 }
@@ -332,7 +374,10 @@ async fn execute_tool(
     match name {
         "spawn_process" => {
             let Some(instructions) = input["instructions"].as_str() else {
-                return ("spawn_process requires an 'instructions' string.".into(), true);
+                return (
+                    "spawn_process requires an 'instructions' string.".into(),
+                    true,
+                );
             };
             let inherited = match context_mode(input, history) {
                 Ok(inherited) => inherited,
@@ -356,7 +401,11 @@ async fn execute_tool(
                     Err(e) => return (e, true),
                 },
             };
-            let shown = child.name.clone().map(|n| format!(" ({n})")).unwrap_or_default();
+            let shown = child
+                .name
+                .clone()
+                .map(|n| format!(" ({n})"))
+                .unwrap_or_default();
             // Naming the contracts back is what makes the pattern stick: the
             // parent re-reads this line on every later turn, so what it sees is
             // the shape it repeats.
@@ -378,10 +427,15 @@ async fn execute_tool(
             let tools = if contracts.is_empty() {
                 String::new()
             } else {
-                format!(" It can call {} from inside run_script.", contracts.join(", "))
+                format!(
+                    " It can call {} from inside run_script.",
+                    contracts.join(", ")
+                )
             };
             (
-                format!("Spawned {id}{shown}. It is now working on your instructions.{tools}{reach}"),
+                format!(
+                    "Spawned {id}{shown}. It is now working on your instructions.{tools}{reach}"
+                ),
                 false,
             )
         }
@@ -407,7 +461,9 @@ async fn execute_tool(
             if let Some(id) = input["in_reply_to"].as_str().filter(|id| !id.is_empty()) {
                 if !sys.call_is_pending(id) {
                     return (
-                        format!("Nobody is waiting on '{id}' — it already timed out or was answered."),
+                        format!(
+                            "Nobody is waiting on '{id}' — it already timed out or was answered."
+                        ),
                         true,
                     );
                 }
@@ -419,10 +475,50 @@ async fn execute_tool(
                 Err(e) => return (e, true),
             };
             if targets.len() > 1 {
-                ui::trace(&me.tag, &format!("  fan-out to {} recipients", targets.len()));
+                ui::trace(
+                    &me.tag,
+                    &format!("  fan-out to {} recipients", targets.len()),
+                );
             }
             actions::send(sys, me, targets, body, priority)
         }
+        "mailbox" => match input["action"].as_str().unwrap_or("") {
+            "list" => (sys.list_mail_artifacts(&me.id), false),
+            "read" => {
+                let Some(id) = input["id"].as_str() else {
+                    return ("mailbox read requires an 'id'.".into(), true);
+                };
+                let offset = input["offset"]
+                    .as_u64()
+                    .unwrap_or(0)
+                    .try_into()
+                    .unwrap_or(usize::MAX);
+                let limit = input["limit"]
+                    .as_u64()
+                    .unwrap_or(4_000)
+                    .try_into()
+                    .unwrap_or(usize::MAX);
+                match sys.read_mail_artifact(&me.id, id, offset, limit) {
+                    Ok(page) => (page, false),
+                    Err(error) => (error, true),
+                }
+            }
+            "discard" => {
+                let Some(id) = input["id"].as_str() else {
+                    return ("mailbox discard requires an 'id'.".into(), true);
+                };
+                match sys.discard_mail_artifact(&me.id, id) {
+                    Ok(result) => (result, false),
+                    Err(error) => (error, true),
+                }
+            }
+            other => (
+                format!(
+                    "Unknown mailbox action '{other}'. Use \"list\", \"read\", or \"discard\"."
+                ),
+                true,
+            ),
+        },
         "stop_process" => {
             let targets = match resolve_stop_targets(sys, me, input) {
                 Ok(targets) => targets,
@@ -430,8 +526,9 @@ async fn execute_tool(
             };
             let (visible, unseen): (Vec<String>, Vec<String>) =
                 targets.into_iter().partition(|t| sys.is_visible(me, t));
-            let (allowed, denied): (Vec<String>, Vec<String>) =
-                visible.into_iter().partition(|t| sys.may(me, Capability::Stop, t));
+            let (allowed, denied): (Vec<String>, Vec<String>) = visible
+                .into_iter()
+                .partition(|t| sys.may(me, Capability::Stop, t));
             if allowed.is_empty() {
                 let mut why = Vec::new();
                 if !denied.is_empty() {
@@ -480,10 +577,15 @@ async fn execute_tool(
         }
         "call_process" => {
             let (Some(to), Some(message)) = (
-                input["process_id"].as_str().or_else(|| input["to"].as_str()),
+                input["process_id"]
+                    .as_str()
+                    .or_else(|| input["to"].as_str()),
                 input["message"].as_str(),
             ) else {
-                return ("call_process requires 'process_id' and 'message'.".into(), true);
+                return (
+                    "call_process requires 'process_id' and 'message'.".into(),
+                    true,
+                );
             };
             if to == me.id {
                 return ("You cannot call yourself.".into(), true);
@@ -526,7 +628,10 @@ async fn execute_tool(
             let (Some(target), Some(source)) =
                 (input["process_id"].as_str(), input["script"].as_str())
             else {
-                return ("patch_script requires 'process_id' and 'script'.".into(), true);
+                return (
+                    "patch_script requires 'process_id' and 'script'.".into(),
+                    true,
+                );
             };
             if !sys.is_visible(me, target) {
                 return (format!("No process with id '{target}'."), true);
@@ -544,7 +649,10 @@ async fn execute_tool(
                 );
             }
             if !me.grants.spawn.is_permissive() {
-                return ("Not permitted: you do not hold the spawn capability.".into(), true);
+                return (
+                    "Not permitted: you do not hold the spawn capability.".into(),
+                    true,
+                );
             }
             match sys.patch_script(target, source.to_string()) {
                 Ok(ok) => (ok, false),
@@ -556,7 +664,12 @@ async fn execute_tool(
     }
 }
 
-fn spawn_topology(sys: &Arc<System>, me: &Meta, input: &Value, history: &[Value]) -> (String, bool) {
+fn spawn_topology(
+    sys: &Arc<System>,
+    me: &Meta,
+    input: &Value,
+    history: &[Value],
+) -> (String, bool) {
     let Some(entries) = input["processes"].as_array() else {
         return ("spawn_topology requires a 'processes' array.".into(), true);
     };
@@ -565,7 +678,10 @@ fn spawn_topology(sys: &Arc<System>, me: &Meta, input: &Value, history: &[Value]
     }
     if entries.len() > MAX_GROUP {
         return (
-            format!("Too many processes: {} requested, limit is {MAX_GROUP}.", entries.len()),
+            format!(
+                "Too many processes: {} requested, limit is {MAX_GROUP}.",
+                entries.len()
+            ),
             true,
         );
     }
@@ -588,7 +704,10 @@ fn spawn_topology(sys: &Arc<System>, me: &Meta, input: &Value, history: &[Value]
             );
         }
         if seen.iter().any(|s| s == name) {
-            return (format!("Duplicate process name '{name}' in this topology."), true);
+            return (
+                format!("Duplicate process name '{name}' in this topology."),
+                true,
+            );
         }
         seen.push(name.to_string());
 
@@ -697,7 +816,9 @@ fn read_ids(input: &Value, fields: &[&str], verb: &str) -> Result<Ids, String> {
     // Deduplicate while preserving order, so a repeated id can't act twice.
     let mut seen = std::collections::HashSet::new();
     Ok(Ids::List(
-        list.into_iter().filter(|id| seen.insert(id.clone())).collect(),
+        list.into_iter()
+            .filter(|id| seen.insert(id.clone()))
+            .collect(),
     ))
 }
 
@@ -772,6 +893,8 @@ pub(crate) async fn call(
             from_name: me.name.clone(),
             body: body.to_string(),
             priority: Priority::High,
+            artifact_id: None,
+            artifact_chars: None,
             reply_to: Some(id.clone()),
             seq: 0,
         },
@@ -857,7 +980,9 @@ pub fn alias_specs(spec: &Value) -> Result<Vec<ToolAlias>, String> {
             return Err("Every entry in 'tools' needs 'name', 'description' and 'target'.".into());
         };
         if RESERVED_TOOLS.contains(&name) {
-            return Err(format!("'{name}' is a built-in tool and cannot be used as an alias."));
+            return Err(format!(
+                "'{name}' is a built-in tool and cannot be used as an alias."
+            ));
         }
         let schema = match &item["input_schema"] {
             Value::Null => json!({"type": "object", "properties": {}}),
@@ -873,7 +998,7 @@ pub fn alias_specs(spec: &Value) -> Result<Vec<ToolAlias>, String> {
     Ok(out)
 }
 
-const RESERVED_TOOLS: [&str; 7] = [
+const RESERVED_TOOLS: [&str; 8] = [
     "spawn_process",
     "spawn_topology",
     "send_message",
@@ -881,6 +1006,7 @@ const RESERVED_TOOLS: [&str; 7] = [
     "patch_script",
     "stop_process",
     "list_processes",
+    "mailbox",
 ];
 
 /// Read the capability fields common to both spawn tools. A missing field
@@ -966,10 +1092,7 @@ fn render_transcript(history: &[Value]) -> String {
         .find('\n')
         .map(|i| cut + i + 1)
         .unwrap_or(cut);
-    format!(
-        "[earlier context truncated]\n{}",
-        &transcript[boundary..]
-    )
+    format!("[earlier context truncated]\n{}", &transcript[boundary..])
 }
 
 fn tool_definitions(me: &Meta) -> Value {
@@ -982,7 +1105,7 @@ fn tool_definitions(me: &Meta) -> Value {
     // breakpoint, so every process still shares that prefix no matter which
     // optional tools follow. Capability-shaped variation costs one cache entry
     // per shape, not per process.
-    const ALWAYS: [&str; 2] = ["send_message", "list_processes"];
+    const ALWAYS: [&str; 3] = ["send_message", "mailbox", "list_processes"];
     let permitted = |name: &str| match name {
         "send_message" => me.grants.send.is_permissive(),
         // A roster is only useful to a process that can act on a name other
@@ -1161,7 +1284,7 @@ fn base_tools() -> Value {
         },
         {
             "name": "send_message",
-            "description": "Send a free-form text message to one or more process mailboxes. If a recipient is mid-task it sees the message between its tool calls; if idle, the message wakes it. The special id \"user\" prints on the human's console. To fan out, pass a list of ids or \"*\" (everyone you may message) — the body is written once no matter how many recipients. Fan out deliberately: each delivery wakes an idle recipient and costs it a full turn of thinking, so a broadcast to eight processes is eight times the work of one message.",
+            "description": "Send a free-form text message to one or more process mailboxes. If a recipient is mid-task it sees the message between its tool calls; if idle, the message wakes it. Agent-bound bodies over about 8000 characters are stored as recipient-scoped mailbox artifacts and delivered as a preview plus handle, so they do not consume context wholesale. The special id \"user\" prints on the human's console. To fan out, pass a list of ids or \"*\" (everyone you may message) — the body is written once no matter how many recipients. Fan out deliberately: each delivery wakes an idle recipient and costs it a full turn of thinking, so a broadcast to eight processes is eight times the work of one message.",
             "input_schema": {
                 "type": "object",
                 "properties": {
@@ -1184,6 +1307,32 @@ fn base_tools() -> Value {
                     }
                 },
                 "required": ["to", "message"]
+            }
+        },
+        {
+            "name": "mailbox",
+            "description": "Inspect long messages that the harness kept out of your context. A long incoming message includes an artifact_id and a short preview. List your handles, read only the character range you need (at most 8000 characters per call), or discard a stored copy when finished. Artifacts are private to the receiving process; this cannot read another process's mail.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["list", "read", "discard"]
+                    },
+                    "id": {
+                        "type": "string",
+                        "description": "Artifact handle from an incoming message or the list action. Required for read and discard."
+                    },
+                    "offset": {
+                        "type": "integer",
+                        "description": "Zero-based character offset for read; default 0."
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Characters to return for read; default 4000, maximum 8000."
+                    }
+                },
+                "required": ["action"]
             }
         },
         {
@@ -1264,6 +1413,8 @@ How the system works:
 <incoming_message from=\"...\"> tags. They can arrive at any moment, including between your tool \
 calls mid-task. Treat them like interruptions from a collaborator: read them when they appear \
 and factor them into what you do next.
+- Long incoming messages are kept out of context. Their tag carries artifact_id and artifact_chars, \
+and their body is only a preview; use the mailbox tool to list or page the stored original.
 - When you end a turn without calling a tool, you go idle until the next mailbox message wakes \
 you. Going idle is normal — end your turn when you have nothing left to do.
 - Message text is free-form. Be concise and information-dense.";
@@ -1288,7 +1439,9 @@ anyone, it just rides along the next time they run, so it is close to free.
 - send_message is one-way; call_process waits for an answer and hands it back inside the same \
 turn, so you can act on the result immediately. Use call_process when you need the answer to \
 decide what to do next, and send_message when you do not. If a message arrives carrying a \
-reply_to id, someone is blocked waiting on you: answer with send_message and in_reply_to.
+reply_to id, someone is blocked waiting on you: answer exactly once with send_message and \
+in_reply_to. Do not also send the same answer as ordinary mail; those are independent delivery \
+channels and the duplicate may arrive later.
 - A process can be a TypeScript script instead of an agent: pass `script` to spawn_process or a \
 topology node. Script processes have the same mailbox, links, permissions and namespace, but they \
 run deterministic code and cost no API tokens. Prefer one for any node whose job is mechanical — \
@@ -1510,9 +1663,15 @@ fn envelope(mail: &Mail) -> String {
         .as_ref()
         .map(|id| format!(" reply_to=\"{id}\""))
         .unwrap_or_default();
+    let artifact_attr = match (&mail.artifact_id, mail.artifact_chars) {
+        (Some(id), Some(chars)) => {
+            format!(" artifact_id=\"{id}\" artifact_chars=\"{chars}\"")
+        }
+        _ => String::new(),
+    };
     format!(
-        "<incoming_message from=\"{}\"{}{}>\n{}\n</incoming_message>",
-        mail.from, name_attr, reply_attr, mail.body
+        "<incoming_message from=\"{}\"{}{}{}>\n{}\n</incoming_message>",
+        mail.from, name_attr, reply_attr, artifact_attr, mail.body
     )
 }
 
@@ -1531,7 +1690,11 @@ fn compact_above(sys: &Arc<System>, model: &str) -> u64 {
     std::env::var("BITTY_COMPACT_ABOVE")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or_else(|| sys.api.context_window(model).saturating_sub(COMPACT_RESERVE))
+        .unwrap_or_else(|| {
+            sys.api
+                .context_window(model)
+                .saturating_sub(COMPACT_RESERVE)
+        })
 }
 
 /// True when this conversation is close enough to the model's window that the
@@ -1641,7 +1804,10 @@ async fn compact_conversation(
         "role": "user",
         "content": [text_block(&prompt)],
     }));
-    ui::trace(&me.tag, &format!("  … compacting {}k of conversation", before / 1_000));
+    ui::trace(
+        &me.tag,
+        &format!("  … compacting {}k of conversation", before / 1_000),
+    );
 
     let (model, effort) = (me.model(), me.effort());
     let no_tools = json!([]);
@@ -1694,14 +1860,20 @@ async fn compact_conversation(
             match sys.api.message(turn, &me.tag).await {
                 Ok(response) => extract(response),
                 Err(e) => {
-                    ui::warn(&me.tag, &format!("could not compact ({e}); continuing uncompacted"));
+                    ui::warn(
+                        &me.tag,
+                        &format!("could not compact ({e}); continuing uncompacted"),
+                    );
                     return;
                 }
             }
         }
     };
     if summary.trim().is_empty() {
-        ui::warn(&me.tag, "compaction produced nothing; continuing uncompacted");
+        ui::warn(
+            &me.tag,
+            "compaction produced nothing; continuing uncompacted",
+        );
         return;
     }
 
@@ -1727,7 +1899,11 @@ async fn compact_conversation(
                 let mut note = format!(
                     "\n\nYour run_script session survived compaction. These globals still \
                      exist — reuse them, do not redefine or re-fetch them: {}.",
-                    shown.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
+                    shown
+                        .iter()
+                        .map(|s| s.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
                 );
                 if !results.is_empty() {
                     note.push_str(&format!(
@@ -1765,7 +1941,12 @@ async fn compact_conversation(
     me.context_tokens
         .store((conversation_size(history) / 4) as u64, Ordering::Relaxed);
 
-    sys.journal.record(&me.id, &Event::Compacted { history: history.clone() });
+    sys.journal.record(
+        &me.id,
+        &Event::Compacted {
+            history: history.clone(),
+        },
+    );
     sys.journal.flush(&me.id);
     ui::system(&format!(
         "{} compacted: {}k → {}k of conversation",
@@ -1821,7 +2002,11 @@ fn me_tag(me: &Meta) -> &crate::ui::Tag {
 
 fn first_line(text: &str) -> String {
     let line = text.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
-    let rest = text.lines().filter(|l| !l.trim().is_empty()).count().saturating_sub(1);
+    let rest = text
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .count()
+        .saturating_sub(1);
     let line = truncate(line.trim(), 160);
     if rest > 0 {
         format!("{line} (+{rest} more lines, sent to the process)")
@@ -1836,5 +2021,40 @@ fn truncate(text: &str, max: usize) -> String {
     } else {
         let cut: String = text.chars().take(max).collect();
         format!("{cut}…")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn long_mail_handle_is_exposed_on_the_envelope() {
+        let mut mail = Mail::system("proc-2", "preview".into());
+        mail.artifact_id = Some("mail-proc-1-9".into());
+        mail.artifact_chars = Some(12_345);
+        let rendered = envelope(&mail);
+        assert!(rendered.contains("artifact_id=\"mail-proc-1-9\""));
+        assert!(rendered.contains("artifact_chars=\"12345\""));
+        assert!(rendered.contains("\npreview\n"));
+    }
+
+    #[test]
+    fn mailbox_is_a_reserved_builtin_tool() {
+        let spec = json!({
+            "tools": [{
+                "name": "mailbox",
+                "description": "shadow it",
+                "target": "proc-2"
+            }]
+        });
+        assert!(alias_specs(&spec).is_err());
+        assert!(
+            base_tools()
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|tool| tool["name"] == "mailbox")
+        );
     }
 }
