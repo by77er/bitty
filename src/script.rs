@@ -100,7 +100,12 @@ fn op_bitty_fs_read(
     #[string] path: String,
 ) -> Result<String, deno_error::JsErrorBox> {
     let host = state.borrow::<Host>();
-    let resolved = host.me.grants.read.resolve(&path, false).map_err(fs_error)?;
+    let resolved = host
+        .me
+        .grants
+        .read
+        .resolve(&path, false)
+        .map_err(fs_error)?;
     std::fs::read_to_string(&resolved).map_err(|e| fs_error(format!("{path}: {e}")))
 }
 
@@ -112,7 +117,12 @@ fn op_bitty_fs_write(
     #[string] contents: String,
 ) -> Result<String, deno_error::JsErrorBox> {
     let host = state.borrow::<Host>();
-    let resolved = host.me.grants.write.resolve(&path, true).map_err(fs_error)?;
+    let resolved = host
+        .me
+        .grants
+        .write
+        .resolve(&path, true)
+        .map_err(fs_error)?;
     std::fs::write(&resolved, contents).map_err(|e| fs_error(format!("{path}: {e}")))?;
     Ok(resolved.display().to_string())
 }
@@ -126,7 +136,12 @@ fn op_bitty_fs_list(
     #[string] path: String,
 ) -> Result<String, deno_error::JsErrorBox> {
     let host = state.borrow::<Host>();
-    let resolved = host.me.grants.read.resolve(&path, false).map_err(fs_error)?;
+    let resolved = host
+        .me
+        .grants
+        .read
+        .resolve(&path, false)
+        .map_err(fs_error)?;
     let mut entries = Vec::new();
     for entry in std::fs::read_dir(&resolved).map_err(|e| fs_error(format!("{path}: {e}")))? {
         let entry = entry.map_err(|e| fs_error(e.to_string()))?;
@@ -147,7 +162,12 @@ fn op_bitty_fs_mkdir(
     #[string] path: String,
 ) -> Result<String, deno_error::JsErrorBox> {
     let host = state.borrow::<Host>();
-    let resolved = host.me.grants.write.resolve(&path, true).map_err(fs_error)?;
+    let resolved = host
+        .me
+        .grants
+        .write
+        .resolve(&path, true)
+        .map_err(fs_error)?;
     std::fs::create_dir_all(&resolved).map_err(|e| fs_error(format!("{path}: {e}")))?;
     Ok(resolved.display().to_string())
 }
@@ -159,7 +179,12 @@ fn op_bitty_fs_remove(
     #[string] path: String,
 ) -> Result<String, deno_error::JsErrorBox> {
     let host = state.borrow::<Host>();
-    let resolved = host.me.grants.write.resolve(&path, false).map_err(fs_error)?;
+    let resolved = host
+        .me
+        .grants
+        .write
+        .resolve(&path, false)
+        .map_err(fs_error)?;
     let outcome = if resolved.is_dir() {
         std::fs::remove_dir_all(&resolved)
     } else {
@@ -174,6 +199,34 @@ fn op_bitty_fs_remove(
 /// re-parse and no metacharacter to smuggle. The allowlist is on the program
 /// name, which is a genuinely weaker boundary than a path prefix — whatever
 /// runs is bounded by the OS, not by this harness.
+/// The checks and the spawn itself, shared by the two shapes a caller can ask
+/// the result in: text for `api.exec`, raw bytes for `Deno.Command`.
+fn run_program(
+    state: &mut OpState,
+    program: &str,
+    args: &[String],
+    cwd: &str,
+) -> Result<std::process::Output, deno_error::JsErrorBox> {
+    let host = state.borrow::<Host>();
+    if !host.me.may(crate::grants::Capability::Run, program) {
+        return Err(fs_error(format!(
+            "not permitted to run '{program}'; you may run {}",
+            host.me.permitted(crate::grants::Capability::Run)
+        )));
+    }
+    // The working directory has to be somewhere this process can already read,
+    // so running a command cannot become a way to reach outside its roots.
+    let dir = host.me.grants.read.resolve(cwd, false).map_err(fs_error)?;
+    std::process::Command::new(program)
+        .args(args)
+        .current_dir(&dir)
+        .output()
+        .map_err(|e| fs_error(format!("{program}: {e}")))
+}
+
+/// `api.exec`: output as text, which is what a script handling a command's
+/// result almost always wants. Lossy for output that is not valid UTF-8, by
+/// construction — a caller who needs the bytes themselves wants the op below.
 #[op2]
 #[string]
 fn op_bitty_exec(
@@ -182,27 +235,43 @@ fn op_bitty_exec(
     #[serde] args: Vec<String>,
     #[string] cwd: String,
 ) -> Result<String, deno_error::JsErrorBox> {
-    let host = state.borrow::<Host>();
-    if !host.me.may(crate::grants::Capability::Run, &program) {
-        return Err(fs_error(format!(
-            "not permitted to run '{program}'; you may run {}",
-            host.me.permitted(crate::grants::Capability::Run)
-        )));
-    }
-    // The working directory has to be somewhere this process can already read,
-    // so running a command cannot become a way to reach outside its roots.
-    let dir = host.me.grants.read.resolve(&cwd, false).map_err(fs_error)?;
-    let output = std::process::Command::new(&program)
-        .args(&args)
-        .current_dir(&dir)
-        .output()
-        .map_err(|e| fs_error(format!("{program}: {e}")))?;
+    let output = run_program(state, &program, &args, &cwd)?;
     Ok(json!({
         "code": output.status.code(),
         "stdout": String::from_utf8_lossy(&output.stdout),
         "stderr": String::from_utf8_lossy(&output.stderr),
     })
     .to_string())
+}
+
+/// What `Deno.Command` is specified to hand back: the bytes the program wrote,
+/// as `Uint8Array`s. Routing those through a `String` first would be wrong
+/// twice over — anything not valid UTF-8 would already have become replacement
+/// characters, and the caller's `new TextDecoder().decode(out.stdout)` would be
+/// handed a string where a buffer belongs. `ToJsBuffer` moves the vector into
+/// V8 as a byte view, so nothing is copied through a text encoding at all.
+#[derive(serde::Serialize)]
+struct ExecBytes {
+    /// None when the child was killed by a signal rather than exiting.
+    code: Option<i32>,
+    stdout: deno_core::ToJsBuffer,
+    stderr: deno_core::ToJsBuffer,
+}
+
+#[op2]
+#[serde]
+fn op_bitty_exec_bytes(
+    state: &mut OpState,
+    #[string] program: String,
+    #[serde] args: Vec<String>,
+    #[string] cwd: String,
+) -> Result<ExecBytes, deno_error::JsErrorBox> {
+    let output = run_program(state, &program, &args, &cwd)?;
+    Ok(ExecBytes {
+        code: output.status.code(),
+        stdout: output.stdout.into(),
+        stderr: output.stderr.into(),
+    })
 }
 
 /// Bind a port and serve it. The accept loop runs on the *main* runtime, not
@@ -387,8 +456,14 @@ async fn serve_connection(
         head.push_str("content-type: text/plain; charset=utf-8\r\n");
     }
     head.push_str("\r\n");
-    stream.write_all(head.as_bytes()).await.map_err(|e| e.to_string())?;
-    stream.write_all(text.as_bytes()).await.map_err(|e| e.to_string())?;
+    stream
+        .write_all(head.as_bytes())
+        .await
+        .map_err(|e| e.to_string())?;
+    stream
+        .write_all(text.as_bytes())
+        .await
+        .map_err(|e| e.to_string())?;
     stream.flush().await.map_err(|e| e.to_string())?;
     Ok(())
 }
@@ -415,7 +490,7 @@ fn reason(status: u16) -> &'static str {
 /// and a message still lands the moment it arrives.
 #[op2(async(deferred), nofast)]
 async fn op_bitty_sleep(millis: f64) {
-    let millis = millis.max(0.0).min(86_400_000.0) as u64;
+    let millis = millis.clamp(0.0, 86_400_000.0) as u64;
     tokio::time::sleep(std::time::Duration::from_millis(millis)).await;
 }
 
@@ -618,8 +693,8 @@ fn op_bitty_fetch(
     // Headers are the difference between "can make a request" and "can use an
     // API": without them there is no way to authenticate, and the failure looks
     // like a rejected credential rather than a missing one.
-    let supplied: serde_json::Map<String, Value> = serde_json::from_str(&headers)
-        .unwrap_or_default();
+    let supplied: serde_json::Map<String, Value> =
+        serde_json::from_str(&headers).unwrap_or_default();
 
     let client = reqwest::Client::new();
     let (tx, rx) = std::sync::mpsc::channel();
@@ -753,9 +828,14 @@ async fn op_bitty_call(
         return Err(fs_error(format!("invalid arguments for '{name}': {e}")));
     }
     let body = serde_json::to_string(&parsed).unwrap_or_else(|_| "{}".into());
-    let (reply, is_error) =
-        crate::agent::call(&sys, &me, &alias.target, &body, crate::agent::DEFAULT_CALL_TIMEOUT)
-            .await;
+    let (reply, is_error) = crate::agent::call(
+        &sys,
+        &me,
+        &alias.target,
+        &body,
+        crate::agent::DEFAULT_CALL_TIMEOUT,
+    )
+    .await;
     if is_error {
         return Err(fs_error(reply));
     }
@@ -925,15 +1005,22 @@ globalThis.bitty = (() => {
   };
 
 
-  // Deno.Command, minus the byte-array plumbing: stdout and stderr come back
-  // as strings, which is what a script actually wants here.
+  // Deno.Command. stdout and stderr are Uint8Arrays, as the real API specifies:
+  // the idiom every caller writes is `new TextDecoder().decode(out.stdout)`, and
+  // handing that a string used to produce silent mojibake instead of text.
+  // `api.exec` keeps its own contract and still returns them as strings.
   D.Command = class {
     constructor(program, options = {}) {
       this._program = program;
       this._args = options.args ?? [];
       this._cwd = options.cwd ?? ".";
     }
-    outputSync() { return api.exec(this._program, this._args, this._cwd); }
+    outputSync() {
+      const r = ops.op_bitty_exec_bytes(
+        String(this._program), this._args.map(String), String(this._cwd));
+      // code is null when the child was killed by a signal, which is not success.
+      return { code: r.code, success: r.code === 0, signal: null, stdout: r.stdout, stderr: r.stderr };
+    }
     output() { return Promise.resolve(this.outputSync()); }
   };
 
@@ -946,7 +1033,19 @@ globalThis.bitty = (() => {
     constructor(label = "utf-8") { this.encoding = String(label).toLowerCase(); }
     decode(input) {
       if (input == null) return "";
-      const bytes = input instanceof ArrayBuffer ? new Uint8Array(input) : input;
+      // A string is not a BufferSource, and letting one through was silent
+      // corruption rather than an error: bytes[i] came out a one-character
+      // string, every range test below coerced to NaN and failed, and four
+      // input characters collapsed into one garbage code point — ASCII in,
+      // CJK mojibake out. Throw, the way the spec does.
+      let bytes;
+      if (input instanceof ArrayBuffer) bytes = new Uint8Array(input);
+      else if (ArrayBuffer.isView(input)) {
+        bytes = new Uint8Array(input.buffer, input.byteOffset, input.byteLength);
+      } else {
+        throw new TypeError(
+          "TextDecoder.decode expects an ArrayBuffer or a view of one, not " + typeof input);
+      }
       let out = "";
       for (let i = 0; i < bytes.length; ) {
         const b = bytes[i];
@@ -1186,14 +1285,25 @@ pub async fn run(
     let handle = std::thread::Builder::new()
         .name(me.id.clone())
         .spawn(move || {
-            let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+            let rt = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
                 Ok(rt) => rt,
                 Err(e) => {
                     ui::warn(&me.tag, &format!("could not start script runtime: {e}"));
                     return;
                 }
             };
-            rt.block_on(actor_loop(sys, me, mailbox, control, instructions, source, resumed));
+            rt.block_on(actor_loop(
+                sys,
+                me,
+                mailbox,
+                control,
+                instructions,
+                source,
+                resumed,
+            ));
         });
     if let Err(e) = handle {
         ui::warn(&tag, &format!("could not spawn script thread: {e}"));
@@ -1244,7 +1354,9 @@ async fn actor_loop(
         }
 
         let wake = {
-            let js = runtime.as_mut().expect("runtime is present while the loop runs");
+            let js = runtime
+                .as_mut()
+                .expect("runtime is present while the loop runs");
             tokio::select! {
                 // Code replacement is out of band, so it is never mistaken for a
                 // message and cannot be starved behind a full mailbox.
@@ -1263,10 +1375,10 @@ async fn actor_loop(
                 settled = true;
                 if let Err(e) = result {
                     ui::warn(&me.tag, &format!("handler failed: {e}"));
-                    if let Some(id) = pending_reply.take() {
-                        if sys.call_is_pending(&id) {
-                            sys.resolve_call(&id, Err(format!("the handler raised: {e}")));
-                        }
+                    if let Some(id) = pending_reply.take()
+                        && sys.call_is_pending(&id)
+                    {
+                        sys.resolve_call(&id, Err(format!("the handler raised: {e}")));
                     }
                 }
                 continue;
@@ -1275,8 +1387,13 @@ async fn actor_loop(
                 ui::trace(&me.tag, "⟳ replacing script code");
                 // The old code's sockets and closures die with this runtime,
                 // so its onStop is the last chance to close them cleanly.
-                run_cleanup(runtime.as_mut().expect("runtime is present while the loop runs"), &me.tag)
-                    .await;
+                run_cleanup(
+                    runtime
+                        .as_mut()
+                        .expect("runtime is present while the loop runs"),
+                    &me.tag,
+                )
+                .await;
                 drop(runtime.take());
                 match boot(&sys, &me, &instructions, &source, true, false).await {
                     Some(fresh) => runtime = Some(fresh),
@@ -1288,8 +1405,13 @@ async fn actor_loop(
             // The sender is dropped when this process is stopped, which is how
             // a blocked script learns to exit.
             Wake::Ctl(None) | Wake::Mail(None) => {
-                run_cleanup(runtime.as_mut().expect("runtime is present while the loop runs"), &me.tag)
-                    .await;
+                run_cleanup(
+                    runtime
+                        .as_mut()
+                        .expect("runtime is present while the loop runs"),
+                    &me.tag,
+                )
+                .await;
                 return;
             }
             Wake::Mail(Some(mail)) => mail,
@@ -1310,7 +1432,9 @@ async fn actor_loop(
 
         let call = format!("globalThis.__bitty_deliver({payload});");
         pending_reply = mail.reply_to.clone();
-        let js = runtime.as_mut().expect("runtime is present while the loop runs");
+        let js = runtime
+            .as_mut()
+            .expect("runtime is present while the loop runs");
         // Only the synchronous part runs here. Whatever the handler leaves
         // pending is driven by the race at the top of the loop, which is what
         // lets a handler await a socket without deafening the process.
@@ -1319,10 +1443,10 @@ async fn actor_loop(
             ui::warn(&me.tag, &format!("handler failed: {e}"));
             // A caller blocked on this message must not wait for the timeout
             // when the handler has already blown up.
-            if let Some(id) = pending_reply.take() {
-                if sys.call_is_pending(&id) {
-                    sys.resolve_call(&id, Err(format!("the handler raised: {e}")));
-                }
+            if let Some(id) = pending_reply.take()
+                && sys.call_is_pending(&id)
+            {
+                sys.resolve_call(&id, Err(format!("the handler raised: {e}")));
             }
         }
         // A script has no turns, so this is its turn boundary: the point at
@@ -1423,7 +1547,10 @@ impl Session {
         let (id, rx) = sys.register_call(&me.id, &me.id);
         if self
             .tx
-            .send(EvalRequest { source: source.to_string(), call_id: id.clone() })
+            .send(EvalRequest {
+                source: source.to_string(),
+                call_id: id.clone(),
+            })
             .is_err()
         {
             sys.resolve_call(&id, Err(String::new()));
@@ -1440,7 +1567,10 @@ impl Session {
                     handle.terminate_execution();
                 }
                 sys.resolve_call(&id, Err("timed out".into()));
-                ui::warn(&me.tag, "session eval timed out; the running code was terminated");
+                ui::warn(
+                    &me.tag,
+                    "session eval timed out; the running code was terminated",
+                );
                 (
                     "the script did not finish in time and was terminated. The session and its \
                      g.* state survive. If the work is genuinely long-running, do it in a script \
@@ -1484,7 +1614,10 @@ fn session_thread(
     mut rx: UnboundedReceiver<EvalRequest>,
     slot: Arc<std::sync::Mutex<Option<deno_core::v8::IsolateHandle>>>,
 ) {
-    let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
+    let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    else {
         return;
     };
     rt.block_on(async move {
@@ -1588,6 +1721,7 @@ async fn boot(
         op_bitty_fs_mkdir(),
         op_bitty_fs_remove(),
         op_bitty_exec(),
+        op_bitty_exec_bytes(),
         op_bitty_fetch(),
         op_bitty_serve(),
         op_bitty_sleep(),
@@ -1832,10 +1966,7 @@ mod tests {
     // on disk before run_cleanup returns.
     #[tokio::test]
     async fn on_stop_handler_runs_before_the_runtime_is_torn_down() {
-        // SAFETY (test-only): no other test in this binary reads or writes
-        // ANTHROPIC_API_KEY, and Client::from_env only reads it — it never
-        // makes a network call, since script processes never touch sys.api.
-        unsafe { std::env::set_var("ANTHROPIC_API_KEY", "sk-ant-test-not-real") };
+        test_key();
         // Real grant roots are always canonicalized at spawn time (system.rs);
         // macOS's temp dir is itself a symlink (/var -> /private/var), so
         // skipping that here would reject every write as "outside" the root.
@@ -1856,12 +1987,329 @@ mod tests {
             "#
         );
 
-        let mut runtime = boot(&sys, &me, "test", &source, false, false).await.expect("boot should succeed");
+        let mut runtime = boot(&sys, &me, "test", &source, false, false)
+            .await
+            .expect("boot should succeed");
         run_cleanup(&mut runtime, &me.tag).await;
 
         let contents =
             std::fs::read_to_string(&marker).expect("onStop should have written the marker file");
         assert_eq!(contents, "cleaned up");
         let _ = std::fs::remove_file(&marker);
+    }
+
+    /// `Client::from_env` reads ANTHROPIC_API_KEY, and it never makes a network
+    /// call — script processes have no access to sys.api at all. Every test
+    /// here goes through this before building a client, so the single write is
+    /// ordered ahead of every read of it.
+    fn test_key() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        // SAFETY (test-only): behind a Once, so it happens exactly once and
+        // strictly before any Client::from_env below; nothing ever unsets it.
+        ONCE.call_once(|| unsafe {
+            std::env::set_var("ANTHROPIC_API_KEY", "sk-ant-test-not-real")
+        });
+    }
+
+    /// Boot a throwaway script runtime that may run python3 inside the temp
+    /// directory, run `body` as its top level, and hand back what the body
+    /// returned. A test has no other channel into an isolate, so the value
+    /// comes out through a marker file — the same trick the onStop test above
+    /// uses. `TMP` is in scope for the body, as a directory to run in.
+    async fn eval_json(body: &str) -> Value {
+        test_key();
+        // Real grant roots are always canonicalized at spawn time (system.rs);
+        // macOS's temp dir is itself a symlink (/var -> /private/var), so
+        // skipping that here would reject every path as "outside" the root.
+        let temp = std::env::temp_dir().canonicalize().unwrap();
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let marker = temp.join(format!(
+            "bitty-script-test-{}-{}.json",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_file(&marker);
+
+        let client = crate::api::Client::from_env().unwrap();
+        let sys = Arc::new(System::new(client));
+        let mut me = test_meta("proc-test", temp.clone());
+        me.grants.run = Grant::Ids(HashSet::from(["python3".to_string()]));
+        me.grants.read = PathGrant::Under(vec![temp.clone()]);
+
+        let source = format!(
+            r#"
+            const TMP = {temp:?};
+            try {{
+              const __value = (() => {{ {body} }})();
+              bitty.fs.write({marker:?}, JSON.stringify(__value));
+            }} catch (e) {{
+              bitty.fs.write({marker:?}, JSON.stringify({{
+                threw: String(e && e.name),
+                message: String(e && e.message ? e.message : e),
+              }}));
+            }}
+            "#
+        );
+        let runtime = boot(&sys, &me, "test", &source, false, false).await;
+        assert!(runtime.is_some(), "the test script should have loaded");
+        let raw = std::fs::read_to_string(&marker)
+            .expect("the test script should have written its result");
+        let _ = std::fs::remove_file(&marker);
+        serde_json::from_str(&raw).expect("the test script should have written JSON")
+    }
+
+    /// A `Deno.Command` that has python3 write exactly `payload` (a python bytes
+    /// expression) to `stream`, so a test can ask for an odd length or for
+    /// bytes that are not valid UTF-8 without a shell in the way.
+    fn emit(stream: &str, payload: &str) -> String {
+        format!(
+            r#"const out = new Deno.Command("python3", {{
+                 args: ["-c", "import sys; sys.{stream}.buffer.write({payload})"],
+                 cwd: TMP,
+               }}).outputSync();"#
+        )
+    }
+
+    // REGRESSION (the bug this group exists for): `Deno.Command`'s output used
+    // to come back as a JS *string*, and the TextDecoder polyfill accepted a
+    // string silently — `bytes[i]` was a one-character string, every range test
+    // coerced to NaN and failed, and four input characters collapsed into one
+    // garbage code point. ASCII in, CJK mojibake out: `echo hello` decoded to
+    // "\u{0}\u{0}", and digit-rich output (digits being the one character class
+    // that coerces to a number) produced glyphs like "Ɂ ቅ ⁄ ㇃ 䃂 熃 耆". Nothing
+    // was ever wrong with the bytes, only with JS's view of them. This pins the
+    // whole round trip: what the program printed is what decode() returns.
+    #[tokio::test]
+    async fn subprocess_stdout_decodes_to_exactly_what_the_program_printed() {
+        let expected = "Bitty 0123456789 the quick brown fox";
+        let v = eval_json(&format!(
+            "{} return {{ text: new TextDecoder().decode(out.stdout) }};",
+            emit("stdout", &format!("b'{expected}'"))
+        ))
+        .await;
+        assert_eq!(
+            v["text"], expected,
+            "stdout should decode verbatim, got {v}"
+        );
+    }
+
+    /// The shape of the value, not only its contents: a two-byte element view
+    /// is exactly what turns ASCII into CJK, so pin element width and length.
+    #[tokio::test]
+    async fn subprocess_stdout_is_a_uint8array_of_the_true_byte_length() {
+        let v = eval_json(&format!(
+            "{} return {{ ctor: out.stdout.constructor.name, bpe: out.stdout.BYTES_PER_ELEMENT, \
+             len: out.stdout.length, byteLength: out.stdout.byteLength, \
+             isView: ArrayBuffer.isView(out.stdout) }};",
+            emit("stdout", "b'hello there'")
+        ))
+        .await;
+        assert_eq!(
+            v["ctor"], "Uint8Array",
+            "stdout should be a Uint8Array, got {v}"
+        );
+        assert_eq!(
+            v["bpe"], 1,
+            "stdout elements should be single bytes, got {v}"
+        );
+        assert_eq!(
+            v["len"], 11,
+            "stdout length should be the byte count, got {v}"
+        );
+        assert_eq!(
+            v["byteLength"], 11,
+            "stdout byteLength should be the byte count, got {v}"
+        );
+        assert_eq!(
+            v["isView"], true,
+            "stdout should be a view over a buffer, got {v}"
+        );
+    }
+
+    /// An odd byte count is unrepresentable in a two-byte-element view, so this
+    /// fails loudly if the buffer is ever reinterpreted as UTF-16.
+    #[tokio::test]
+    async fn subprocess_stdout_survives_an_odd_byte_count() {
+        let v = eval_json(&format!(
+            "{} return {{ len: out.stdout.length, text: new TextDecoder().decode(out.stdout) }};",
+            emit("stdout", "b'abcde'")
+        ))
+        .await;
+        assert_eq!(
+            v["len"], 5,
+            "five bytes should arrive as five elements, got {v}"
+        );
+        assert_eq!(
+            v["text"], "abcde",
+            "an odd-length payload should decode intact, got {v}"
+        );
+    }
+
+    /// Multi-byte UTF-8 must be decoded once and only once — a double decode or
+    /// a lossy pass shows up here as mojibake or U+FFFD.
+    #[tokio::test]
+    async fn subprocess_stdout_decodes_multibyte_utf8() {
+        let v = eval_json(&format!(
+            "{} return {{ len: out.stdout.length, text: new TextDecoder().decode(out.stdout) }};",
+            emit("stdout", r"'h\u00e9llo \u2713'.encode('utf-8')")
+        ))
+        .await;
+        assert_eq!(
+            v["len"], 10,
+            "h\u{e9}llo \u{2713} is ten UTF-8 bytes, got {v}"
+        );
+        assert_eq!(
+            v["text"], "h\u{e9}llo \u{2713}",
+            "multibyte UTF-8 should survive, got {v}"
+        );
+    }
+
+    /// Bytes that are not valid UTF-8 reach JS unchanged: the buffer is the
+    /// program's output, not a string that was decoded on the way there.
+    #[tokio::test]
+    async fn subprocess_stdout_preserves_bytes_that_are_not_valid_utf8() {
+        let v = eval_json(&format!(
+            "{} return {{ bytes: Array.from(out.stdout) }};",
+            emit("stdout", "bytes([0xff, 0xfe, 0x41])")
+        ))
+        .await;
+        assert_eq!(
+            v["bytes"],
+            json!([255, 254, 65]),
+            "invalid UTF-8 should survive, got {v}"
+        );
+    }
+
+    /// stderr goes through the identical conversion, and it is the half a
+    /// caller reaches for when a command fails.
+    #[tokio::test]
+    async fn subprocess_stderr_is_bytes_like_stdout() {
+        let v = eval_json(&format!(
+            "{} return {{ ctor: out.stderr.constructor.name, bpe: out.stderr.BYTES_PER_ELEMENT, \
+             err: new TextDecoder().decode(out.stderr), outLen: out.stdout.length }};",
+            emit("stderr", "b'boom 42'")
+        ))
+        .await;
+        assert_eq!(
+            v["ctor"], "Uint8Array",
+            "stderr should be a Uint8Array, got {v}"
+        );
+        assert_eq!(
+            v["bpe"], 1,
+            "stderr elements should be single bytes, got {v}"
+        );
+        assert_eq!(
+            v["err"], "boom 42",
+            "stderr should decode verbatim, got {v}"
+        );
+        assert_eq!(v["outLen"], 0, "nothing was written to stdout, got {v}");
+    }
+
+    /// Nothing in the conversion may chunk or truncate: 100_000 bytes is well
+    /// past any 64 KiB pipe buffer.
+    #[tokio::test]
+    async fn subprocess_stdout_survives_a_payload_larger_than_64_kib() {
+        let v = eval_json(&format!(
+            "{} const text = new TextDecoder().decode(out.stdout); \
+             return {{ len: out.stdout.length, textLen: text.length, \
+             matches: text === '0123456789'.repeat(10000) }};",
+            emit("stdout", "b'0123456789' * 10000")
+        ))
+        .await;
+        assert_eq!(v["len"], 100_000, "every byte should arrive, got {v}");
+        assert_eq!(v["textLen"], 100_000, "every byte should decode, got {v}");
+        assert_eq!(
+            v["matches"], true,
+            "a large payload should decode verbatim, got {v}"
+        );
+    }
+
+    /// The rest of the documented CommandOutput shape, which the shim used to
+    /// omit entirely: a caller checking `out.success` got undefined.
+    #[tokio::test]
+    async fn subprocess_output_reports_success_and_exit_code() {
+        let v = eval_json(
+            r#"const ok = new Deno.Command("python3", { args: ["-c", "pass"], cwd: TMP }).outputSync();
+               const bad = new Deno.Command("python3", { args: ["-c", "raise SystemExit(3)"], cwd: TMP }).outputSync();
+               return { okCode: ok.code, okSuccess: ok.success, badCode: bad.code, badSuccess: bad.success };"#,
+        )
+        .await;
+        assert_eq!(v["okCode"], 0, "a clean exit is code 0, got {v}");
+        assert_eq!(v["okSuccess"], true, "a clean exit is a success, got {v}");
+        assert_eq!(
+            v["badCode"], 3,
+            "the child's exit code should come through, got {v}"
+        );
+        assert_eq!(
+            v["badSuccess"], false,
+            "a nonzero exit is not a success, got {v}"
+        );
+    }
+
+    /// The failure mode that cost two processes an hour: decode() was handed
+    /// something that is not a BufferSource and returned garbage rather than
+    /// raising. A TypeError, as the spec requires, is the whole point.
+    #[tokio::test]
+    async fn text_decoder_rejects_a_string_instead_of_silently_decoding_it() {
+        let v = eval_json(
+            r#"try {
+                 const bad = new TextDecoder().decode("already a string");
+                 return { threw: null, returned: bad };
+               } catch (e) { return { threw: String(e.name), message: String(e.message) }; }"#,
+        )
+        .await;
+        assert_eq!(
+            v["threw"], "TypeError",
+            "decoding a string should throw, got {v}"
+        );
+    }
+
+    /// The encoder and decoder are both ours, so round-tripping through them is
+    /// the cheapest proof that neither drops a multibyte sequence.
+    #[tokio::test]
+    async fn text_encoder_and_decoder_round_trip_multibyte_utf8() {
+        let v = eval_json(
+            r#"const bytes = new TextEncoder().encode("h\u00e9llo \u2713");
+               return { ctor: bytes.constructor.name, len: bytes.length,
+                        back: new TextDecoder().decode(bytes) };"#,
+        )
+        .await;
+        assert_eq!(
+            v["ctor"], "Uint8Array",
+            "encode should produce bytes, got {v}"
+        );
+        assert_eq!(
+            v["len"], 10,
+            "h\u{e9}llo \u{2713} is ten UTF-8 bytes, got {v}"
+        );
+        assert_eq!(
+            v["back"], "h\u{e9}llo \u{2713}",
+            "the round trip should be lossless, got {v}"
+        );
+    }
+
+    /// A view into the middle of a buffer decodes its own window, not the whole
+    /// allocation behind it.
+    #[tokio::test]
+    async fn text_decoder_honours_a_view_offset() {
+        let v = eval_json(
+            r#"const all = new Uint8Array([65, 66, 67, 68]);
+               return { part: new TextDecoder().decode(all.subarray(1, 3)),
+                        whole: new TextDecoder().decode(all),
+                        buffer: new TextDecoder().decode(all.buffer) };"#,
+        )
+        .await;
+        assert_eq!(
+            v["part"], "BC",
+            "a subarray should decode only its window, got {v}"
+        );
+        assert_eq!(
+            v["whole"], "ABCD",
+            "a full view should decode wholly, got {v}"
+        );
+        assert_eq!(
+            v["buffer"], "ABCD",
+            "an ArrayBuffer should still decode, got {v}"
+        );
     }
 }
