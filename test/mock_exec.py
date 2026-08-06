@@ -2,16 +2,43 @@ import json, os
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 REPO=os.environ["BITTY_TEST_REPO"]
 SCRIPT = """
+const CWD = %s;
+// Codepoints rather than escapes: this file is read through two layers of
+// string literal, and a mojibake regression test that mangles its own
+// expectation proves nothing.
+const CODES = [104, 233, 108, 108, 111, 32, 10003, 32, 8594];
+const EXPECT = CODES.map((c) => String.fromCodePoint(c)).join("");
+const PY = "import sys; sys.stdout.buffer.write(''.join(chr(c) for c in [" +
+  CODES.join(",") + "]).encode('utf-8')); sys.stderr.write('e')";
 bitty.onMail((mail, api): string => {
   if (mail.body === "run") {
-    const r = api.exec("python3", ["-c", "print(6*7)"], %s);
+    const r = api.exec("python3", ["-c", "print(6*7)"], CWD);
     return `code=${r.code} out=${r.stdout.trim()}`;
   }
-  if (mail.body === "mkdir") { api.fs.mkdir(%s + "/newdir"); return "made"; }
-  try { api.exec("rm", ["-rf", "/"], %s); return "RAN_FORBIDDEN"; }
+  // The two exec paths have deliberately different contracts: api.exec hands
+  // back text, Deno.Command hands back the bytes the program actually wrote.
+  if (mail.body === "types") {
+    const t = api.exec("python3", ["-c", PY], CWD);
+    const out = new Deno.Command("python3", { args: ["-c", PY], cwd: CWD })
+      .outputSync();
+    return [
+      "exec.stdout=" + typeof t.stdout,
+      "exec.stderr=" + typeof t.stderr,
+      "exec.text=" + (t.stdout === EXPECT),
+      "exec.errtext=" + (t.stderr === "e"),
+      "cmd.stdout=" + out.stdout.constructor.name,
+      "cmd.stderr=" + out.stderr.constructor.name,
+      "cmd.len=" + out.stdout.length,
+      "cmd.text=" + (new TextDecoder().decode(out.stdout) === EXPECT),
+      "cmd.code=" + out.code,
+      "cmd.success=" + out.success,
+    ].join(" ");
+  }
+  if (mail.body === "mkdir") { api.fs.mkdir(CWD + "/newdir"); return "made"; }
+  try { api.exec("rm", ["-rf", "/"], CWD); return "RAN_FORBIDDEN"; }
   catch (e) { return `blocked:${e instanceof Error ? e.message : String(e)}`; }
 });
-""" % (json.dumps(REPO), json.dumps(REPO), json.dumps(REPO))
+""" % json.dumps(REPO)
 def sse(e): return "".join(f"event: {x['type']}\ndata: {json.dumps(x)}\n\n" for x in e).encode()
 def turn(blocks, stop):
     ev=[{"type":"message_start","message":{"id":"m","type":"message","role":"assistant","content":[],"model":"claude-opus-5","usage":{"input_tokens":10}}}]
@@ -46,13 +73,27 @@ class H(BaseHTTPRequestHandler):
             r=results(messages[-1])[0]
             if r["is_error"] or "out=42" not in r["content"]:
                 return self.fail(f"python3 should have run: {r}")
-            ev=turn([("tool_use","t3","call_process",{"process_id":"proc-2","message":"mkdir"})],"tool_use")
+            ev=turn([("tool_use","t3","call_process",{"process_id":"proc-2","message":"types"})],"tool_use")
         elif n==3:
             r=results(messages[-1])[0]
             if r["is_error"]:
-                return self.fail(f"mkdir should work with write access: {r}")
-            ev=turn([("tool_use","t4","call_process",{"process_id":"proc-2","message":"forbidden"})],"tool_use")
+                return self.fail(f"the exec contract probe failed outright: {r}")
+            got=r["content"] if isinstance(r["content"],str) else flat(r["content"])
+            # api.exec is documented to return text and Deno.Command to return
+            # the raw bytes; the day they converge, one of them has regressed.
+            want=["exec.stdout=string","exec.stderr=string","exec.text=true","exec.errtext=true",
+                  "cmd.stdout=Uint8Array","cmd.stderr=Uint8Array","cmd.len=14","cmd.text=true",
+                  "cmd.code=0","cmd.success=true"]
+            missing=[w for w in want if w not in got]
+            if missing:
+                return self.fail(f"exec contract broken: missing {missing} in {got!r}")
+            ev=turn([("tool_use","t4","call_process",{"process_id":"proc-2","message":"mkdir"})],"tool_use")
         elif n==4:
+            r=results(messages[-1])[0]
+            if r["is_error"]:
+                return self.fail(f"mkdir should work with write access: {r}")
+            ev=turn([("tool_use","t5","call_process",{"process_id":"proc-2","message":"forbidden"})],"tool_use")
+        elif n==5:
             r=results(messages[-1])[0]
             if "RAN_FORBIDDEN" in r["content"]:
                 return self.fail("a program outside the allowlist was executed")

@@ -16,9 +16,13 @@ Server-side assertions (surface as HTTP 400 in the harness):
   - writer must not be able to stop the editor
 """
 import json
+import os
+import tempfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-LOG = open("/tmp/claude-1000/-home-bit-Code-Bitty/29b2838b-63ef-4bac-9206-4b943883dc56/scratchpad/topology_requests.jsonl", "w")
+# Whatever machine runs the suite: the request log is a debug aid, so it lives
+# in the system temp dir rather than a path baked in from someone's checkout.
+LOG = open(os.path.join(tempfile.gettempdir(), "topology_requests.jsonl"), "w")
 
 
 def sse(events):

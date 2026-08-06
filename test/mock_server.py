@@ -8,9 +8,13 @@ Also asserts that thinking blocks (with signature) are echoed back unchanged;
 returns HTTP 400 if not, which surfaces as a visible error in the harness.
 """
 import json
+import os
+import tempfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-LOG = open("/tmp/claude-1000/-home-bit-Code-Bitty/29b2838b-63ef-4bac-9206-4b943883dc56/scratchpad/mock_requests.jsonl", "w")
+# Whatever machine runs the suite: the request log is a debug aid, so it lives
+# in the system temp dir rather than a path baked in from someone's checkout.
+LOG = open(os.path.join(tempfile.gettempdir(), "mock_requests.jsonl"), "w")
 
 
 def sse(events):

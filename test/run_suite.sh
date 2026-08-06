@@ -7,7 +7,22 @@
 # every mock dies at launch — which used to read as a wall of vacuous passes
 # before the mock-liveness check existed.
 SCRATCH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd /home/bit/Code/Bitty || exit 1
+# setsid is Linux-only; where it is absent the launch must degrade to a plain
+# background job rather than dying with "command not found".
+SETSID=""; command -v setsid >/dev/null 2>&1 && SETSID="setsid"
+# A hard cap on each harness run, everywhere: a scenario that hangs must not
+# hang the suite. GNU timeout is absent on macOS, where coreutils may supply
+# gtimeout and perl's alarm is the portable fallback of last resort.
+if command -v timeout >/dev/null 2>&1; then
+  CAP=(timeout 180)
+elif command -v gtimeout >/dev/null 2>&1; then
+  CAP=(gtimeout 180)
+elif command -v perl >/dev/null 2>&1; then
+  CAP=(perl -e 'alarm 180; exec @ARGV')
+else
+  CAP=()
+fi
+cd "$SCRATCH/.." || exit 1
 # Bash otherwise announces "Terminated" for every leftover process reaped
 # below, which buries the actual results.
 set +m
@@ -36,7 +51,9 @@ run() {
   for _ in $(seq 40); do
     (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null && exec 3<&- && sleep 0.1 || break
   done
-  ( cd "$SCRATCH" && setsid nohup python3 "$script" >/dev/null 2>&1 & )
+  # Keep the launcher's stderr: a mock that never execs (missing interpreter,
+  # import error) otherwise reads as an inexplicable dead port.
+  ( cd "$SCRATCH" && $SETSID nohup python3 "$script" >/dev/null 2>"$SCRATCH/mock-$port.err" & )
   for _ in $(seq 40); do
     (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null && exec 3<&- && break
     sleep 0.1
@@ -44,7 +61,7 @@ run() {
   # A dead mock makes every turn fail with connection refused, which settles
   # and looks like a pass. Refuse to run the scenario instead.
   if ! (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null; then
-    printf 'FAIL  %s (mock never came up on :%s)\n' "$name" "$port"
+    printf 'FAIL  %s (mock never came up on :%s — see %s)\n' "$name" "$port" "$SCRATCH/mock-$port.err"
     fail=$((fail+1))
     return
   fi
@@ -54,7 +71,7 @@ run() {
   local start=$SECONDS
   local log; log=$(mktemp)
   ANTHROPIC_API_KEY=test ANTHROPIC_BASE_URL="http://127.0.0.1:$port" \
-        timeout 180 ./target/debug/bitty "$@" > "$log" 2>&1 &
+        ${CAP[@]+"${CAP[@]}"} ./target/debug/bitty "$@" > "$log" 2>&1 &
   local bpid=$!
   STARTED+=("$bpid")
   wait "$bpid" 2>/dev/null
@@ -90,6 +107,17 @@ export BITTY_TEST_REPO="$REPO" BITTY_TEST_SECRET="$SECRET"
 run "filesystem capabilities"                   8741 mock_fs.py        --once --allow-read "$REPO" --allow-write "$REPO" "read the repo"
 
 run "tool aliases (typed call to a process)"     8742 mock_alias.py     --once "wire a typed tool"
+
+# The two exec paths must not converge: api.exec returns text, Deno.Command
+# returns bytes. Needs a scoped run grant, since the mock also checks that a
+# program outside the allowlist is refused.
+REPO3=$(mktemp -d); export BITTY_TEST_REPO="$REPO3"
+run "api.exec text vs Deno.Command bytes" 8744 mock_exec.py --once --allow-run=python3 --allow-read "$REPO3" --allow-write "$REPO3" "exercise exec"
+
+# A turn that ends without tool calls must reach disk when it ends, not when
+# the harness exits — the mock reads the journal while bitty is still running.
+JDIR=$(mktemp -d); export BITTY_TEST_JOURNAL="$JDIR"
+run "text-only turn is flushed to the journal" 8745 mock_flush.py --once --journal "$JDIR" --allow-read "$JDIR" "wait for a wake"
 
 REPO2=$(mktemp -d); mkdir -p "$REPO2/src"; echo "fn main() {}" > "$REPO2/src/main.rs"
 export BITTY_TEST_REPO="$REPO2"
@@ -135,7 +163,7 @@ restart_arm() {
   export BITTY_RESTART_MARK="$markdir/boots" BITTY_RESTART_PORT=$port
   local out=""
   for phase in 1 2; do
-    ( cd "$SCRATCH" && BITTY_RESTART_PHASE=$phase setsid nohup python3 mock_restart.py >/dev/null 2>&1 & )
+    ( cd "$SCRATCH" && BITTY_RESTART_PHASE=$phase $SETSID nohup python3 mock_restart.py >/dev/null 2>"$SCRATCH/mock-restart.err" & )
     for _ in $(seq 40); do
       (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null && exec 3<&- && break || sleep 0.1
     done
