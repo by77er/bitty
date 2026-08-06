@@ -357,6 +357,257 @@ fn op_bitty_exec_bytes(
     })
 }
 
+/// The default directory for a shell command: where the harness itself is
+/// running, when that is somewhere this process may read, and otherwise the
+/// first root it was granted. Bitty is started from the tree being worked on,
+/// so its own cwd is the project root by construction — no knowledge of what
+/// kind of project it is, and nothing about this machine, is written down
+/// anywhere. A narrowly granted process still lands somewhere it can work.
+fn default_cwd(me: &Meta) -> Result<std::path::PathBuf, String> {
+    let here =
+        std::env::current_dir().map_err(|e| format!("cannot read the working directory: {e}"))?;
+    if let Ok(inside) = me.grants.read.resolve(&here.display().to_string(), false) {
+        return Ok(inside);
+    }
+    match &me.grants.read {
+        crate::grants::PathGrant::Under(roots) => roots
+            .first()
+            .cloned()
+            .ok_or_else(|| "no filesystem access is granted, so there is nowhere to run".into()),
+        crate::grants::PathGrant::Nowhere => {
+            Err("no filesystem access is granted, so there is nowhere to run".into())
+        }
+    }
+}
+
+/// The interactive shell the operator uses, so that a login shell derives the
+/// same PATH they would get in a terminal. That is the whole reason this runs
+/// with `-lc`: a non-login shell inherits whatever PATH the harness was started
+/// with, which is what drove scripts to hand-write `export PATH=...` lines
+/// naming directories only that one machine has.
+fn login_shell() -> String {
+    match std::env::var("SHELL") {
+        Ok(shell) if !shell.trim().is_empty() => shell,
+        _ => "/bin/sh".to_string(),
+    }
+}
+
+/// Everything captured from a shell command: the two streams merged in write
+/// order, because a compiler puts diagnostics on stderr and progress on
+/// stdout, and splitting them destroys the ordering a reader needs.
+struct ShellOutput {
+    code: Option<i32>,
+    out: Vec<u8>,
+    timed_out: bool,
+    truncated: bool,
+}
+
+/// What `sh()` keeps at most. Past this the head and the tail survive and the
+/// middle is dropped: in a build log the last lines are the verdict and the
+/// first are the invocation. The pipe keeps being drained past the cap, so the
+/// child never blocks writing into a full one.
+const SHELL_OUTPUT_CAP: usize = 1024 * 1024;
+const SHELL_OUTPUT_EDGE: usize = 256 * 1024;
+/// How far past the cap the buffer may grow before the middle is dropped.
+/// Compacting on every read would memmove the whole buffer per chunk.
+const SHELL_OUTPUT_SLACK: usize = 1024 * 1024;
+/// After the group is killed, how long to keep taking what is already in the
+/// pipe. Not a wait for EOF: a grandchild may still hold the write end, which
+/// is the failure this whole path is shaped around.
+const SHELL_DRAIN: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Drop the middle of an over-long capture, remembering how much went.
+fn compact_capture(buf: &mut Vec<u8>, elided: &mut usize) {
+    if buf.len() <= SHELL_OUTPUT_CAP {
+        return;
+    }
+    let extra = buf.len() - (SHELL_OUTPUT_EDGE * 2);
+    buf.drain(SHELL_OUTPUT_EDGE..SHELL_OUTPUT_EDGE + extra);
+    *elided += extra;
+}
+
+/// Read until EOF, until the deadline, or until the pipe fails. Returns
+/// whether it was the deadline that stopped it.
+fn drain_pipe(
+    reader: &mut std::io::PipeReader,
+    buf: &mut Vec<u8>,
+    elided: &mut usize,
+    deadline: Option<std::time::Instant>,
+) -> bool {
+    use std::io::Read;
+    use std::os::fd::AsRawFd;
+    let mut chunk = [0u8; 65536];
+    loop {
+        if let Some(deadline) = deadline {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                return true;
+            }
+            let mut poll = libc::pollfd {
+                fd: reader.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let ms = i32::try_from(left.as_millis()).unwrap_or(i32::MAX).max(1);
+            // SAFETY: one initialised pollfd, described by the count that
+            // follows it, over a descriptor this call owns for its duration.
+            let ready = unsafe { libc::poll(&mut poll, 1, ms) };
+            if ready == 0 {
+                return true;
+            }
+            if ready < 0 {
+                if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return false;
+            }
+        }
+        match reader.read(&mut chunk) {
+            // Every writer is gone: the child, and anything it forked.
+            Ok(0) => return false,
+            Ok(n) => {
+                buf.extend_from_slice(&chunk[..n]);
+                if buf.len() > SHELL_OUTPUT_CAP + SHELL_OUTPUT_SLACK {
+                    compact_capture(buf, elided);
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return false,
+        }
+    }
+}
+
+/// `sh()`: one command line, through the operator's login shell, with the two
+/// output streams merged and the working directory already right.
+///
+/// It exists because the alternative gets retyped: a `Deno.Command`, an args
+/// array, a `TextDecoder`, a `cd`, a PATH export and a `2>&1` — per call, in
+/// every process, at the caller's token expense. Everything here is a default
+/// that was already being written out by hand.
+///
+/// A non-zero exit is a *result*, not an error: this returns normally with the
+/// code, and throws only when the command could not be started at all, which
+/// is the same line `api.exec` draws.
+fn run_shell(
+    state: &mut OpState,
+    command: &str,
+    cwd: &str,
+    timeout_ms: i32,
+) -> Result<ShellOutput, deno_error::JsErrorBox> {
+    use std::os::unix::process::CommandExt;
+
+    let host = state.borrow::<Host>();
+    let shell = login_shell();
+    // The allowlist names programs, and a grant may reasonably name the shell
+    // either way round, so both spellings are tried before refusing.
+    let named = std::path::Path::new(&shell)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| shell.clone());
+    if !host.me.may(crate::grants::Capability::Run, &shell)
+        && !host.me.may(crate::grants::Capability::Run, &named)
+    {
+        return Err(fs_error(format!(
+            "not permitted to run '{named}', which sh() needs; you may run {}. api.exec runs one \
+             program directly, without a shell.",
+            host.me.permitted(crate::grants::Capability::Run)
+        )));
+    }
+    let dir = if cwd.is_empty() {
+        default_cwd(&host.me).map_err(fs_error)?
+    } else {
+        host.me.grants.read.resolve(cwd, false).map_err(fs_error)?
+    };
+    let children = host.children.clone();
+
+    // One pipe, handed to the child twice: that is what merges the streams,
+    // and it merges them in the child's own write order rather than in the
+    // order two separate readers happened to be polled.
+    let (mut reader, writer) = std::io::pipe().map_err(|e| fs_error(format!("sh: {e}")))?;
+    let mirror = writer
+        .try_clone()
+        .map_err(|e| fs_error(format!("sh: {e}")))?;
+    let mut spawner = std::process::Command::new(&shell);
+    spawner
+        .arg("-lc")
+        .arg(command)
+        .current_dir(&dir)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::from(writer))
+        .stderr(std::process::Stdio::from(mirror))
+        .process_group(0);
+    let mut child = spawner
+        .spawn()
+        .map_err(|e| fs_error(format!("{shell}: {e}")))?;
+    // The Command keeps its stdio slots after spawn, so the write end of that
+    // pipe is still open *here* until it is dropped — and a pipe with a live
+    // writer never reaches EOF. Dropping it is not tidiness; it is the
+    // difference between this returning and this hanging forever.
+    drop(spawner);
+
+    let pgid = child.id() as i32;
+    children.entered(pgid);
+    let deadline = (timeout_ms > 0).then(|| {
+        std::time::Instant::now()
+            + std::time::Duration::from_millis(u64::from(timeout_ms.unsigned_abs()))
+    });
+    let mut buf = Vec::new();
+    let mut elided = 0usize;
+    let timed_out = drain_pipe(&mut reader, &mut buf, &mut elided, deadline);
+    if timed_out {
+        // The group, not the child: the child is a shell, and what it started
+        // is what is still running.
+        // SAFETY: a pgid this process created; a group that has already gone
+        // fails with ESRCH, which is why the result is discarded.
+        unsafe { libc::killpg(pgid, libc::SIGTERM) };
+        std::thread::sleep(KILL_GRACE);
+        // SAFETY: as above.
+        unsafe { libc::killpg(pgid, libc::SIGKILL) };
+        drain_pipe(
+            &mut reader,
+            &mut buf,
+            &mut elided,
+            Some(std::time::Instant::now() + SHELL_DRAIN),
+        );
+    }
+    let status = child.wait();
+    children.left();
+    drop(reader);
+
+    compact_capture(&mut buf, &mut elided);
+    if elided > 0 {
+        let marker = format!("\n…[{elided} bytes elided]…\n");
+        buf.splice(SHELL_OUTPUT_EDGE..SHELL_OUTPUT_EDGE, marker.into_bytes());
+    }
+    Ok(ShellOutput {
+        code: status.ok().and_then(|s| s.code()),
+        out: buf,
+        timed_out,
+        truncated: elided > 0,
+    })
+}
+
+/// The op behind `sh()`. Text, like `api.exec` — a caller who needs the exact
+/// bytes of a program's output wants `Deno.Command`, whose contract is
+/// deliberately different and is not touched by this.
+#[op2]
+#[string]
+fn op_bitty_exec_shell(
+    state: &mut OpState,
+    #[string] command: String,
+    #[string] cwd: String,
+    #[smi] timeout_ms: i32,
+) -> Result<String, deno_error::JsErrorBox> {
+    let result = run_shell(state, &command, &cwd, timeout_ms)?;
+    Ok(json!({
+        "code": result.code,
+        "out": String::from_utf8_lossy(&result.out),
+        "timedOut": result.timed_out,
+        "truncated": result.truncated,
+    })
+    .to_string())
+}
+
 /// Bind a port and serve it. The accept loop runs on the *main* runtime, not
 /// in this isolate: a script process is mail-driven, and its event loop is only
 /// pumped while a message is being handled, so a JS-side accept loop would
@@ -1570,6 +1821,71 @@ globalThis.__bitty_render = (v) => {
     " chars serialized. Preview:]\n" + s.slice(0, 2000) +
     "\n…[slice g.results." + key + " in a later run_script call to see more]";
 };
+// Set per eval by the session thread: when this caller stops waiting, in
+// epoch ms. Declared here so it is part of the namespace baseline below and
+// never shows up as something an eval created.
+globalThis.__bitty_deadline = 0;
+
+// sh(command, {cwd, timeout}) -> {code, out, timedOut, truncated}
+//
+// The two most-retyped things in a run_script call, made defaults: the login
+// shell (so PATH is the operator's), the working directory (so no cd), stdout
+// and stderr merged in write order (so no 2>&1 and no TextDecoder), and a
+// timeout derived from this call's own remaining budget rather than a number
+// anyone has to pick.
+//
+// A non-zero exit is an answer, not an exception: branch on code. This throws
+// only if the command could not be started — Run denied, or a cwd outside the
+// read grant.
+globalThis.sh = async (command, opts = {}) => {
+  const asked = opts && opts.timeout !== undefined && opts.timeout !== null
+    ? Math.max(1, Math.round(Number(opts.timeout) * 1000))
+    // Two seconds inside the caller's own deadline: enough that a command that
+    // overruns comes back as {timedOut: true} carrying what it printed,
+    // instead of dying with the whole eval and taking the output with it.
+    : (globalThis.__bitty_deadline
+      ? Math.max(1000, globalThis.__bitty_deadline - Date.now() - 2000)
+      : 0);
+  return JSON.parse(Deno.core.ops.op_bitty_exec_shell(
+    String(command),
+    String(opts && opts.cwd !== undefined && opts.cwd !== null ? opts.cwd : ""),
+    Math.min(asked, 2147483647),
+  ));
+};
+
+// read(path, from, to) -> line-numbered text.
+//
+// 1-indexed and inclusive at both ends, because everything a model reasons
+// with — grep, sed, a compiler diagnostic, its own patch — is. Out of range
+// clamps rather than throwing; a missing file or a path outside the read
+// grant throws, exactly as bitty.fs.read does. A negative from counts back
+// from the end, so read(p, -60) is the last sixty lines. Raw text is one call
+// away with Deno.readTextFile: this shape is the one that was being rebuilt by
+// hand around every slice.
+globalThis.read = async (path, from, to) => {
+  const text = Deno.core.ops.op_bitty_fs_read(String(path));
+  if (text === "") return "";
+  const lines = text.split("\n");
+  // A trailing newline ends the last line rather than starting an empty one.
+  if (lines.length > 1 && lines[lines.length - 1] === "") lines.pop();
+  const n = lines.length;
+  const at = (v, fallback) => {
+    if (v === undefined || v === null) return fallback;
+    const k = Math.trunc(Number(v));
+    if (Number.isNaN(k)) return fallback;
+    return k < 0 ? n + k + 1 : k;
+  };
+  const start = Math.max(1, at(from, 1));
+  const end = Math.min(n, at(to, n));
+  if (start > end) return "";
+  const width = String(end).length;
+  const out = [];
+  for (let i = start; i <= end; i++) {
+    out.push(String(i).padStart(width) + "| " + lines[i - 1]);
+  }
+  return out.join("\n");
+};
+
 globalThis.__bitty_session_names = () => {
   const skip = new Set(globalThis.__bitty_skip || []);
   const names = Object.getOwnPropertyNames(globalThis)
@@ -1624,6 +1940,19 @@ const RECOVERY_PROBE: std::time::Duration = std::time::Duration::from_secs(5);
 struct EvalRequest {
     source: String,
     call_id: String,
+    /// When this eval's caller stops waiting, as epoch milliseconds. Handed to
+    /// the isolate so a script can bound its own subprocesses *inside* its
+    /// budget instead of being killed at the end of it with its output lost.
+    deadline_ms: u64,
+}
+
+/// Epoch milliseconds, for a deadline the isolate can compare against
+/// `Date.now()`.
+fn epoch_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
 }
 
 impl Live {
@@ -1683,6 +2012,7 @@ impl Session {
             .send(EvalRequest {
                 source: source.to_string(),
                 call_id: id.clone(),
+                deadline_ms: epoch_ms() + seconds.saturating_mul(1000),
             })
             .is_err()
         {
@@ -1789,6 +2119,8 @@ impl Session {
             .send(EvalRequest {
                 source: "return 1".into(),
                 call_id: id.clone(),
+                deadline_ms: epoch_ms()
+                    + u64::try_from(RECOVERY_PROBE.as_millis()).unwrap_or(u64::MAX),
             })
             .is_err()
         {
@@ -1896,13 +2228,18 @@ fn session_thread(
                         );
                         continue;
                     }
+                    // The caller's deadline goes in before the body runs, so
+                    // that sh() can bound a subprocess inside the budget it
+                    // actually has rather than guessing at one.
                     let wrapped = format!(
-                        "(async () => {{\n  const __value = await (async () => {{\n{}\n}})();\n  \
+                        "globalThis.__bitty_deadline = {deadline};\n\
+                         (async () => {{\n  const __value = await (async () => {{\n{}\n}})();\n  \
                          Deno.core.ops.op_bitty_reply({id:?}, globalThis.__bitty_render(__value));\n\
                          }})().catch((e) => Deno.core.ops.op_bitty_reply_error({id:?}, \
                          String(e && e.message ? e.message : e)));",
                         req.source,
-                        id = req.call_id
+                        id = req.call_id,
+                        deadline = req.deadline_ms
                     );
                     // Strip the types before V8 sees them. The precheck
                     // transpiled too, but only to validate — running the
@@ -1966,6 +2303,7 @@ async fn boot(
         op_bitty_fs_remove(),
         op_bitty_exec(),
         op_bitty_exec_bytes(),
+        op_bitty_exec_shell(),
         op_bitty_fetch(),
         op_bitty_serve(),
         op_bitty_sleep(),
@@ -2735,6 +3073,412 @@ mod tests {
             elapsed < std::time::Duration::from_secs(9),
             "the session should have recovered by killing the process group, not by outliving \
              the sleeper; recovery took {elapsed:?}"
+        );
+    }
+
+    /// A session that may run anything and may read the temp directory (plus
+    /// whatever else a test needs). `sh()` spawns the operator's login shell, so an
+    /// allowlist of named programs is the wrong grant for most of these — that
+    /// case has a test of its own below.
+    fn shell_session(
+        id: &str,
+        extra: &[std::path::PathBuf],
+    ) -> (Arc<System>, Meta, Session, std::path::PathBuf) {
+        test_key();
+        let temp = std::env::temp_dir().canonicalize().unwrap();
+        let client = crate::api::Client::from_env().unwrap();
+        let sys = Arc::new(System::new(client));
+        let mut me = test_meta(id, temp.clone());
+        me.grants.run = Grant::All;
+        let mut roots = vec![temp.clone()];
+        roots.extend(extra.iter().cloned());
+        me.grants.read = PathGrant::Under(roots);
+        let session = Session::open(sys.clone(), me.clone());
+        (sys, me, session, temp)
+    }
+
+    /// Run `body` in a session and parse what it returned as JSON. A session eval
+    /// renders an object with JSON.stringify (SESSION_PRELUDE), so returning a
+    /// record of observations is how a test sees more than one thing at once.
+    async fn session_json(
+        sys: &Arc<System>,
+        me: &Meta,
+        session: &Session,
+        body: &str,
+        seconds: u64,
+    ) -> Value {
+        let (out, failed) = session.eval(sys, me, body, seconds).await;
+        assert!(!failed, "the eval should have succeeded, got {out}");
+        serde_json::from_str(&out)
+            .unwrap_or_else(|e| panic!("expected JSON back from the eval, got {out} ({e})"))
+    }
+
+    /// The two halves of sh()'s contract that a caller writes code against: a
+    /// non-zero exit comes back as a value rather than a throw, and the two
+    /// streams arrive merged in the order the program wrote them — which is
+    /// the whole point of handing one pipe to both of them.
+    #[tokio::test]
+    async fn sh_returns_a_nonzero_exit_and_merges_the_streams_in_write_order() {
+        let (sys, me, session, _temp) = shell_session("proc-sh-exit", &[]);
+        let v = session_json(
+            &sys,
+            &me,
+            &session,
+            r#"
+            const bad = await sh("exit 3");
+            const both = await sh("echo one; echo two 1>&2; echo three");
+            return {
+              code: bad.code, timedOut: bad.timedOut, truncated: bad.truncated,
+              bothCode: both.code,
+              one: both.out.indexOf("one"),
+              two: both.out.indexOf("two"),
+              three: both.out.indexOf("three"),
+              out: both.out,
+            };
+            "#,
+            20,
+        )
+        .await;
+        assert_eq!(v["code"], 3, "a non-zero exit should be reported, got {v}");
+        assert_eq!(v["timedOut"], false, "nothing timed out here, got {v}");
+        assert_eq!(v["truncated"], false, "nothing was truncated here, got {v}");
+        assert_eq!(v["bothCode"], 0, "the second command succeeded, got {v}");
+        // Positions, not equality: a login shell is entitled to print whatever
+        // the operator's profile prints, and this pins the ordering regardless.
+        let (one, two, three) = (
+            v["one"].as_i64().unwrap(),
+            v["two"].as_i64().unwrap(),
+            v["three"].as_i64().unwrap(),
+        );
+        assert!(
+            one >= 0 && two >= 0 && three >= 0,
+            "both streams should be captured, got {v}"
+        );
+        assert!(
+            one < two && two < three,
+            "the streams should merge in write order, got {v}"
+        );
+    }
+
+    /// The harness is launched from the tree being worked on, so its own cwd is
+    /// the right default — but only when the process may read it. Under a grant
+    /// that does not cover it, the first granted root is where the command runs
+    /// rather than somewhere it cannot touch anything.
+    #[tokio::test]
+    async fn sh_falls_back_to_the_first_granted_root_when_the_harness_cwd_is_out_of_reach() {
+        let (sys, me, session, temp) = shell_session("proc-sh-cwd-fallback", &[]);
+        // cargo runs tests from the crate root, which is not under temp.
+        let here = std::env::current_dir().unwrap().canonicalize().unwrap();
+        assert!(
+            !here.starts_with(&temp),
+            "this test needs a cwd outside the grant"
+        );
+        let v = session_json(
+            &sys,
+            &me,
+            &session,
+            r#"const r = await sh("pwd"); return { out: r.out.trim(), code: r.code };"#,
+            20,
+        )
+        .await;
+        assert_eq!(v["code"], 0, "pwd should have run, got {v}");
+        assert_eq!(
+            v["out"].as_str(),
+            Some(temp.display().to_string().as_str()),
+            "the command should run in the granted root, got {v}"
+        );
+    }
+
+    /// And the other branch: when the harness cwd is inside the grant it wins,
+    /// so a command runs where the operator started Bitty without anyone
+    /// naming that directory.
+    #[tokio::test]
+    async fn sh_runs_in_the_harness_cwd_when_that_is_inside_the_read_grant() {
+        let here = std::env::current_dir().unwrap().canonicalize().unwrap();
+        let (sys, me, session, _temp) =
+            shell_session("proc-sh-cwd-here", std::slice::from_ref(&here));
+        let v = session_json(
+            &sys,
+            &me,
+            &session,
+            r#"const r = await sh("pwd"); return { out: r.out.trim() };"#,
+            20,
+        )
+        .await;
+        assert_eq!(
+            v["out"].as_str(),
+            Some(here.display().to_string().as_str()),
+            "the harness cwd should be the default, got {v}"
+        );
+    }
+
+    /// An explicit cwd is honoured, and it is checked against the same read
+    /// grant every other path goes through — a shell that could be pointed
+    /// anywhere would be a way around the grant rather than a use of it.
+    #[tokio::test]
+    async fn sh_honours_an_explicit_cwd_and_refuses_one_outside_the_read_grant() {
+        let (sys, me, session, temp) = shell_session("proc-sh-cwd-opt", &[]);
+        let dir = temp.join(format!("bitty-sh-cwd-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let v = session_json(
+            &sys,
+            &me,
+            &session,
+            &format!(
+                r#"
+                const inside = await sh("pwd", {{ cwd: {dir:?} }});
+                let denied = null;
+                try {{ await sh("pwd", {{ cwd: "/" }}); }}
+                catch (e) {{ denied = String(e && e.message ? e.message : e); }}
+                return {{ out: inside.out.trim(), denied }};
+                "#
+            ),
+            20,
+        )
+        .await;
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            v["out"].as_str(),
+            Some(dir.display().to_string().as_str()),
+            "opts.cwd should be where the command runs, got {v}"
+        );
+        let denied = v["denied"].as_str().unwrap_or("");
+        assert!(
+            denied.contains("outside the directories you may use"),
+            "a cwd outside the grant should be refused in the grant's own words, got {v}"
+        );
+    }
+
+    /// The Run check is against the shell, because the shell is what is
+    /// spawned. A process allowed to run one named program does not get a
+    /// shell by the back door, and the refusal names the path that would work.
+    #[tokio::test]
+    async fn sh_refuses_when_the_run_grant_does_not_cover_the_shell() {
+        let (sys, me, session, _temp) = test_session("proc-sh-nogrant");
+        let (out, failed) = session
+            .eval(&sys, &me, r#"return await sh("echo hi");"#, 20)
+            .await;
+        assert!(
+            failed,
+            "sh should have thrown under a grant without the shell, got {out}"
+        );
+        assert!(
+            out.contains("not permitted to run"),
+            "the refusal should say what was refused, got {out}"
+        );
+        assert!(
+            out.contains("api.exec"),
+            "the refusal should name the narrower path that is still open, got {out}"
+        );
+    }
+
+    /// REGRESSION-adjacent: the timeout exists so that an overrunning command
+    /// comes back as data instead of taking the eval down with it. What it
+    /// printed before it was killed survives, the exit code is null because a
+    /// signal is not an exit, and — the wedge lesson — the session is still
+    /// usable immediately afterwards because the whole process group went.
+    #[tokio::test]
+    async fn sh_times_out_with_its_output_intact_and_leaves_the_session_usable() {
+        let (sys, me, session, _temp) = shell_session("proc-sh-timeout", &[]);
+        let v = session_json(
+            &sys,
+            &me,
+            &session,
+            r#"
+            const started = Date.now();
+            const slow = await sh("echo early; sleep 5", { timeout: 1 });
+            const ms = Date.now() - started;
+            const after = await sh("echo later");
+            return {
+              code: slow.code, timedOut: slow.timedOut,
+              early: slow.out.includes("early"), ms,
+              later: after.out.trim(), laterCode: after.code,
+            };
+            "#,
+            20,
+        )
+        .await;
+        assert_eq!(
+            v["timedOut"], true,
+            "the command should have timed out, got {v}"
+        );
+        assert!(
+            v["code"].is_null(),
+            "a signalled command has no exit code, got {v}"
+        );
+        assert_eq!(
+            v["early"], true,
+            "output printed before the kill should survive, got {v}"
+        );
+        assert!(
+            v["ms"].as_i64().is_some_and(|ms| ms < 4000),
+            "the kill should happen on the deadline, not when the sleeper finishes, got {v}"
+        );
+        assert_eq!(
+            v["laterCode"], 0,
+            "the next command should run normally, got {v}"
+        );
+        assert_eq!(
+            v["later"], "later",
+            "the next command should produce its output, got {v}"
+        );
+    }
+
+    /// With no timeout given, the bound comes from the caller's own run_script
+    /// budget: a four-second eval kills the child at about two, so the eval
+    /// returns a result carrying what happened instead of dying at four with
+    /// the output lost. Nothing in JS can see that budget on its own — the
+    /// session thread publishes it per eval as __bitty_deadline.
+    #[tokio::test]
+    async fn sh_defaults_its_timeout_to_the_evals_remaining_budget() {
+        let (sys, me, session, _temp) = shell_session("proc-sh-budget", &[]);
+        let v = session_json(
+            &sys,
+            &me,
+            &session,
+            r#"
+            const started = Date.now();
+            const r = await sh("sleep 30");
+            return { timedOut: r.timedOut, code: r.code, ms: Date.now() - started };
+            "#,
+            4,
+        )
+        .await;
+        assert_eq!(
+            v["timedOut"], true,
+            "the child should be killed inside the budget, got {v}"
+        );
+        let ms = v["ms"].as_i64().unwrap_or_default();
+        assert!(
+            (900..3500).contains(&ms),
+            "the default timeout should be the budget less its margin, got {v}"
+        );
+    }
+
+    /// A megabyte cap that keeps both ends: in a build log the first lines are
+    /// the invocation and the last are the verdict, and the middle is what can
+    /// be spared. The end marker proves the tail is the real tail rather than
+    /// wherever the reader gave up.
+    #[tokio::test]
+    async fn sh_truncates_the_middle_of_an_oversized_capture_and_keeps_both_ends() {
+        let (sys, me, session, _temp) = shell_session("proc-sh-truncate", &[]);
+        let v = session_json(
+            &sys,
+            &me,
+            &session,
+            r#"
+            const r = await sh("python3 -c 'import sys; sys.stdout.write(\"a\"*1500000); sys.stdout.write(\"ZEND\")'");
+            return {
+              code: r.code, truncated: r.truncated, len: r.out.length,
+              head: r.out.slice(0, 3), tail: r.out.slice(-4),
+              marked: r.out.includes("bytes elided"),
+            };
+            "#,
+            60,
+        )
+        .await;
+        assert_eq!(
+            v["code"], 0,
+            "the producer should have exited cleanly, got {v}"
+        );
+        assert_eq!(
+            v["truncated"], true,
+            "an oversized capture should say so, got {v}"
+        );
+        assert_eq!(
+            v["head"], "aaa",
+            "the head of the output should survive, got {v}"
+        );
+        assert_eq!(
+            v["tail"], "ZEND",
+            "the tail of the output should survive, got {v}"
+        );
+        assert_eq!(v["marked"], true, "the gap should be marked, got {v}");
+        let len = v["len"].as_i64().unwrap_or_default();
+        assert!(
+            (500_000..700_000).contains(&len),
+            "the capture should be cut to the two edges, got {v}"
+        );
+    }
+
+    /// read()'s contract is the one every hand-written slice loop reimplemented:
+    /// 1-indexed, inclusive at both ends, clamped rather than throwing, and a
+    /// negative start counting back from the end.
+    #[tokio::test]
+    async fn read_numbers_lines_from_one_inclusively_and_clamps_to_the_file() {
+        let (sys, me, session, temp) = shell_session("proc-read-range", &[]);
+        let path = temp.join(format!("bitty-read-{}.txt", std::process::id()));
+        std::fs::write(&path, "alpha\nbravo\ncharlie\ndelta\necho\n").unwrap();
+        let v = session_json(
+            &sys,
+            &me,
+            &session,
+            &format!(
+                r#"
+                const P = {path:?};
+                let denied = null;
+                try {{ await read("/etc/hosts"); }}
+                catch (e) {{ denied = String(e && e.message ? e.message : e); }}
+                return {{
+                  span: await read(P, 2, 3),
+                  clamped: await read(P, 4, 99),
+                  past: await read(P, 99),
+                  tail: await read(P, -2),
+                  all: await read(P),
+                  denied,
+                }};
+                "#
+            ),
+            20,
+        )
+        .await;
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(
+            v["span"], "2| bravo\n3| charlie",
+            "an inclusive span, got {v}"
+        );
+        assert_eq!(
+            v["clamped"], "4| delta\n5| echo",
+            "an end past EOF should clamp, got {v}"
+        );
+        assert_eq!(v["past"], "", "a start past EOF should be empty, got {v}");
+        assert_eq!(
+            v["tail"], "4| delta\n5| echo",
+            "a negative start is a tail, got {v}"
+        );
+        assert_eq!(
+            v["all"], "1| alpha\n2| bravo\n3| charlie\n4| delta\n5| echo",
+            "no bounds should be the whole file, and the trailing newline is not a sixth line, got {v}"
+        );
+        assert!(
+            v["denied"]
+                .as_str()
+                .unwrap_or("")
+                .contains("outside the directories you may use"),
+            "a path outside the read grant should throw, got {v}"
+        );
+    }
+
+    /// The numbers are right-aligned to the widest one in the span, so the text
+    /// of the file stays in one column however long the file is.
+    #[tokio::test]
+    async fn read_right_aligns_the_line_numbers_across_a_change_of_width() {
+        let (sys, me, session, temp) = shell_session("proc-read-width", &[]);
+        let path = temp.join(format!("bitty-read-width-{}.txt", std::process::id()));
+        let body: String = (1..=12).map(|n| format!("line{n}\n")).collect();
+        std::fs::write(&path, body).unwrap();
+        let v = session_json(
+            &sys,
+            &me,
+            &session,
+            &format!(r#"const P = {path:?}; return {{ span: await read(P, 9, 11) }};"#),
+            20,
+        )
+        .await;
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(
+            v["span"], " 9| line9\n10| line10\n11| line11",
+            "single-digit numbers should be padded to the widest in the span, got {v}"
         );
     }
 }

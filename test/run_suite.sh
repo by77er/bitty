@@ -114,6 +114,14 @@ run "tool aliases (typed call to a process)"     8742 mock_alias.py     --once "
 REPO3=$(mktemp -d); export BITTY_TEST_REPO="$REPO3"
 run "api.exec text vs Deno.Command bytes" 8744 mock_exec.py --once --allow-run=python3 --allow-read "$REPO3" --allow-write "$REPO3" "exercise exec"
 
+# The run_script prelude bindings. --allow-run with no list because sh() spawns
+# $SHELL, whose name is the operator's business; the scoped-grant refusal has a
+# cargo test of its own. BITTY_TEST_SH_DISCOVERABLE=1 additionally asserts that
+# run_script's description and the system prompt name sh() and read().
+REPO4=$(mktemp -d); export BITTY_TEST_REPO="$REPO4" BITTY_TEST_SH_DISCOVERABLE=1
+run "sh() and read() in the run_script session" 8747 mock_sh.py --once --allow-run --allow-read "$REPO4" --allow-write "$REPO4" "use the shell helpers"
+unset BITTY_TEST_SH_DISCOVERABLE
+
 # A turn that ends without tool calls must reach disk when it ends, not when
 # the harness exits — the mock reads the journal while bitty is still running.
 JDIR=$(mktemp -d); export BITTY_TEST_JOURNAL="$JDIR"
