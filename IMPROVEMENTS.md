@@ -117,7 +117,8 @@ commodity crate).
   - Compact header: animated ASCII cat + `bitty` + session name + one-word
     system state.
   - Slim left rail: process tree from the snapshot (status glyph ●/○/■, id,
-    name, model/effort, ctx tokens), arrow-key selectable.
+    name, model-size chip, ctx tokens, spend), arrow-key selectable. Each
+    process keeps an identity colour, which survives the selection highlight.
   - Dominant main transcript: activity from the tap, colored by kind and
     presented as chat rather than a monitoring panel. `trace` lines are hidden
     by default behind the `Ctrl-T` toggle — that's the not-overwhelming part.
@@ -133,7 +134,9 @@ commodity crate).
   `(-ω-)ᶻᶻ`; a warn in the last 5s → `(⊙ω⊙)!`. A status indicator that
   happens to be a cat, not a toy.
 - **Redraw** on a 250ms tick + on every tap event (debounced); snapshot
-  refetched on the tick.
+  refetched on the tick. A braille spinner advances every 120ms, and only
+  while something is working. `Ctrl-O` hands the mouse back to the terminal
+  so text can be selected and copied.
 - **Testing:** pure layout/filter/wrapping behavior uses a ratatui test backend,
   alternate-screen entry/restore has a pseudo-terminal smoke test, and the
   plain-mode mock suite runs unchanged. `ui::tap` stays inert unless subscribed.
