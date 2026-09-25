@@ -1,78 +1,148 @@
 # Bitty
 
-[![CI](https://github.com/by77er/Bitty/actions/workflows/ci.yml/badge.svg)](https://github.com/by77er/Bitty/actions/workflows/ci.yml)
+Bitty runs a team of AI agents that work at the same time and talk to each
+other by sending messages.
 
-An agent meta-harness built on the **actor model**. Every agent is a **process** with an address, private state (its own conversation with the model), and a **mailbox**. Processes share nothing: the only ways to interact are to **spawn** a process or **send** mail to an address you know, and both are tools the model calls. Mail lands mid-task, between tool calls, the way you'd interrupt a coding agent while it works.
+Each agent is its own process, with its own conversation and its own inbox.
+Agents share nothing. To work together, they start new agents or send each
+other mail, using tools the model can call. Mail arrives while an agent is
+working, between tool calls, the way you might interrupt someone mid-task.
 
-![The actor model, applied to agents](actors.svg)
+![Two agents, each with its own conversation and mailbox](actors.svg)
 
-Processes come in two flavors: **agents** (a model conversation) and **scripts** (TypeScript actors on an embedded Deno runtime: same mailbox, same permissions, zero tokens). Agents for judgment, scripts for the mechanical parts.
+This is the actor model, the idea behind Erlang, applied to agents. It gives
+you a few useful things for free:
 
-## Why
+- **Parallel work.** Many agents can work at once, each with a full context
+  window of its own.
+- **Contained failures.** If an agent dies, the agent that started it gets a
+  message instead of crashing too, and can retry or change plans.
+- **Safe delegation.** An agent can only give a new agent permissions it
+  already has, never more.
 
-Single-agent harnesses hit a wall: one context window, one train of thought, one thing at a time. The actor model is the classic answer to that shape of problem, and the properties that made it work for Erlang/OTP transfer directly: **concurrency without shared state**, **failure isolation** (a dead process signals its links with mail instead of taking anyone down), and **supervision** (spawners learn about their children's deaths and can re-plan or respawn). Bitty hands those primitives to the model and lets the agents decide how to organize.
+Not every job needs a model. A process can also be a TypeScript **script**
+that runs in Bitty's built-in Deno runtime. It has the same inbox and
+permissions as an agent, and uses no tokens. Scripts can route mail, check
+results, or run a web server.
 
-That enables systems that run indefinitely, not just tasks that finish:
-
-- **Long-running services.** A script actor can `Deno.serve` from inside the system, so a swarm can host something rather than emit an artifact and exit.
-- **Self-maintaining projects.** Give one agent ownership of a codebase and let others file requests through its mailbox.
-- **Pipelines and fan-out.** Writer → editor chains; parallel researchers reporting to a coordinator.
-- **Safe delegation.** A process holds only the files, peers, programs, hosts and variables it was granted, and can never grant a child more than it has.
-
-## How it works
-
-- Each process is a tokio task running its own agentic loop, with an mpsc channel as its mailbox. Mail is injected between tool calls; an idle process blocks until woken.
-- **Tools:** `spawn_process`, `spawn_topology`, `send_message`, `call_process` (send and block for the reply), `mailbox` (page long mail), `stop_process`, `list_processes`, `run_script`, `patch_script`. A process only sees the tools its capabilities allow.
-- **Capabilities:** `Send` / `Stop` / `Spawn` / `Run` / `Net` / `Env` / `Sys` plus read and write roots, clamped so a child never holds authority its spawner lacks. Visibility follows authority: an isolated worker can't even list its siblings.
-- **Links:** a dying process signals its spawner as `<exit_signal>` mail, never a kill, OTP-style.
-- **Topologies:** `spawn_topology` wires a whole group at once, with per-node roles, models, scripts and `can_send_to` allowlists.
-- **Tool aliases:** a spawner can define typed tools that route to another actor. Arguments are schema-validated before delivery, and an alias may only target a process the spawner could message itself. The holder calls it as a plain async function and is never told a graph exists.
-- **Scripts:** an embedded `deno_core` runtime with `bitty.onMail` / `send` / `spawn`, `fetch`, `Deno.serve`, `Deno.Command` and the file APIs, every call checked against the process's grants. TypeScript is transpiled and syntax-checked before it runs.
-- **Cost controls:** per-process model tier and effort, with providers mixed freely (a Claude coordinator can run ChatGPT workers). Low-priority mail never wakes anyone. Long mail is stored as an artifact and paged, not injected wholesale. One prompt-cache prefix is shared across the system, and `--max-tokens` winds it down on a budget.
-
-Source map: `src/agent.rs` (the loop and tool surface), `src/system.rs` (process table and supervision), `src/script.rs` (Deno runtime), `src/grants.rs` (capabilities), `src/actions.rs` (policy layer), `src/durable.rs` (journaling).
-
-## Install & use
-
-Needs a recent nightly toolchain (`deno_core` 0.409 wants const `TypeId`). `rust-toolchain.toml` pins one, so rustup fetches it on the first `cargo build`.
+## Install
 
 ```bash
 git clone https://github.com/by77er/Bitty && cd Bitty
 cargo install --path .
+```
+
+Bitty needs a nightly Rust toolchain. `rust-toolchain.toml` pins one, and
+rustup downloads it the first time you build.
+
+## Usage
+
+```bash
 export ANTHROPIC_API_KEY=sk-ant-...   # or put it in .env
 
 bitty "Research X with two parallel workers and summarize."
-bitty --role "You coordinate a writing pipeline." "Draft a page on actor systems."
 bitty --tui --allow-read . --allow-write . "Refactor the parser and keep the tests green."
 bitty --once --gate "cargo test" "Fix the failing parser tests."
-bitty --resume                        # pick up the most recent session
+bitty --resume                        # pick up where the last session left off
 ```
 
-**Permissions** follow Deno's convention: omitted means denied, a bare flag means unrestricted, a value scopes it. `--allow-read[=PATHS]`, `--allow-write[=PATHS]`, `--allow-run[=PROGRAMS]`, `--allow-net[=HOSTS]`, `--allow-env[=NAMES]`, `--allow-sys[=KEYS]`, or `-A` for everything. The root process can only narrow what it hands to a child.
+Bitty denies everything by default. Permissions work like Deno's: leave a flag
+out to deny, pass it bare to allow everything, or give it values to allow only
+those.
 
-**Run modes:** `--tui` for the live dashboard, `--once` to exit when everything settles, `--gate CMD` (with `--once`) to require a command to pass first (a failure goes back to the root as work, up to `--gate-attempts`), `--max-tokens N` to wind down on a budget, `--role TEXT` for the root's system prompt. `bitty --help` lists the rest.
-
-The console is wired into the actor system while it runs:
-
-| Input | Effect |
+| Flag | Allows |
 | --- | --- |
-| plain text | mail the root process (interrupts it mid-task) |
-| `@proc-3 message` | mail specific processes (`@*` to fan out) |
-| `/ps`, `/graph` | process list / supervision and messaging graph |
-| `/model proc-2 small [low]` | retune a process's model tier and effort |
-| `/stop proc-2 [--cascade]` | stop processes (`*` for all) |
-| `/quit` | exit |
+| `--allow-read[=PATHS]` | reading files |
+| `--allow-write[=PATHS]` | writing files |
+| `--allow-run[=PROGRAMS]` | running programs |
+| `--allow-net[=HOSTS]` | network access |
+| `--allow-env[=NAMES]` | reading environment variables |
+| `--allow-sys[=KEYS]` | reading system information |
+| `-A` | all of the above |
 
-`--tui` opens an alternate-screen dashboard: a chat transcript, a selectable process tree with live context and cost per process, and a status line with the run's totals. Up/Down filters by process, `Ctrl-T` toggles trace lines, `Ctrl-O` releases the mouse for copying text.
+Other options:
 
-## Persistence
+- `--tui` opens a full-screen dashboard with the conversation, a tree of
+  processes, and what each one costs.
+- `--once` exits when every process has finished.
+- `--gate CMD` (with `--once`) won't let the run finish until `CMD` passes. A
+  failure is sent back to the agents as more work.
+- `--max-tokens N` tells the agents to wrap up after spending `N` tokens.
+- `--role TEXT` sets the root agent's system prompt.
 
-Interactive runs are journaled under `.bitty/sessions/<name>/`: one append-only `proc-N.jsonl` per process plus artifact-backed mail bodies. `bitty --resume` rebuilds the whole process table from it: personas, grants, conversations, undelivered mail, patched scripts and model overrides. Every model turn is flushed before its tool calls run and a mailbox cursor only advances once the mail is durable, so a resume is consistent at turn boundaries and mail is at-least-once. `--once` skips journaling.
+`bitty --help` lists everything.
+
+While Bitty runs, you can type to it:
+
+| Input | Does |
+| --- | --- |
+| any text | sends a message to the root agent |
+| `@proc-3 message` | sends a message to one process (`@*` for all) |
+| `/ps`, `/graph` | lists processes, or shows who started whom and who can message whom |
+| `/model proc-2 small` | switches a process to a different model size |
+| `/stop proc-2` | stops a process (`--cascade` stops its children too) |
+| `/quit` | exits |
+
+## How it works
+
+Agents get a small set of tools: start one process or a connected group, send
+mail, call a process and wait for its reply, read long mail, stop processes,
+and list them. An agent only sees the tools its permissions allow.
+
+Each agent also has a TypeScript workspace that stays alive for its whole life.
+It can run code there with its own permissions, keep data in variables between
+calls, and use two built-in helpers: `sh()` runs a shell command and `read()`
+reads lines from a file. Big results stay in the workspace, and the agent gets
+a short preview, so they don't fill up its context.
+
+A few things keep costs down:
+
+- Models come in three sizes, and each agent can use a different one. By
+  default the root agent uses the large model at high effort, and the agents
+  it starts use low effort unless asked otherwise.
+- Low-priority mail waits until the recipient is awake instead of waking it.
+- Long mail is stored and read in pages instead of being pasted into context.
+- All agents share the same cached system prompt and tool list.
+
+Interactive runs are saved under `.bitty/sessions/`. `bitty --resume` brings
+back every process with its conversation, permissions, and unread mail.
+`--once` runs aren't saved.
 
 ## Configuration
 
-Anthropic is the default backend (`ANTHROPIC_API_KEY`, or `ANTHROPIC_AUTH_TOKEN` for OAuth; `ANTHROPIC_BASE_URL` to point elsewhere). `BITTY_PROVIDER=codex` switches to the ChatGPT/Codex Responses endpoint, reusing the Codex CLI's `~/.codex/auth.json`.
+Bitty uses Anthropic by default. Set `BITTY_PROVIDER=codex` to use your
+ChatGPT account through the Codex CLI's login (`~/.codex/auth.json`) instead.
+One run uses one provider.
 
-Models are named as tiers, `small` / `medium` / `large`, that each provider maps to its own model, so a topology or journaled session survives a provider switch. `BITTY_MODEL` sets the root's tier (default `large` at effort `high`; children inherit the model at effort `low`). `BITTY_COMPACTION=off` disables server-side compaction; `BITTY_CONTEXT_WINDOW`, `BITTY_COMPACT_ABOVE` and `BITTY_COMPACT_FLOOR` tune the harness's own.
+| Size | Anthropic | Codex |
+| --- | --- | --- |
+| `small` | `claude-haiku-4-5` | `gpt-5.6-luna` |
+| `medium` | `claude-sonnet-5` | `gpt-5.6-terra` |
+| `large` | `claude-opus-5` | `gpt-5.6-sol` |
 
-To run without credentials, point `ANTHROPIC_BASE_URL` at any mock server speaking the Messages API SSE format. `test/` is exactly that: mocks that script multi-process scenarios and assert server-side. See `test/README.md`.
+| Variable | Purpose |
+| --- | --- |
+| `ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN` | Anthropic credentials |
+| `ANTHROPIC_BASE_URL` | a different Anthropic-compatible endpoint |
+| `BITTY_PROVIDER` | `codex` to use ChatGPT |
+| `BITTY_MODEL` | the root agent's model size (default `large`) |
+| `BITTY_COMPACTION` | `off` to turn off server-side context compaction |
+| `BITTY_PRICES` | your own per-model prices, as JSON |
+| `BITTY_PRICE_FETCH` | `off` to skip fetching current prices from OpenRouter |
+
+Bitty loads `.env` on startup, but agents can't read those variables unless you
+allow them with `--allow-env`.
+
+## Development
+
+```bash
+cargo test
+cargo build && test/run_suite.sh   # multi-agent scenarios against mock servers (needs python3)
+```
+
+The mock servers speak the Anthropic API, so none of this needs an API key. See
+[test/README.md](test/README.md).
+
+The main pieces are in `src/`: `agent.rs` (the agent loop and its tools),
+`system.rs` (processes and supervision), `script.rs` (the Deno runtime),
+`grants.rs` (permissions), and `durable.rs` (saved sessions).
